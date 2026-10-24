@@ -1,0 +1,20 @@
+.env
+.env.*
+!.env.example
+
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+
+__pycache__/
+*.py[cod]
+.venv/
+node_modules/
+dist/
+coverage/
+.pytest_cache/
+
+# Local backup files
+*.backup

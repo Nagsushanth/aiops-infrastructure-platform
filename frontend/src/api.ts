@@ -1,0 +1,193 @@
+
+const API_BASE_URL =
+  import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
+
+const TOKEN_KEY = "aiops-access-token";
+
+export function getAccessToken(): string | null {
+  return sessionStorage.getItem(TOKEN_KEY);
+}
+
+export function setAccessToken(token: string): void {
+  sessionStorage.setItem(TOKEN_KEY, token);
+}
+
+export function clearAccessToken(): void {
+  sessionStorage.removeItem(TOKEN_KEY);
+}
+
+export interface HealthResponse {
+  status: string;
+  service: string;
+}
+
+export interface Conversation {
+  id: number;
+  session_id: string;
+  title: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ChatMessage {
+  id: number;
+  conversation_id: number;
+  role: "user" | "assistant";
+  content: string;
+  created_at: string;
+}
+
+async function apiRequest<T>(
+  path: string,
+  options: RequestInit = {},
+  authenticated = true,
+): Promise<T> {
+  const token = authenticated ? getAccessToken() : null;
+
+  const response = await fetch(`${API_BASE_URL}${path}`, {
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...options.headers,
+    },
+  });
+
+  if (!response.ok) {
+    const detail = await response.text();
+    throw new Error(`API error ${response.status}: ${detail}`);
+  }
+
+  return response.json() as Promise<T>;
+}
+
+export async function checkBackendHealth(): Promise<HealthResponse> {
+  return apiRequest<HealthResponse>("/health", {}, false);
+}
+
+export interface AuthUser {
+  id: number;
+  email: string;
+  role: string;
+  is_active: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AuthTokenResponse {
+  access_token: string;
+  token_type: string;
+}
+
+export async function registerUser(
+  email: string,
+  password: string,
+): Promise<AuthUser> {
+  return apiRequest<AuthUser>("/auth/register", {
+    method: "POST",
+    body: JSON.stringify({ email, password }),
+  }, false);
+}
+
+export async function loginUser(
+  email: string,
+  password: string,
+): Promise<AuthTokenResponse> {
+  return apiRequest<AuthTokenResponse>("/auth/login", {
+    method: "POST",
+    body: JSON.stringify({ email, password }),
+  }, false);
+}
+
+export async function getCurrentUser(): Promise<AuthUser> {
+  return apiRequest<AuthUser>("/auth/me");
+}
+
+export async function createConversation(
+  sessionId: string,
+  title: string,
+): Promise<Conversation> {
+  return apiRequest<Conversation>("/conversations", {
+    method: "POST",
+    body: JSON.stringify({
+      session_id: sessionId,
+      title,
+    }),
+  });
+}
+
+export async function getConversationBySession(
+  sessionId: string,
+): Promise<Conversation> {
+  return apiRequest<Conversation>(
+    `/conversations/by-session/${encodeURIComponent(sessionId)}`,
+  );
+}
+
+
+export async function sendMessage(
+  conversationId: number,
+  role: "user" | "assistant",
+  content: string,
+): Promise<ChatMessage> {
+  return apiRequest<ChatMessage>(
+    `/conversations/${conversationId}/messages`,
+    {
+      method: "POST",
+      body: JSON.stringify({ role, content }),
+    },
+  );
+}
+
+export async function getMessages(
+  conversationId: number,
+): Promise<ChatMessage[]> {
+  return apiRequest<ChatMessage[]>(
+    `/conversations/${conversationId}/messages`,
+  );
+}
+
+
+export interface TerraformPreviewResource {
+  address: string;
+  type: string;
+  name: string;
+  action: string;
+  description: string;
+}
+
+export interface TerraformPreviewResponse {
+  preview_type: string;
+  is_real_terraform_plan: boolean;
+  deployment_enabled: boolean;
+  status: string;
+  cloud_provider: string;
+  region: string;
+  environment: string;
+  resource_summary: {
+    create: number;
+    update: number;
+    delete: number;
+    total_managed_resources: number;
+  };
+  resources: TerraformPreviewResource[];
+  [key: string]: unknown;
+}
+
+export async function createTerraformPreview(
+  specification: {
+    cloud_provider: "aws" | "azure" | "gcp";
+    resource_type: string;
+    environment: "development" | "testing" | "staging" | "production";
+    region: string;
+    vcpus: number;
+    memory_gb: number;
+    public_access: boolean;
+    operating_system: string;
+  },
+): Promise<TerraformPreviewResponse> {
+  return apiRequest<TerraformPreviewResponse>("/terraform/preview", {
+    method: "POST",
+    body: JSON.stringify(specification),
+  });
+}
