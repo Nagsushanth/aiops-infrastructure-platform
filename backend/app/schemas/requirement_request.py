@@ -12,6 +12,7 @@ class GatherRequirementsRequest(BaseModel):
 
 
 class GatherRequirementsResponse(BaseModel):
+    infrastructure_request_id: int
     status: str
     question: str | None = None
     missing_field: str | None = None

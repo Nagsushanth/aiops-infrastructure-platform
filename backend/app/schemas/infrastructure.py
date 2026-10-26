@@ -1,5 +1,5 @@
 from typing import Literal
-
+from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
@@ -46,3 +46,14 @@ class ValidatedInfrastructureSpecification(
     vcpus: int = Field(ge=1, le=256)
     memory_gb: int = Field(ge=1, le=4096)
     public_access: bool
+
+
+class TerraformPlanParseRequest(BaseModel):
+    """Request body containing Terraform show -json output."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    plan: dict[str, Any] = Field(
+        ...,
+        description="JSON output from terraform show -json.",
+    )

@@ -54,6 +54,7 @@ type SocketEvent =
       result?: {
         status?: string;
         question?: string | null;
+        infrastructure_request_id?: number;
         [key: string]: unknown;
       };
       question?: string | null;
@@ -74,6 +75,7 @@ type SocketEvent =
 
 export default function ChatPanel() {
   const [conversationId, setConversationId] = useState<number | null>(null);
+  const [infrastructureRequestId, setInfrastructureRequestId] = useState<number | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
@@ -169,6 +171,7 @@ export default function ChatPanel() {
 
         setMessages(history);
         setConversationId(conversation.id);
+        setInfrastructureRequestId(null);
         setConnectionStatus("connecting");
         setError("");
       } catch (err) {
@@ -312,12 +315,19 @@ export default function ChatPanel() {
         }
 
         if (data.type === "requirements_result") {
+          const requestId = data.result?.infrastructure_request_id;
+
+          if (typeof requestId === "number") {
+            setInfrastructureRequestId(requestId);
+          }
+
           if (data.result?.status === "complete") {
             pendingContentRef.current = null;
             setInput("");
             setLoading(false);
             setError("");
           }
+
           return;
         }
 
@@ -411,8 +421,9 @@ export default function ChatPanel() {
       sessionStorage.setItem(SESSION_KEY, newSessionId);
       sessionIdRef.current = newSessionId;
 
-      // Clear the previous conversation from the interface.
+      // Clear the previous conversation and its request ID.
       setMessages([]);
+      setInfrastructureRequestId(null);
       setInput("");
       setLoading(false);
       setError("");
@@ -655,6 +666,12 @@ export default function ChatPanel() {
           not enabled yet.
         </Typography>
       </Stack>
+      {infrastructureRequestId !== null && (
+  <Typography variant="caption" color="text.secondary">
+    Infrastructure Request ID: {infrastructureRequestId}
+  </Typography>
+)}
     </Paper>
   );
 }
+

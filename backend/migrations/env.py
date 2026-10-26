@@ -9,6 +9,7 @@ from sqlalchemy.engine import URL
 from dotenv import load_dotenv
 
 from backend.app.models.base import Base
+from backend.app.models.approval import ApprovalAuditEvent, ApprovalRequest
 from backend.app.models.conversation import Conversation
 from backend.app.models.messages import Message
 from backend.app.models.infrastructure_request import InfrastructureRequest

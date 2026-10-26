@@ -3,6 +3,7 @@
 
 import json
 import re
+from pathlib import Path
 
 from backend.app.schemas.infrastructure import (
     ValidatedInfrastructureSpecification,
@@ -77,7 +78,12 @@ def generate_terraform(
     operating_system = (
         (specification.operating_system or "linux").strip().lower()
     )
-    if operating_system not in {"linux", "amazon linux", "amazon linux 2023"}:
+
+    if operating_system not in {
+        "linux",
+        "amazon linux",
+        "amazon linux 2023",
+    }:
         raise TerraformGenerationError(
             "The initial generator supports Amazon Linux 2023 only."
         )
@@ -179,3 +185,23 @@ resource "aws_instance" "this" {{
   }}
 }}
 '''
+
+
+def write_terraform_configuration(
+    specification: ValidatedInfrastructureSpecification,
+    output_dir: str | Path,
+) -> Path:
+    """Generate Terraform and write it to a local main.tf file.
+
+    This function writes a local file only. It never executes Terraform
+    or provisions cloud resources.
+    """
+    configuration = generate_terraform(specification)
+
+    destination = Path(output_dir).expanduser()
+    destination.mkdir(parents=True, exist_ok=True)
+
+    output_file = destination / "main.tf"
+    output_file.write_text(configuration, encoding="utf-8")
+
+    return output_file

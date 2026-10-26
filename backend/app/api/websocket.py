@@ -227,7 +227,10 @@ async def conversation_websocket(
 
             await websocket.send_json({
                 "type": "requirements_result",
-                "result": result,
+                "result": {
+                    **result,
+                    "infrastructure_request_id": request_record.id,
+                },
             })
 
             # Save and return a clarification, or confirm a completed request.

@@ -180,3 +180,75 @@ def test_preview_api_rejects_unsupported_specification(client, auth_headers):
     )
 
     assert response.status_code == 422
+
+
+def test_plan_parse_api_rejects_missing_token(client):
+    response = client.post(
+        "/terraform/plan/parse",
+        json={"plan": {"resource_changes": []}},
+    )
+
+    assert response.status_code == 401
+
+
+def test_plan_parse_api_accepts_authenticated_user(client, auth_headers):
+    plan = {
+        "terraform_version": "1.15.6",
+        "format_version": "1.2",
+        "resource_changes": [
+            {
+                "address": "aws_instance.this",
+                "mode": "managed",
+                "type": "aws_instance",
+                "name": "this",
+                "change": {
+                    "actions": ["create"],
+                    "before": None,
+                    "after": {"instance_type": "c6i.xlarge"},
+                },
+            }
+        ],
+    }
+
+    response = client.post(
+        "/terraform/plan/parse",
+        headers=auth_headers,
+        json={"plan": plan},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["preview_type"] == "terraform_plan_json"
+    assert body["is_real_terraform_plan"] is True
+    assert body["deployment_enabled"] is False
+    assert body["resource_summary"]["create"] == 1
+    assert body["resources"][0]["address"] == "aws_instance.this"
+
+
+def test_plan_parse_api_rejects_invalid_plan_structure(
+    client,
+    auth_headers,
+):
+    response = client.post(
+        "/terraform/plan/parse",
+        headers=auth_headers,
+        json={"plan": {"resource_changes": {}}},
+    )
+
+    assert response.status_code == 422
+
+
+def test_plan_parse_api_rejects_extra_request_fields(
+    client,
+    auth_headers,
+):
+    response = client.post(
+        "/terraform/plan/parse",
+        headers=auth_headers,
+        json={
+            "plan": {"resource_changes": []},
+            "unexpected": True,
+        },
+    )
+
+    assert response.status_code == 422

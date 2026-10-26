@@ -10,6 +10,7 @@ from backend.app.schemas.infrastructure import (
     ValidatedInfrastructureSpecification,
 )
 from backend.app.services.terraform.generator import (
+    INSTANCE_CATALOG,
     TerraformGenerationError,
     generate_terraform,
 )
@@ -20,7 +21,7 @@ def build_plan_preview(
 ) -> dict[str, Any]:
     """Return a proposed-resource summary for the validated specification."""
 
-    # Reuse the existing generator as the source of supported configurations.
+    # Reuse the generator as the source of supported configurations.
     terraform_configuration = generate_terraform(specification)
 
     # The initial generator creates these two managed resources.
@@ -54,16 +55,7 @@ def build_plan_preview(
         "data.aws_subnets.default_vpc",
     ]
 
-    instance_catalog = {
-        (2, 2): "t3.small",
-        (2, 4): "t3.medium",
-        (2, 8): "t3.large",
-        (4, 8): "c6i.xlarge",
-        (4, 16): "m6i.xlarge",
-        (8, 16): "c6i.2xlarge",
-        (8, 32): "m6i.2xlarge",
-    }
-    instance_type = instance_catalog.get(
+    instance_type = INSTANCE_CATALOG.get(
         (specification.vcpus, specification.memory_gb)
     )
 

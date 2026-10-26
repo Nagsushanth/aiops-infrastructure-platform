@@ -1,4 +1,5 @@
 
+import TerraformPlanReview from "./TerraformPlanReview";
 import { useEffect, useState } from "react";
 import {
   AppBar,
@@ -22,6 +23,8 @@ import CheckCircleIcon from "@mui/icons-material/CheckCircle";
 import AuthPanel from "./AuthPanel";
 import ChatPanel from "./ChatPanel";
 import TerraformPreview from "./TerraformPreview";
+import ApprovalPanel from "./ApprovalPanel";
+import ApprovalReviewPanel from "./ApprovalReviewPanel";
 
 import {
   checkBackendHealth,
@@ -178,11 +181,7 @@ export default function App() {
             }}
           />
 
-          <Button
-            color="inherit"
-            onClick={handleLogout}
-            sx={{ ml: 1 }}
-          >
+          <Button color="inherit" onClick={handleLogout} sx={{ ml: 1 }}>
             Logout
           </Button>
         </Toolbar>
@@ -347,7 +346,19 @@ export default function App() {
           </Box>
 
           <Box sx={{ mt: 3 }}>
+            <TerraformPlanReview />
+          </Box>
+
+          <Box sx={{ mt: 3 }}>
             <ChatPanel />
+          </Box>
+
+          <Box sx={{ mt: 3 }}>
+            <ApprovalPanel />
+          </Box>
+
+          <Box sx={{ mt: 3 }}>
+            <ApprovalReviewPanel />
           </Box>
 
           <Typography

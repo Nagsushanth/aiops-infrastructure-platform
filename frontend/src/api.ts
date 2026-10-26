@@ -37,7 +37,7 @@ export interface ChatMessage {
   created_at: string;
 }
 
-async function apiRequest<T>(
+export async function apiRequest<T>(
   path: string,
   options: RequestInit = {},
   authenticated = true,
@@ -189,5 +189,73 @@ export async function createTerraformPreview(
   return apiRequest<TerraformPreviewResponse>("/terraform/preview", {
     method: "POST",
     body: JSON.stringify(specification),
+  });
+}
+
+
+export interface TerraformPlanResource {
+  address: string | null;
+  mode: string;
+  type: string | null;
+  name: string | null;
+  provider_name: string | null;
+  actions: string[];
+  before: unknown;
+  after: unknown;
+  after_unknown: unknown;
+  action_reason: string | null;
+}
+
+export interface TerraformPlanReviewResponse {
+  preview_type: string;
+  is_real_terraform_plan: boolean;
+  deployment_enabled: boolean;
+  terraform_version: string | null;
+  format_version: string | null;
+  resource_summary: {
+    create: number;
+    update: number;
+    delete: number;
+    replace: number;
+    read: number;
+    no_op: number;
+    other: number;
+    total_resource_changes: number;
+  };
+  resources: TerraformPlanResource[];
+}
+
+export async function parseTerraformPlan(
+  plan: Record<string, unknown>,
+): Promise<TerraformPlanReviewResponse> {
+  return apiRequest<TerraformPlanReviewResponse>("/terraform/plan/parse", {
+    method: "POST",
+    body: JSON.stringify({ plan }),
+  });
+}
+
+export interface ApprovalResponse {
+  id: number;
+  infrastructure_request_id: number;
+  requester_id: number;
+  reviewer_id: number | null;
+  status: string;
+  plan_summary: Record<string, unknown>;
+  reviewer_comments: string | null;
+  decided_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export async function createApproval(
+  infrastructureRequestId: number,
+  plan: Record<string, unknown>,
+): Promise<ApprovalResponse> {
+  return apiRequest<ApprovalResponse>("/approvals", {
+    method: "POST",
+    body: JSON.stringify({
+      infrastructure_request_id: infrastructureRequestId,
+      plan,
+    }),
   });
 }

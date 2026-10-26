@@ -12,6 +12,7 @@ from backend.app.api.websocket import router as websocket_router
 from backend.app.api.requirements import router as requirements_router
 from backend.app.api.terraform_preview import router as terraform_preview_router
 from backend.app.api.auth import router as auth_router
+from backend.app.api.approvals import router as approvals_router
 
 from typing import Annotated
 
@@ -30,6 +31,7 @@ app.include_router(conversations_router)
 app.include_router(requirements_router)
 app.include_router(terraform_preview_router)
 app.include_router(auth_router)
+app.include_router(approvals_router)
 
 app.add_middleware(
     CORSMiddleware,

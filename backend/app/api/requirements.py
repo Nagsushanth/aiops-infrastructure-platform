@@ -81,4 +81,7 @@ def gather_infrastructure_requirements(
             detail="Could not save infrastructure requirements.",
         ) from exc
 
-    return result
+    return {
+    **result,
+    "infrastructure_request_id": request_record.id,
+}
