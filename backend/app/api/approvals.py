@@ -1,3 +1,6 @@
+
+import hashlib
+import json
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -9,18 +12,15 @@ from backend.app.core.dependencies import get_db
 from backend.app.models.approval import ApprovalAuditEvent, ApprovalRequest
 from backend.app.models.conversation import Conversation
 from backend.app.models.infrastructure_request import InfrastructureRequest
+from backend.app.models.terraform_plan import TerraformPlanRecord
 from backend.app.schemas.approval import (
     ApprovalAuditResponse,
     ApprovalCreate,
     ApprovalDecision,
     ApprovalResponse,
 )
-import hashlib
-import json
-
-from backend.app.services.terraform.plan_parser import (
-    TerraformPlanParsingError,
-    parse_terraform_plan,
+from backend.app.schemas.infrastructure import (
+    ValidatedInfrastructureSpecification,
 )
 
 router = APIRouter(prefix="/approvals", tags=["Approvals"])
@@ -53,6 +53,29 @@ def ensure_can_view(
         )
 
 
+def _fingerprint_specification(
+    specification: ValidatedInfrastructureSpecification,
+) -> str:
+    """Return SHA-256 for the canonical validated specification."""
+    canonical = json.dumps(
+        specification.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _is_sha256_fingerprint(value: str | None) -> bool:
+    """Check that a fingerprint is a 64-character hexadecimal SHA-256."""
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value.lower())
+    )
+
+
 @router.post(
     "",
     response_model=ApprovalResponse,
@@ -63,6 +86,8 @@ def create_approval(
     current_user: CurrentUser,
     db: Session = Depends(get_db),
 ):
+    """Create an approval request linked to a trusted Terraform plan record."""
+
     infrastructure_request = db.get(
         InfrastructureRequest,
         payload.infrastructure_request_id,
@@ -104,65 +129,107 @@ def create_approval(
     if existing is not None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="An approval request already exists for this infrastructure request.",
+            detail=(
+                "An approval request already exists for this "
+                "infrastructure request."
+            ),
         )
 
-    try:
-        parsed_plan = parse_terraform_plan(payload.plan)
-    except TerraformPlanParsingError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Invalid Terraform plan: {exc}",
-        ) from exc
-
-    # Require a plan that is explicitly marked as complete and applyable.
-    if (
-        payload.plan.get("errored") is not False
-        or payload.plan.get("complete") is not True
-        or payload.plan.get("applyable") is not True
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="The plan must be complete, applyable, and free of errors.",
-        )
-
-    canonical_plan = json.dumps(
-        payload.plan,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
+    plan_record = db.get(
+        TerraformPlanRecord,
+        payload.terraform_plan_record_id,
     )
 
-    plan_fingerprint = hashlib.sha256(
-        canonical_plan.encode("utf-8")
-    ).hexdigest()
+    # Hide plans belonging to another user or infrastructure request.
+    if (
+        plan_record is None
+        or plan_record.infrastructure_request_id != infrastructure_request.id
+        or plan_record.requester_id != current_user.id
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Trusted Terraform plan record not found.",
+        )
+
+    if plan_record.status != "succeeded":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Only successfully generated Terraform plans "
+                "can be submitted for approval."
+            ),
+        )
+
+    if not _is_sha256_fingerprint(plan_record.plan_fingerprint):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The Terraform plan record has no valid fingerprint.",
+        )
+
+    if not _is_sha256_fingerprint(plan_record.specification_fingerprint):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The Terraform plan specification fingerprint is invalid.",
+        )
+
+    # Revalidate the current requirements and ensure the plan is not stale.
+    try:
+        specification = ValidatedInfrastructureSpecification.model_validate(
+            infrastructure_request.requirements
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Infrastructure requirements are no longer valid.",
+        ) from exc
+
+    current_fingerprint = _fingerprint_specification(specification)
+
+    if plan_record.specification_fingerprint != current_fingerprint:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Infrastructure requirements changed after plan generation. "
+                "Generate a new Terraform plan."
+            ),
+        )
 
     approval = ApprovalRequest(
         infrastructure_request_id=infrastructure_request.id,
+        terraform_plan_record_id=plan_record.id,
         requester_id=current_user.id,
         status="pending",
-        plan_summary=parsed_plan,
-        plan_fingerprint=plan_fingerprint,
+        plan_summary=plan_record.plan_summary,
+        plan_fingerprint=plan_record.plan_fingerprint,
     )
 
-    db.add(approval)
-    db.flush()
+    try:
+        db.add(approval)
+        db.flush()
 
-    db.add(
-        ApprovalAuditEvent(
-            approval_request_id=approval.id,
-            actor_id=current_user.id,
-            event_type="submitted",
-            previous_status=None,
-            new_status="pending",
-            comments=None,
-            event_metadata={"source": "approval_api","plan_fingerprint": plan_fingerprint,},
+        db.add(
+            ApprovalAuditEvent(
+                approval_request_id=approval.id,
+                actor_id=current_user.id,
+                event_type="submitted",
+                previous_status=None,
+                new_status="pending",
+                comments=None,
+                event_metadata={
+                    "source": "trusted_terraform_plan",
+                    "terraform_plan_record_id": plan_record.id,
+                    "plan_fingerprint": plan_record.plan_fingerprint,
+                },
+            )
         )
-    )
 
-    db.commit()
-    db.refresh(approval)
-    return approval
+        db.commit()
+        db.refresh(approval)
+        return approval
+
+    except Exception:
+        db.rollback()
+        raise
 
 
 @router.get("", response_model=list[ApprovalResponse])
@@ -207,7 +274,10 @@ def get_approval_audit(
     statement = (
         select(ApprovalAuditEvent)
         .where(ApprovalAuditEvent.approval_request_id == approval.id)
-        .order_by(ApprovalAuditEvent.created_at, ApprovalAuditEvent.id)
+        .order_by(
+            ApprovalAuditEvent.created_at,
+            ApprovalAuditEvent.id,
+        )
     )
 
     return list(db.scalars(statement).all())
@@ -220,7 +290,7 @@ def decide_approval(
     reviewer: AdminUser,
     db: Session = Depends(get_db),
 ):
-    # Lock the approval row so simultaneous decisions cannot both succeed.
+    # Lock the approval row so concurrent decisions cannot both succeed.
     statement = (
         select(ApprovalRequest)
         .where(ApprovalRequest.id == approval_id)
@@ -267,6 +337,10 @@ def decide_approval(
         )
     )
 
-    db.commit()
-    db.refresh(approval)
-    return approval
+    try:
+        db.commit()
+        db.refresh(approval)
+        return approval
+    except Exception:
+        db.rollback()
+        raise

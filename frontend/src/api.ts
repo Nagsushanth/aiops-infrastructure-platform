@@ -156,6 +156,30 @@ export interface TerraformPreviewResource {
   description: string;
 }
 
+
+export interface TerraformCostEstimate {
+  status: "estimated" | "unavailable";
+  currency: string;
+  instance_type: string;
+  region: string;
+  estimated_monthly_compute_cost: string | null;
+  budget_threshold: string | null;
+  budget_status:
+    | "within_threshold"
+    | "exceeds_threshold"
+    | "not_configured"
+    | "not_evaluated";
+  pricing_source?: string;
+  pricing_verified_on?: string;
+  assumptions?: {
+    hours_per_month: string;
+    hourly_rate_usd?: string;
+    includes?: string[];
+    excludes?: string[];
+  };
+  note: string;
+}
+
 export interface TerraformPreviewResponse {
   preview_type: string;
   is_real_terraform_plan: boolean;
@@ -171,8 +195,29 @@ export interface TerraformPreviewResponse {
     total_managed_resources: number;
   };
   resources: TerraformPreviewResource[];
-  [key: string]: unknown;
+  configuration?: {
+    resource_type: string;
+    instance_type: string;
+    vcpus: number;
+    memory_gb: number;
+    operating_system: string;
+    public_ip_associated: boolean;
+    inbound_security_group_rules: number;
+    root_volume_encrypted: boolean;
+    imds_v2_required: boolean;
+  };
+  estimated_monthly_cost: string | null;
+  cost_estimate_note: string;
+  cost_estimate: TerraformCostEstimate;
+  approval: {
+    technical_review: string;
+    cost_review: string;
+    security_review: string;
+  };
+  warnings: string[];
+  terraform_configuration?: string;
 }
+
 
 export async function createTerraformPreview(
   specification: {

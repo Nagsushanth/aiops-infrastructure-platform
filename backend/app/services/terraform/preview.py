@@ -4,10 +4,14 @@
 This module does not execute Terraform or provision cloud resources.
 """
 
+from decimal import Decimal
 from typing import Any
 
 from backend.app.schemas.infrastructure import (
     ValidatedInfrastructureSpecification,
+)
+from backend.app.services.terraform.cost_estimator import (
+    estimate_ec2_monthly_cost,
 )
 from backend.app.services.terraform.generator import (
     INSTANCE_CATALOG,
@@ -18,13 +22,17 @@ from backend.app.services.terraform.generator import (
 
 def build_plan_preview(
     specification: ValidatedInfrastructureSpecification,
+    pricing_catalog: dict[str, Any] | None = None,
+    budget_threshold: Decimal | int | float | str | None = None,
 ) -> dict[str, Any]:
-    """Return a proposed-resource summary for the validated specification."""
+    """Return a proposed-resource summary and a transparent cost estimate.
 
-    # Reuse the generator as the source of supported configurations.
+    Pricing is supplied by trusted server-side code. The default empty
+    catalog deliberately produces an unavailable estimate, not a guessed rate.
+    """
+
     terraform_configuration = generate_terraform(specification)
 
-    # The initial generator creates these two managed resources.
     resources = [
         {
             "address": "aws_security_group.instance",
@@ -47,8 +55,6 @@ def build_plan_preview(
         },
     ]
 
-    # Data sources are read during a real Terraform plan; they are not
-    # managed resources being created by this preview.
     data_sources = [
         "data.aws_ami.amazon_linux_2023",
         "data.aws_vpc.default",
@@ -60,10 +66,30 @@ def build_plan_preview(
     )
 
     if instance_type is None:
-        # Normally the generator raises first; retain this guard so the
-        # preview never returns a misleading instance size.
         raise TerraformGenerationError(
             "No supported instance type matches the requested CPU and memory."
+        )
+
+    cost_estimate = estimate_ec2_monthly_cost(
+        instance_type=instance_type,
+        region=specification.region,
+        pricing_catalog=pricing_catalog or {},
+        budget_threshold=budget_threshold,
+    )
+
+    estimated_monthly_cost = cost_estimate[
+        "estimated_monthly_compute_cost"
+    ]
+
+    if cost_estimate["status"] == "estimated":
+        cost_estimate_note = (
+            "Compute-only estimate based on the configured pricing catalog. "
+            "It excludes additional AWS charges and is not a bill prediction."
+        )
+    else:
+        cost_estimate_note = (
+            "Not calculated: no verified price is configured for this "
+            "instance type and region."
         )
 
     return {
@@ -96,11 +122,11 @@ def build_plan_preview(
             "imds_v2_required": True,
         },
         "terraform_configuration": terraform_configuration,
-        "estimated_monthly_cost": None,
-        "cost_estimate_note": (
-            "Not calculated. A reliable estimate requires pricing data, "
-            "usage assumptions, and environment-specific validation."
-        ),
+        # Retained for compatibility with existing clients and tests.
+        "estimated_monthly_cost": estimated_monthly_cost,
+        "cost_estimate_note": cost_estimate_note,
+        # New structured information for the review UI and budget workflow.
+        "cost_estimate": cost_estimate,
         "approval": {
             "technical_review": "pending",
             "cost_review": "pending",

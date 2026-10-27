@@ -1,3 +1,4 @@
+
 from datetime import datetime
 from typing import Any, Literal
 
@@ -8,7 +9,7 @@ class ApprovalCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     infrastructure_request_id: int = Field(gt=0)
-    plan: dict[str, Any]
+    terraform_plan_record_id: int = Field(gt=0)
 
 
 class ApprovalDecision(BaseModel):
@@ -23,6 +24,7 @@ class ApprovalResponse(BaseModel):
 
     id: int
     infrastructure_request_id: int
+    terraform_plan_record_id: int | None
     requester_id: int
     reviewer_id: int | None
     status: str

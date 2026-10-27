@@ -219,7 +219,8 @@ def test_plan_parse_api_accepts_authenticated_user(client, auth_headers):
     assert response.status_code == 200
     body = response.json()
     assert body["preview_type"] == "terraform_plan_json"
-    assert body["is_real_terraform_plan"] is True
+    assert body["is_real_terraform_plan"] is False
+    assert body["source_verified"] is False
     assert body["deployment_enabled"] is False
     assert body["resource_summary"]["create"] == 1
     assert body["resources"][0]["address"] == "aws_instance.this"
@@ -252,3 +253,58 @@ def test_plan_parse_api_rejects_extra_request_fields(
     )
 
     assert response.status_code == 422
+
+
+def test_preview_cost_is_unavailable_without_verified_pricing():
+    preview = build_plan_preview(make_spec())
+
+    assert preview["estimated_monthly_cost"] is None
+    assert preview["cost_estimate"]["status"] == "unavailable"
+    assert preview["cost_estimate"]["budget_status"] == "not_evaluated"
+    assert "no verified price" in preview["cost_estimate_note"].lower()
+
+
+def test_preview_estimates_cost_from_supplied_pricing_catalog():
+    # Test-only rate. This is not a verified AWS price.
+    test_catalog = {
+        "ap-south-1": {
+            "c6i.xlarge": {
+                "hourly_usd": "0.10",
+                "source": "Test fixture only",
+                "verified_on": "2026-10-27",
+            }
+        }
+    }
+
+    preview = build_plan_preview(
+        make_spec(),
+        pricing_catalog=test_catalog,
+        budget_threshold=50,
+    )
+
+    assert preview["configuration"]["instance_type"] == "c6i.xlarge"
+    assert preview["estimated_monthly_cost"] == "73.00"
+    assert preview["cost_estimate"]["status"] == "estimated"
+    assert preview["cost_estimate"]["budget_status"] == "exceeds_threshold"
+    assert preview["cost_estimate"]["pricing_source"] == "Test fixture only"
+    assert preview["deployment_enabled"] is False
+
+
+def test_preview_cost_within_budget():
+    test_catalog = {
+        "ap-south-1": {
+            "c6i.xlarge": {
+                "hourly_usd": "0.10",
+                "source": "Test fixture only",
+                "verified_on": "2026-10-27",
+            }
+        }
+    }
+
+    preview = build_plan_preview(
+        make_spec(),
+        pricing_catalog=test_catalog,
+        budget_threshold=100,
+    )
+
+    assert preview["cost_estimate"]["budget_status"] == "within_threshold"

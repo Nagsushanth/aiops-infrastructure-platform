@@ -276,11 +276,108 @@ export default function TerraformPreview() {
               </Card>
             ))}
 
-            <Alert severity="warning" sx={{ mt: 2 }}>
-              Technical, cost and security reviews are pending. This is not a
-              real Terraform plan, no verified cost estimate is available,
-              and no deployment has been performed.
-            </Alert>
+
+<Stack spacing={2} sx={{ mt: 2 }}>
+  <Card variant="outlined" sx={{ borderRadius: 2 }}>
+    <CardContent>
+      <Typography variant="h6" sx={{ fontWeight: 700, mb: 1 }}>
+        Cost Estimation
+      </Typography>
+
+      {preview.cost_estimate?.status === "estimated" ? (
+        <>
+          <Typography variant="h5" sx={{ fontWeight: 700 }}>
+            {preview.cost_estimate.currency}{" "}
+            {preview.cost_estimate.estimated_monthly_compute_cost}
+            <Typography
+              component="span"
+              variant="body2"
+              color="text.secondary"
+            >
+              {" "}/ month
+            </Typography>
+          </Typography>
+
+          <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
+            Compute estimate only. Storage, networking, data transfer, taxes
+            and other services may add costs.
+          </Typography>
+
+          {preview.cost_estimate.pricing_source && (
+            <Typography variant="body2" sx={{ mt: 1 }}>
+              Pricing source: {preview.cost_estimate.pricing_source}
+            </Typography>
+          )}
+
+          {preview.cost_estimate.pricing_verified_on && (
+            <Typography variant="body2">
+              Pricing verified on: {preview.cost_estimate.pricing_verified_on}
+            </Typography>
+          )}
+        </>
+      ) : (
+        <Alert severity="info">
+          Cost estimate unavailable. Verified pricing has not been configured.
+          No price is assumed.
+        </Alert>
+      )}
+
+      <Divider sx={{ my: 2 }} />
+
+      <Typography variant="subtitle2" sx={{ fontWeight: 700, mb: 1 }}>
+        Budget Status
+      </Typography>
+
+      <Chip
+        label={preview.cost_estimate?.budget_status
+          ?.replace(/_/g, " ") ?? "not evaluated"}
+        variant="outlined"
+      />
+
+      {preview.cost_estimate?.budget_threshold != null && (
+        <Typography variant="body2" sx={{ mt: 1 }}>
+          Budget threshold: {preview.cost_estimate.currency}{" "}
+          {preview.cost_estimate.budget_threshold}
+        </Typography>
+      )}
+
+      {preview.cost_estimate?.note && (
+        <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
+          {preview.cost_estimate.note}
+        </Typography>
+      )}
+    </CardContent>
+  </Card>
+
+  <Card variant="outlined" sx={{ borderRadius: 2 }}>
+    <CardContent>
+      <Typography variant="h6" sx={{ fontWeight: 700, mb: 2 }}>
+        Approval Review
+      </Typography>
+
+      <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: "wrap" }}>
+        <Chip
+          label={`Technical: ${preview.approval?.technical_review ?? "pending"}`}
+          variant="outlined"
+        />
+        <Chip
+          label={`Cost: ${preview.approval?.cost_review ?? "pending"}`}
+          variant="outlined"
+        />
+        <Chip
+          label={`Security: ${preview.approval?.security_review ?? "pending"}`}
+          variant="outlined"
+        />
+      </Stack>
+    </CardContent>
+  </Card>
+
+  <Alert severity="warning">
+    This is a local preview, not a real Terraform execution plan. Reviews
+    are not automatically approved, and deployment remains disabled.
+  </Alert>
+</Stack>
+
           </Box>
         )}
       </CardContent>

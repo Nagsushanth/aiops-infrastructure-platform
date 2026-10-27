@@ -53,7 +53,8 @@ def test_parses_realistic_resource_changes():
     result = parse_terraform_plan(sample_plan())
 
     assert result["preview_type"] == "terraform_plan_json"
-    assert result["is_real_terraform_plan"] is True
+    assert result["is_real_terraform_plan"] is False
+    assert result["source_verified"] is False
     assert result["deployment_enabled"] is False
     assert result["resource_summary"]["create"] == 2
     assert result["resource_summary"]["total_resource_changes"] == 2

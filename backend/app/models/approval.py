@@ -25,6 +25,12 @@ class ApprovalRequest(Base):
         index=True,
     )
 
+    terraform_plan_record_id: Mapped[int | None] = mapped_column(
+        ForeignKey("terraform_plan_records.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+
     requester_id: Mapped[int] = mapped_column(
         ForeignKey("users.id", ondelete="RESTRICT"),
         nullable=False,

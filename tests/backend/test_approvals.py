@@ -1,3 +1,4 @@
+
 import hashlib
 import json
 
@@ -14,14 +15,20 @@ from backend.app.models.base import Base
 from backend.app.models.approval import ApprovalAuditEvent, ApprovalRequest
 from backend.app.models.conversation import Conversation
 from backend.app.models.infrastructure_request import InfrastructureRequest
+from backend.app.models.terraform_plan import TerraformPlanRecord
 from backend.app.models.user import User
+from backend.app.schemas.infrastructure import (
+    ValidatedInfrastructureSpecification,
+)
 
 
+# Isolated in-memory database for tests only.
 test_engine = create_engine(
     "sqlite://",
     connect_args={"check_same_thread": False},
     poolclass=StaticPool,
 )
+
 TestingSessionLocal = sessionmaker(
     bind=test_engine,
     autoflush=False,
@@ -42,11 +49,12 @@ def client():
 
     app.dependency_overrides[get_db] = override_get_db
 
-    with TestClient(app) as test_client:
-        yield test_client
-
-    app.dependency_overrides.clear()
-    Base.metadata.drop_all(bind=test_engine)
+    try:
+        with TestClient(app) as test_client:
+            yield test_client
+    finally:
+        app.dependency_overrides.clear()
+        Base.metadata.drop_all(bind=test_engine)
 
 
 @pytest.fixture
@@ -65,6 +73,7 @@ def setup_data(client):
             role="admin",
             is_active=True,
         )
+
         db.add_all([requester, reviewer])
         db.flush()
 
@@ -92,7 +101,7 @@ def setup_data(client):
         db.add(infra_request)
         db.commit()
 
-        result = {
+        return {
             "requester_id": requester.id,
             "reviewer_id": reviewer.id,
             "infra_request_id": infra_request.id,
@@ -107,7 +116,6 @@ def setup_data(client):
                 )
             },
         }
-        return result
     finally:
         db.close()
 
@@ -142,7 +150,143 @@ def valid_plan():
     }
 
 
-def test_create_approval_calculates_fingerprint_and_audit(
+def _fingerprint_specification(requirements):
+    """Match the production specification fingerprint format."""
+    specification = ValidatedInfrastructureSpecification.model_validate(
+        requirements
+    )
+    canonical_specification = json.dumps(
+        specification.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(
+        canonical_specification.encode("utf-8")
+    ).hexdigest()
+
+
+def _fingerprint_plan(plan):
+    """Generate a deterministic fingerprint for test fixtures."""
+    canonical_plan = json.dumps(
+        plan,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(
+        canonical_plan.encode("utf-8")
+    ).hexdigest()
+
+
+def create_trusted_plan_record(setup_data, plan=None):
+    """
+    Create a successful Terraform plan record for isolated tests.
+
+    This is test-only database setup. It does not run Terraform or
+    prove that the fixture represents a real cloud plan.
+    """
+    if plan is None:
+        plan = {
+            "preview_type": "test_fixture",
+            "resources": [],
+        }
+
+    db = TestingSessionLocal()
+    try:
+        infra_request = db.get(
+            InfrastructureRequest,
+            setup_data["infra_request_id"],
+        )
+        assert infra_request is not None
+
+        plan_record = TerraformPlanRecord(
+            infrastructure_request_id=infra_request.id,
+            requester_id=setup_data["requester_id"],
+            status="succeeded",
+            plan_fingerprint=_fingerprint_plan(plan),
+            specification_fingerprint=_fingerprint_specification(
+                infra_request.requirements
+            ),
+            plan_summary=plan,
+        )
+        db.add(plan_record)
+        db.commit()
+        db.refresh(plan_record)
+
+        return plan_record.id
+    finally:
+        db.close()
+
+
+def create_pending_approval(setup_data, plan=None):
+    """
+    Create a linked plan record, pending approval, and audit event.
+
+    This helper is only for test setup. It does not bypass the production
+    API security safeguard or create real cloud infrastructure.
+    """
+    if plan is None:
+        plan = {
+            "preview_type": "test_fixture",
+            "resources": [],
+        }
+
+    db = TestingSessionLocal()
+    try:
+        infra_request = db.get(
+            InfrastructureRequest,
+            setup_data["infra_request_id"],
+        )
+        assert infra_request is not None
+
+        plan_record = TerraformPlanRecord(
+            infrastructure_request_id=infra_request.id,
+            requester_id=setup_data["requester_id"],
+            status="succeeded",
+            plan_fingerprint=_fingerprint_plan(plan),
+            specification_fingerprint=_fingerprint_specification(
+                infra_request.requirements
+            ),
+            plan_summary=plan,
+        )
+        db.add(plan_record)
+        db.flush()
+
+        approval = ApprovalRequest(
+            infrastructure_request_id=infra_request.id,
+            terraform_plan_record_id=plan_record.id,
+            requester_id=setup_data["requester_id"],
+            status="pending",
+            plan_summary=plan,
+            plan_fingerprint=plan_record.plan_fingerprint,
+        )
+        db.add(approval)
+        db.flush()
+
+        db.add(
+            ApprovalAuditEvent(
+                approval_request_id=approval.id,
+                actor_id=setup_data["requester_id"],
+                event_type="submitted",
+                previous_status=None,
+                new_status="pending",
+                comments=None,
+                event_metadata={
+                    "source": "test_fixture",
+                    "terraform_plan_record_id": plan_record.id,
+                },
+            )
+        )
+
+        db.commit()
+        db.refresh(approval)
+        return approval.id
+    finally:
+        db.close()
+
+
+def test_client_submitted_plan_is_rejected(
     client, setup_data, valid_plan
 ):
     response = client.post(
@@ -154,36 +298,21 @@ def test_create_approval_calculates_fingerprint_and_audit(
         },
     )
 
-    assert response.status_code == 201, response.text
-    body = response.json()
-
-    canonical = json.dumps(
-        valid_plan,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-    )
-    expected_fingerprint = hashlib.sha256(
-        canonical.encode("utf-8")
-    ).hexdigest()
-
-    assert body["status"] == "pending"
-    assert len(expected_fingerprint) == 64
+    # "plan" is not an accepted field in ApprovalCreate.
+    assert response.status_code == 422, response.text
 
     db = TestingSessionLocal()
     try:
-        approval = db.get(ApprovalRequest, body["id"])
-        assert approval is not None
-        assert approval.plan_fingerprint == expected_fingerprint
-
-        audit = db.scalar(
-            select(ApprovalAuditEvent).where(
-                ApprovalAuditEvent.approval_request_id == approval.id
+        approval = db.scalar(
+            select(ApprovalRequest).where(
+                ApprovalRequest.infrastructure_request_id
+                == setup_data["infra_request_id"]
             )
         )
-        assert audit is not None
-        assert audit.event_type == "submitted"
-        assert audit.event_metadata["plan_fingerprint"] == expected_fingerprint
+        assert approval is None
+
+        audit = db.scalar(select(ApprovalAuditEvent))
+        assert audit is None
     finally:
         db.close()
 
@@ -196,7 +325,7 @@ def test_create_approval_calculates_fingerprint_and_audit(
         ("applyable", False),
     ],
 )
-def test_rejects_plan_with_invalid_status(
+def test_client_submitted_plan_is_rejected_regardless_of_flags(
     client, setup_data, valid_plan, field, value
 ):
     plan = dict(valid_plan)
@@ -211,28 +340,36 @@ def test_rejects_plan_with_invalid_status(
         },
     )
 
-    assert response.status_code == 422
+    # The API rejects client-supplied plan JSON at schema validation.
+    assert response.status_code == 422, response.text
 
 
 def test_duplicate_approval_returns_conflict(
     client, setup_data, valid_plan
 ):
-    payload = {
-        "infrastructure_request_id": setup_data["infra_request_id"],
-        "plan": valid_plan,
-    }
-    headers = setup_data["requester_headers"]
+    create_pending_approval(setup_data, valid_plan)
 
-    first = client.post("/approvals", headers=headers, json=payload)
-    second = client.post("/approvals", headers=headers, json=payload)
+    # The duplicate check should run before the plan record lookup.
+    response = client.post(
+        "/approvals",
+        headers=setup_data["requester_headers"],
+        json={
+            "infrastructure_request_id": setup_data["infra_request_id"],
+            "terraform_plan_record_id": 1,
+        },
+    )
 
-    assert first.status_code == 201, first.text
-    assert second.status_code == 409
+    assert response.status_code == 409, response.text
 
 
 def test_other_user_cannot_create_approval_for_request(
     client, setup_data, valid_plan
 ):
+    plan_record_id = create_trusted_plan_record(
+        setup_data,
+        valid_plan,
+    )
+
     db = TestingSessionLocal()
     try:
         other_user = User(
@@ -244,6 +381,7 @@ def test_other_user_cannot_create_approval_for_request(
         db.add(other_user)
         db.commit()
         db.refresh(other_user)
+
         headers = {
             "Authorization": (
                 f"Bearer {create_access_token(str(other_user.id))}"
@@ -257,26 +395,111 @@ def test_other_user_cannot_create_approval_for_request(
         headers=headers,
         json={
             "infrastructure_request_id": setup_data["infra_request_id"],
-            "plan": valid_plan,
+            "terraform_plan_record_id": plan_record_id,
         },
     )
 
-    assert response.status_code == 404
+    assert response.status_code == 404, response.text
+
+
+def test_approval_requires_successful_trusted_plan(
+    client, setup_data, valid_plan
+):
+    plan_record_id = create_trusted_plan_record(
+        setup_data,
+        valid_plan,
+    )
+
+    db = TestingSessionLocal()
+    try:
+        plan_record = db.get(TerraformPlanRecord, plan_record_id)
+        assert plan_record is not None
+        plan_record.status = "failed"
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.post(
+        "/approvals",
+        headers=setup_data["requester_headers"],
+        json={
+            "infrastructure_request_id": setup_data["infra_request_id"],
+            "terraform_plan_record_id": plan_record_id,
+        },
+    )
+
+    assert response.status_code == 409, response.text
+
+
+def test_approval_rejects_stale_plan_specification(
+    client, setup_data, valid_plan
+):
+    plan_record_id = create_trusted_plan_record(
+        setup_data,
+        valid_plan,
+    )
+
+    db = TestingSessionLocal()
+    try:
+        infra_request = db.get(
+            InfrastructureRequest,
+            setup_data["infra_request_id"],
+        )
+        assert infra_request is not None
+
+        changed_requirements = dict(infra_request.requirements)
+        changed_requirements["memory_gb"] = 8
+        infra_request.requirements = changed_requirements
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.post(
+        "/approvals",
+        headers=setup_data["requester_headers"],
+        json={
+            "infrastructure_request_id": setup_data["infra_request_id"],
+            "terraform_plan_record_id": plan_record_id,
+        },
+    )
+
+    assert response.status_code == 409, response.text
+    assert "changed after plan generation" in response.json()["detail"]
+
+
+def test_approval_uses_trusted_plan_record(
+    client, setup_data, valid_plan
+):
+    plan_record_id = create_trusted_plan_record(
+        setup_data,
+        valid_plan,
+    )
+
+    response = client.post(
+        "/approvals",
+        headers=setup_data["requester_headers"],
+        json={
+            "infrastructure_request_id": setup_data["infra_request_id"],
+            "terraform_plan_record_id": plan_record_id,
+        },
+    )
+
+    assert response.status_code == 201, response.text
+
+    result = response.json()
+    assert result["terraform_plan_record_id"] == plan_record_id
+    assert result["infrastructure_request_id"] == (
+        setup_data["infra_request_id"]
+    )
+    assert result["requester_id"] == setup_data["requester_id"]
+    assert result["status"] == "pending"
+    assert result["plan_summary"] == valid_plan
 
 
 def test_non_admin_cannot_make_approval_decision(
     client, setup_data, valid_plan
 ):
-    create_response = client.post(
-        "/approvals",
-        headers=setup_data["requester_headers"],
-        json={
-            "infrastructure_request_id": setup_data["infra_request_id"],
-            "plan": valid_plan,
-        },
-    )
-    assert create_response.status_code == 201, create_response.text
-    approval_id = create_response.json()["id"]
+    approval_id = create_pending_approval(setup_data, valid_plan)
 
     response = client.post(
         f"/approvals/{approval_id}/decision",
@@ -284,31 +507,25 @@ def test_non_admin_cannot_make_approval_decision(
         json={"decision": "approved", "comments": "Test"},
     )
 
-    assert response.status_code == 403
-
+    assert response.status_code == 403, response.text
 
 
 def test_admin_can_approve_and_audit_is_recorded(
     client, setup_data, valid_plan
 ):
-    create_response = client.post(
-        "/approvals",
-        headers=setup_data["requester_headers"],
-        json={
-            "infrastructure_request_id": setup_data["infra_request_id"],
-            "plan": valid_plan,
-        },
-    )
-    assert create_response.status_code == 201, create_response.text
-    approval_id = create_response.json()["id"]
+    approval_id = create_pending_approval(setup_data, valid_plan)
 
     decision_response = client.post(
         f"/approvals/{approval_id}/decision",
         headers=setup_data["reviewer_headers"],
-        json={"decision": "approved", "comments": "Reviewed successfully"},
+        json={
+            "decision": "approved",
+            "comments": "Reviewed successfully",
+        },
     )
 
     assert decision_response.status_code == 200, decision_response.text
+
     result = decision_response.json()
     assert result["status"] == "approved"
     assert result["reviewer_id"] == setup_data["reviewer_id"]
@@ -319,6 +536,7 @@ def test_admin_can_approve_and_audit_is_recorded(
         f"/approvals/{approval_id}/audit",
         headers=setup_data["reviewer_headers"],
     )
+
     assert audit_response.status_code == 200, audit_response.text
 
     events = audit_response.json()
@@ -335,21 +553,15 @@ def test_admin_can_approve_and_audit_is_recorded(
 def test_admin_can_reject_approval(
     client, setup_data, valid_plan
 ):
-    create_response = client.post(
-        "/approvals",
-        headers=setup_data["requester_headers"],
-        json={
-            "infrastructure_request_id": setup_data["infra_request_id"],
-            "plan": valid_plan,
-        },
-    )
-    assert create_response.status_code == 201, create_response.text
-    approval_id = create_response.json()["id"]
+    approval_id = create_pending_approval(setup_data, valid_plan)
 
     response = client.post(
         f"/approvals/{approval_id}/decision",
         headers=setup_data["reviewer_headers"],
-        json={"decision": "rejected", "comments": "Needs security review"},
+        json={
+            "decision": "rejected",
+            "comments": "Needs security review",
+        },
     )
 
     assert response.status_code == 200, response.text
@@ -360,23 +572,15 @@ def test_admin_can_reject_approval(
         f"/approvals/{approval_id}/audit",
         headers=setup_data["reviewer_headers"],
     )
-    assert audit_response.status_code == 200
+
+    assert audit_response.status_code == 200, audit_response.text
     assert audit_response.json()[-1]["event_type"] == "rejected"
 
 
 def test_cannot_decide_approval_twice(
     client, setup_data, valid_plan
 ):
-    create_response = client.post(
-        "/approvals",
-        headers=setup_data["requester_headers"],
-        json={
-            "infrastructure_request_id": setup_data["infra_request_id"],
-            "plan": valid_plan,
-        },
-    )
-    assert create_response.status_code == 201, create_response.text
-    approval_id = create_response.json()["id"]
+    approval_id = create_pending_approval(setup_data, valid_plan)
 
     first = client.post(
         f"/approvals/{approval_id}/decision",
@@ -390,7 +594,7 @@ def test_cannot_decide_approval_twice(
     )
 
     assert first.status_code == 200, first.text
-    assert second.status_code == 409
+    assert second.status_code == 409, second.text
     assert second.json()["detail"] == (
         "This approval request has already been decided."
     )
@@ -399,16 +603,7 @@ def test_cannot_decide_approval_twice(
 def test_requester_cannot_approve_own_request(
     client, setup_data, valid_plan
 ):
-    create_response = client.post(
-        "/approvals",
-        headers=setup_data["requester_headers"],
-        json={
-            "infrastructure_request_id": setup_data["infra_request_id"],
-            "plan": valid_plan,
-        },
-    )
-    assert create_response.status_code == 201, create_response.text
-    approval_id = create_response.json()["id"]
+    approval_id = create_pending_approval(setup_data, valid_plan)
 
     # The requester is not an admin, so the role check should deny this.
     response = client.post(
@@ -417,5 +612,72 @@ def test_requester_cannot_approve_own_request(
         json={"decision": "approved"},
     )
 
-    assert response.status_code == 403
+    assert response.status_code == 403, response.text
 
+
+def test_admin_cannot_approve_own_request(
+    client, setup_data, valid_plan
+):
+    # Promote the requester to admin for this specific test.
+    db = TestingSessionLocal()
+    try:
+        requester = db.get(User, setup_data["requester_id"])
+        assert requester is not None
+        requester.role = "admin"
+        db.commit()
+    finally:
+        db.close()
+
+    approval_id = create_pending_approval(setup_data, valid_plan)
+
+    response = client.post(
+        f"/approvals/{approval_id}/decision",
+        headers=setup_data["requester_headers"],
+        json={
+            "decision": "approved",
+            "comments": "Self-approval test",
+        },
+    )
+
+    assert response.status_code == 403, response.text
+    assert response.json()["detail"] == (
+        "You cannot approve or reject your own request."
+    )
+
+
+def test_other_user_cannot_read_approval_or_audit(
+    client, setup_data, valid_plan
+):
+    approval_id = create_pending_approval(setup_data, valid_plan)
+
+    db = TestingSessionLocal()
+    try:
+        other_user = User(
+            email="unauthorized-reader@example.com",
+            password_hash="test-hash",
+            role="user",
+            is_active=True,
+        )
+        db.add(other_user)
+        db.commit()
+        db.refresh(other_user)
+
+        other_headers = {
+            "Authorization": (
+                f"Bearer {create_access_token(str(other_user.id))}"
+            )
+        }
+    finally:
+        db.close()
+
+    approval_response = client.get(
+        f"/approvals/{approval_id}",
+        headers=other_headers,
+    )
+    audit_response = client.get(
+        f"/approvals/{approval_id}/audit",
+        headers=other_headers,
+    )
+
+    assert approval_response.status_code == 404
+    assert audit_response.status_code == 404
