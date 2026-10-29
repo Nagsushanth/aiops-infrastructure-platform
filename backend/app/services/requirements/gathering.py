@@ -105,13 +105,22 @@ def extract_requirements(
             requirements["environment"] = environment
             break
 
+
     # Region
-    region_match = re.search(
-        r"\b([a-z]{2}(?:-gov)?-[a-z]+-\d+)\b",
-        lower,
-    )
-    if region_match:
-        requirements["region"] = region_match.group(1)
+    # Recognize Mumbai as the AWS Mumbai region when AWS is selected.
+    if (
+        requirements.get("cloud_provider") == "aws"
+        and re.search(r"\bmumbai\b", lower)
+    ):
+        requirements["region"] = "ap-south-1"
+    else:
+        region_match = re.search(
+            r"\b([a-z]{2}(?:-gov)?-[a-z]+-\d+)\b",
+            lower,
+        )
+        if region_match:
+            requirements["region"] = region_match.group(1)
+
 
     # vCPUs
     cpu_match = re.search(
