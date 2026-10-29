@@ -69,3 +69,32 @@ def test_out_of_range_vcpu_does_not_crash():
 
     assert result["status"] == "needs_clarification"
     assert "validation_errors" in result
+
+def test_disable_public_access_is_false():
+    result = gather_requirements(
+        "Create an AWS EC2 development instance in ap-south-1 "
+        "with 2 vCPUs and 2 GB memory, disable public access, Linux."
+    )
+
+    assert result["requirements"]["public_access"] is False
+    assert result["status"] == "complete"
+
+
+def test_do_not_enable_public_access_is_false():
+    result = gather_requirements(
+        "Create an AWS EC2 development instance in ap-south-1 "
+        "with 2 vCPUs and 2 GB memory, do not enable public access, Linux."
+    )
+
+    assert result["requirements"]["public_access"] is False
+    assert result["status"] == "complete"
+
+
+def test_publicly_accessible_is_true():
+    result = gather_requirements(
+        "Create an AWS EC2 development instance in ap-south-1 "
+        "with 2 vCPUs and 2 GB memory, publicly accessible, Linux."
+    )
+
+    assert result["requirements"]["public_access"] is True
+    assert result["status"] == "complete"

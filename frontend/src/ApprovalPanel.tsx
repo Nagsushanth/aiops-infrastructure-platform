@@ -8,80 +8,94 @@ import {
   CardContent,
   CircularProgress,
   Stack,
-  TextField,
   Typography,
 } from "@mui/material";
 import AccountTreeIcon from "@mui/icons-material/AccountTree";
-import { createApproval, type ApprovalResponse } from "./api";
+import {
+  createApproval,
+  generateTrustedTerraformPlan,
+  type ApprovalResponse,
+  type TrustedTerraformPlanResponse,
+} from "./api";
 
 export default function ApprovalPanel() {
   const [requestId, setRequestId] = useState("");
-  const [planJson, setPlanJson] = useState("");
+  const [plan, setPlan] = useState<TrustedTerraformPlanResponse | null>(null);
   const [approval, setApproval] = useState<ApprovalResponse | null>(null);
-  const [loading, setLoading] = useState(false);
+  const [loadingPlan, setLoadingPlan] = useState(false);
+  const [loadingApproval, setLoadingApproval] = useState(false);
   const [error, setError] = useState("");
-  const [success, setSuccess] = useState("");
+  const [notice, setNotice] = useState("");
 
-  async function handleSubmit() {
+  function validRequestId(): number | null {
+    const id = Number(requestId);
+    return requestId.trim() && Number.isSafeInteger(id) && id > 0
+      ? id
+      : null;
+  }
+
+  async function handleGeneratePlan() {
     setError("");
-    setSuccess("");
+    setNotice("");
+    setPlan(null);
     setApproval(null);
 
-    const parsedRequestId = Number(requestId);
-
-    if (
-      !requestId.trim() ||
-      !Number.isSafeInteger(parsedRequestId) ||
-      parsedRequestId <= 0
-    ) {
+    const id = validRequestId();
+    if (id === null) {
       setError("Enter a valid positive infrastructure request ID.");
       return;
     }
 
-    let plan: Record<string, unknown>;
-
+    setLoadingPlan(true);
     try {
-      const parsed: unknown = JSON.parse(planJson);
+      const result = await generateTrustedTerraformPlan(id);
+      setPlan(result);
 
-      if (
-        typeof parsed !== "object" ||
-        parsed === null ||
-        Array.isArray(parsed)
-      ) {
-        throw new Error("The plan must be a JSON object.");
+      if (result.status !== "succeeded") {
+        setError(
+          `Terraform plan generation failed${
+            result.error_code ? ` (${result.error_code})` : ""
+          }.`,
+        );
+      } else {
+        setNotice("Trusted Terraform plan generated. Review its summary before submitting.");
       }
-
-      plan = parsed as Record<string, unknown>;
-    } catch {
-      setError("Enter valid Terraform plan JSON before submitting.");
-      return;
-    }
-
-    if (
-      plan.errored !== false ||
-      plan.complete !== true ||
-      plan.applyable !== true
-    ) {
-      setError(
-        "The plan must have errored=false, complete=true, and applyable=true. Use a reviewed Terraform plan JSON file.",
-      );
-      return;
-    }
-
-    setLoading(true);
-
-    try {
-      const result = await createApproval(parsedRequestId, plan);
-      setApproval(result);
-      setSuccess("Approval request submitted successfully.");
     } catch (err) {
       setError(
-        err instanceof Error
-          ? err.message
-          : "Could not submit the approval request.",
+        err instanceof Error ? err.message : "Could not generate the Terraform plan.",
       );
     } finally {
-      setLoading(false);
+      setLoadingPlan(false);
+    }
+  }
+
+  async function handleSubmitApproval() {
+    setError("");
+    setNotice("");
+    setApproval(null);
+
+    const id = validRequestId();
+    if (id === null) {
+      setError("Enter a valid positive infrastructure request ID.");
+      return;
+    }
+
+    if (!plan || plan.status !== "succeeded" || plan.infrastructure_request_id !== id) {
+      setError("Generate a successful trusted plan for this request first.");
+      return;
+    }
+
+    setLoadingApproval(true);
+    try {
+      const result = await createApproval(id, plan.id);
+      setApproval(result);
+      setNotice("Approval request submitted successfully.");
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Could not submit the approval request.",
+      );
+    } finally {
+      setLoadingApproval(false);
     }
   }
 
@@ -96,64 +110,118 @@ export default function ApprovalPanel() {
         </Stack>
 
         <Typography color="text.secondary" sx={{ mb: 3 }}>
-          Submit a completed infrastructure request with its reviewed
-          Terraform plan for approval. Submitting does not provision resources.
+          Generate a trusted Terraform plan for a completed infrastructure
+          request, review its summary, and submit it for approval.
+          Submitting does not provision resources.
         </Typography>
 
-        {error && (
-          <Alert severity="error" sx={{ mb: 2 }}>
-            {error}
-          </Alert>
-        )}
-
-        {success && (
-          <Alert severity="success" sx={{ mb: 2 }}>
-            {success}
-          </Alert>
-        )}
+        {error && <Alert severity="error" sx={{ mb: 2 }}>{error}</Alert>}
+        {notice && <Alert severity="success" sx={{ mb: 2 }}>{notice}</Alert>}
 
         <Stack spacing={2}>
-          <TextField
-            label="Infrastructure Request ID"
-            type="number"
-            value={requestId}
-            onChange={(event) => setRequestId(event.target.value)}
-            placeholder="For example, 9"
-            fullWidth
-            required
-            slotProps={{ htmlInput: { min: 1, step: 1 } }}
-          />
-
-          <TextField
-            label="Reviewed Terraform Plan JSON"
-            value={planJson}
-            onChange={(event) => setPlanJson(event.target.value)}
-            placeholder="Paste the contents of a real terraform show -json plan file"
-            multiline
-            minRows={8}
-            maxRows={18}
-            fullWidth
-            required
-            helperText="Use the JSON generated from a Terraform plan. Do not paste credentials, tokens, or other secrets."
-          />
+          <Box>
+            <Typography variant="subtitle2" sx={{ mb: 1 }}>
+              Infrastructure Request ID
+            </Typography>
+            <input
+              type="number"
+              min="1"
+              step="1"
+              value={requestId}
+              onChange={(event) => {
+                setRequestId(event.target.value);
+                setPlan(null);
+                setApproval(null);
+                setError("");
+                setNotice("");
+              }}
+              placeholder="Enter an existing request ID"
+              style={{
+                boxSizing: "border-box",
+                width: "100%",
+                padding: "14px",
+                borderRadius: "8px",
+                border: "1px solid #999",
+                fontSize: "16px",
+              }}
+            />
+          </Box>
 
           <Box>
             <Button
               variant="contained"
-              onClick={handleSubmit}
-              disabled={loading || !requestId.trim() || !planJson.trim()}
+              onClick={() => void handleGeneratePlan()}
+              disabled={loadingPlan || loadingApproval || !requestId.trim()}
             >
-              {loading ? (
+              {loadingPlan ? (
                 <>
                   <CircularProgress size={18} color="inherit" sx={{ mr: 1 }} />
-                  Submitting...
+                  Generating plan...
                 </>
               ) : (
-                "Submit for Approval"
+                "Generate Trusted Terraform Plan"
               )}
             </Button>
           </Box>
         </Stack>
+
+        {plan && (
+          <Card variant="outlined" sx={{ mt: 3, borderRadius: 2 }}>
+            <CardContent>
+              <Typography variant="h6" sx={{ fontWeight: 700, mb: 1 }}>
+                Terraform Plan Review
+              </Typography>
+
+              <Typography>Plan Record ID: {plan.id}</Typography>
+              <Typography>Request ID: {plan.infrastructure_request_id}</Typography>
+              <Typography>Status: {plan.status}</Typography>
+              <Typography>
+                Deployment enabled: {plan.deployment_enabled ? "Yes" : "No"}
+              </Typography>
+
+              <Typography sx={{ fontWeight: 600, mt: 2, mb: 1 }}>
+                Stored plan summary
+              </Typography>
+
+              <Box
+                component="pre"
+                sx={{
+                  p: 1.5,
+                  borderRadius: 1,
+                  bgcolor: "action.hover",
+                  overflowX: "auto",
+                  whiteSpace: "pre-wrap",
+                  overflowWrap: "anywhere",
+                  fontSize: 12,
+                }}
+              >
+                {JSON.stringify(plan.plan_summary, null, 2)}
+              </Box>
+
+              {plan.status === "succeeded" && (
+                <Button
+                  variant="contained"
+                  onClick={() => void handleSubmitApproval()}
+                  disabled={loadingApproval || loadingPlan}
+                  sx={{ mt: 2 }}
+                >
+                  {loadingApproval ? (
+                    <>
+                      <CircularProgress size={18} color="inherit" sx={{ mr: 1 }} />
+                      Submitting...
+                    </>
+                  ) : (
+                    "Submit for Approval"
+                  )}
+                </Button>
+              )}
+
+              <Alert severity="info" sx={{ mt: 2 }}>
+                A generated plan is not an approval. Terraform deployment remains disabled.
+              </Alert>
+            </CardContent>
+          </Card>
+        )}
 
         {approval && (
           <Card variant="outlined" sx={{ mt: 3, borderRadius: 2 }}>
@@ -161,22 +229,14 @@ export default function ApprovalPanel() {
               <Typography variant="h6" sx={{ fontWeight: 700, mb: 2 }}>
                 Approval Request Created
               </Typography>
-
-              <Typography>
-                Approval ID: {approval.id}
-              </Typography>
-
+              <Typography>Approval ID: {approval.id}</Typography>
               <Typography>
                 Infrastructure Request ID: {approval.infrastructure_request_id}
               </Typography>
-
-              <Typography>
-                Status: {approval.status}
-              </Typography>
-
+              <Typography>Plan Record ID: {approval.terraform_plan_record_id}</Typography>
+              <Typography>Status: {approval.status}</Typography>
               <Alert severity="info" sx={{ mt: 2 }}>
-                This request is awaiting the configured approval workflow.
-                Terraform deployment has not been triggered.
+                The request is awaiting the configured approval workflow. No deployment was triggered.
               </Alert>
             </CardContent>
           </Card>

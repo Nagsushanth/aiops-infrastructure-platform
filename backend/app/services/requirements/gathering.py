@@ -123,6 +123,7 @@ def extract_requirements(
     elif missing_field == "vcpus" and re.fullmatch(r"\d+", lower):
         requirements["vcpus"] = int(lower)
 
+
     # Memory
     memory_match = re.search(
         r"\b(\d+)\s*(?:gb|gib)\s*(?:of\s*)?(?:ram|memory)?\b",
@@ -133,10 +134,14 @@ def extract_requirements(
     elif missing_field == "memory_gb" and re.fullmatch(r"\d+", lower):
         requirements["memory_gb"] = int(lower)
 
-    # Public access
+    # Public access: negative instructions must take precedence.
     if re.search(
-        r"\b(private|not publicly accessible|no public access|no public ip|"
-        r"without public access|not public)\b",
+        r"\b(private|not publicly accessible|not public|"
+        r"no public access|no public ip|without public access|"
+        r"disable public access|disable public ip|"
+        r"do not enable public access|do not enable public ip|"
+        r"don't enable public access|don't enable public ip|"
+        r"block public access|deny public access)\b",
         lower,
     ):
         requirements["public_access"] = False
@@ -152,6 +157,31 @@ def extract_requirements(
             requirements["public_access"] = False
 
     return InfrastructureRequirements.model_validate(requirements)
+
+
+    # Public access
+    # Check negative instructions first so "disable public access"
+    # cannot be mistaken for a request to enable public access.
+    if re.search(
+        r"\b(private|not publicly accessible|not public|"
+        r"no public access|no public ip|without public access|"
+        r"disable public access|disable public ip|"
+        r"do not enable public access|do not enable public ip|"
+        r"don't enable public access|don't enable public ip|"
+        r"block public access|deny public access)\b",
+        lower,
+    ):
+        requirements["public_access"] = False
+    elif re.search(
+        r"\b(publicly accessible|public access|public ip|publicly exposed)\b",
+        lower,
+    ):
+        requirements["public_access"] = True
+    elif missing_field == "public_access":
+        if re.fullmatch(r"(yes|y|true)", lower):
+            requirements["public_access"] = True
+        elif re.fullmatch(r"(no|n|false)", lower):
+            requirements["public_access"] = False
 
 
 def gather_requirements(

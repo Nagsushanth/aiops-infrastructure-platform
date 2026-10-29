@@ -58,6 +58,11 @@ def generate_terraform(
             "The region format is invalid."
         )
 
+    if specification.region != "ap-south-1":
+        raise TerraformGenerationError(
+            "Only the approved AWS region ap-south-1 is supported."
+        )
+
     instance_type = INSTANCE_CATALOG.get(
         (specification.vcpus, specification.memory_gb)
     )

@@ -292,15 +292,51 @@ export interface ApprovalResponse {
   updated_at: string;
 }
 
+
+export interface ApprovalResponse {
+  id: number;
+  infrastructure_request_id: number;
+  terraform_plan_record_id: number | null;
+  requester_id: number;
+  reviewer_id: number | null;
+  status: string;
+  plan_summary: Record<string, unknown>;
+  reviewer_comments: string | null;
+  decided_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface TrustedTerraformPlanResponse {
+  id: number;
+  infrastructure_request_id: number;
+  status: "succeeded" | "failed";
+  plan_fingerprint?: string;
+  specification_fingerprint?: string;
+  plan_summary: Record<string, unknown>;
+  deployment_enabled: false;
+  created_at: string;
+  error_code?: string;
+}
+
+export async function generateTrustedTerraformPlan(
+  infrastructureRequestId: number,
+): Promise<TrustedTerraformPlanResponse> {
+  return apiRequest<TrustedTerraformPlanResponse>(
+    `/terraform/requests/${infrastructureRequestId}/plan`,
+    { method: "POST" },
+  );
+}
+
 export async function createApproval(
   infrastructureRequestId: number,
-  plan: Record<string, unknown>,
+  terraformPlanRecordId: number,
 ): Promise<ApprovalResponse> {
   return apiRequest<ApprovalResponse>("/approvals", {
     method: "POST",
     body: JSON.stringify({
       infrastructure_request_id: infrastructureRequestId,
-      plan,
+      terraform_plan_record_id: terraformPlanRecordId,
     }),
   });
 }

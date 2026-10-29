@@ -258,3 +258,70 @@ def test_terraform_failure_is_recorded_safely(
         assert record.plan_summary == {}
     finally:
         db.close()
+
+def test_missing_request_does_not_execute_terraform(
+    client, setup_data, monkeypatch
+):
+    def must_not_run(specification):
+        pytest.fail("Terraform must not run for a missing request")
+
+    monkeypatch.setattr(
+        terraform_plans_api,
+        "execute_terraform_plan",
+        must_not_run,
+    )
+
+    response = client.post(
+        "/terraform/requests/999999/plan",
+        headers=setup_data["requester_headers"],
+    )
+
+    assert response.status_code == 404
+
+
+def test_unauthenticated_request_does_not_execute_terraform(
+    client, setup_data, monkeypatch
+):
+    def must_not_run(specification):
+        pytest.fail("Terraform must not run without authentication")
+
+    monkeypatch.setattr(
+        terraform_plans_api,
+        "execute_terraform_plan",
+        must_not_run,
+    )
+
+    response = client.post(
+        f"/terraform/requests/{setup_data['request_id']}/plan",
+    )
+
+    assert response.status_code in (401, 403)
+
+
+def test_successful_plan_keeps_deployment_disabled(
+    client, setup_data, fake_result, monkeypatch
+):
+    monkeypatch.setattr(
+        terraform_plans_api,
+        "execute_terraform_plan",
+        lambda specification: fake_result,
+    )
+
+    response = client.post(
+        f"/terraform/requests/{setup_data['request_id']}/plan",
+        headers=setup_data["requester_headers"],
+    )
+
+    assert response.status_code == 201, response.text
+
+    body = response.json()
+    assert body["deployment_enabled"] is False
+
+    db = TestingSessionLocal()
+    try:
+        record = db.get(TerraformPlanRecord, body["id"])
+        assert record is not None
+        assert record.status == "succeeded"
+        assert record.plan_fingerprint == "b" * 64
+    finally:
+        db.close()

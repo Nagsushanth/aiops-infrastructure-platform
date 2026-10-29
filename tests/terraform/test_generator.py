@@ -68,6 +68,13 @@ def test_rejects_invalid_region_format():
     with pytest.raises(TerraformGenerationError, match="region format"):
         generate_terraform(make_spec(region="not a region"))
 
+def test_rejects_region_outside_approved_region():
+    with pytest.raises(
+        TerraformGenerationError,
+        match="Only the approved AWS region ap-south-1",
+    ):
+        generate_terraform(make_spec(region="us-east-1"))
+
 
 def test_writes_generated_terraform_to_main_tf(tmp_path):
     output_file = write_terraform_configuration(

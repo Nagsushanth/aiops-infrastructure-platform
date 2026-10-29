@@ -13,7 +13,7 @@ from backend.app.models.infrastructure_request import InfrastructureRequest
 from backend.app.models.messages import Message
 from backend.app.models.user import User
 from backend.app.schemas.infrastructure import InfrastructureRequirements
-from backend.app.services.requirements.gathering import gather_requirements
+from backend.app.services.ai.requirements import gather_requirements_with_ai
 
 logger = logging.getLogger(__name__)
 
@@ -189,8 +189,8 @@ async def conversation_websocket(
     content,
     current.model_dump() if current is not None else None,
 )
-            # Keep the existing deterministic requirements service.
-            result = gather_requirements(content, current)
+            # Use AI-assisted extraction with deterministic fallback and validation.
+            result = await gather_requirements_with_ai(content, current)
 
             logger.info(
     "Requirement result: conversation_id=%s, status=%s, requirements=%s",
