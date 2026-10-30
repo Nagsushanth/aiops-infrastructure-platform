@@ -75,6 +75,45 @@ def _is_sha256_fingerprint(value: str | None) -> bool:
         and all(character in "0123456789abcdef" for character in value.lower())
     )
 
+def _has_eligible_security_analysis(plan_summary: object) -> bool:
+    """Allow approval only when all required security checks pass."""
+
+    if not isinstance(plan_summary, dict):
+        return False
+
+    analysis = plan_summary.get("security_analysis")
+
+    if not isinstance(analysis, dict):
+        return False
+
+    severity_counts = analysis.get("severity_counts")
+    findings = analysis.get("findings")
+    finding_count = analysis.get("finding_count")
+
+    expected_severities = {
+        "critical",
+        "high",
+        "medium",
+        "low",
+    }
+
+    return (
+        analysis.get("checks_completed") is True
+        and analysis.get("deployment_enabled") is False
+        and analysis.get("passed") is True
+        and type(finding_count) is int
+        and finding_count == 0
+        and isinstance(findings, list)
+        and len(findings) == 0
+        and isinstance(severity_counts, dict)
+        and set(severity_counts.keys()) == expected_severities
+        and all(
+            type(severity_counts[key]) is int
+            and severity_counts[key] == 0
+            for key in expected_severities
+        )
+    )
+
 
 @router.post(
     "",
@@ -157,6 +196,15 @@ def create_approval(
             detail=(
                 "Only successfully generated Terraform plans "
                 "can be submitted for approval."
+            ),
+        )
+
+    if not _has_eligible_security_analysis(plan_record.plan_summary):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Terraform plan did not pass the required security "
+                "checks and cannot be submitted for approval."
             ),
         )
 

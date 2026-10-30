@@ -29,6 +29,22 @@ type ConnectionStatus = "connecting" | "connected" | "disconnected";
 
 type SavedMessage = ChatMessage;
 
+export type InfrastructureSpec = {
+  cloud_provider: "aws" | "azure" | "gcp";
+  resource_type: string;
+  environment: "development" | "testing" | "staging" | "production";
+  region: string;
+  vcpus: number;
+  memory_gb: number;
+  public_access: boolean;
+  operating_system: string;
+};
+
+type ChatPanelProps = {
+  onRequirementsComplete: (spec: InfrastructureSpec | null) => void;
+  onInfrastructureRequestIdChange: (id: number | null) => void;
+};
+
 type SocketEvent =
   | {
       type: "connected";
@@ -55,6 +71,7 @@ type SocketEvent =
         status?: string;
         question?: string | null;
         infrastructure_request_id?: number;
+        requirements?: unknown;
         [key: string]: unknown;
       };
       question?: string | null;
@@ -73,9 +90,46 @@ type SocketEvent =
       type: "pong";
     };
 
-export default function ChatPanel() {
+function isInfrastructureSpec(
+  value: unknown,
+): value is InfrastructureSpec {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+
+  const spec = value as Record<string, unknown>;
+
+  return (
+    (spec.cloud_provider === "aws" ||
+      spec.cloud_provider === "azure" ||
+      spec.cloud_provider === "gcp") &&
+    typeof spec.resource_type === "string" &&
+    spec.resource_type.trim().length > 0 &&
+    (spec.environment === "development" ||
+      spec.environment === "testing" ||
+      spec.environment === "staging" ||
+      spec.environment === "production") &&
+    typeof spec.region === "string" &&
+    spec.region.trim().length > 0 &&
+    typeof spec.vcpus === "number" &&
+    Number.isInteger(spec.vcpus) &&
+    spec.vcpus >= 1 &&
+    typeof spec.memory_gb === "number" &&
+    Number.isInteger(spec.memory_gb) &&
+    spec.memory_gb >= 1 &&
+    typeof spec.public_access === "boolean" &&
+    typeof spec.operating_system === "string" &&
+    spec.operating_system.trim().length > 0
+  );
+}
+
+export default function ChatPanel({
+  onRequirementsComplete,
+  onInfrastructureRequestIdChange,
+}: ChatPanelProps) {
   const [conversationId, setConversationId] = useState<number | null>(null);
-  const [infrastructureRequestId, setInfrastructureRequestId] = useState<number | null>(null);
+  const [infrastructureRequestId, setInfrastructureRequestId] =
+    useState<number | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
@@ -315,17 +369,30 @@ export default function ChatPanel() {
         }
 
         if (data.type === "requirements_result") {
-          const requestId = data.result?.infrastructure_request_id;
+          const result = data.result;
+          const requestId = result?.infrastructure_request_id;
 
           if (typeof requestId === "number") {
             setInfrastructureRequestId(requestId);
-          }
+            onInfrastructureRequestIdChange(requestId);
+          } 
 
-          if (data.result?.status === "complete") {
+          if (result?.status === "complete") {
+            const requirements = result.requirements;
+
+            if (isInfrastructureSpec(requirements)) {
+              onRequirementsComplete(requirements);
+              setError("");
+            } else {
+              onRequirementsComplete(null);
+              setError(
+                "The completed requirements are missing valid fields. Please review the conversation.",
+              );
+            }
+
             pendingContentRef.current = null;
             setInput("");
             setLoading(false);
-            setError("");
           }
 
           return;
@@ -391,7 +458,12 @@ export default function ChatPanel() {
         socketRef.current = null;
       }
     };
-  }, [conversationId, addMessages, sendPendingMessage]);
+  }, [
+    conversationId,
+    addMessages,
+    sendPendingMessage,
+    onRequirementsComplete,
+  ]);
 
   // Start an independent conversation for a new infrastructure request.
   async function handleNewRequest() {
@@ -421,9 +493,11 @@ export default function ChatPanel() {
       sessionStorage.setItem(SESSION_KEY, newSessionId);
       sessionIdRef.current = newSessionId;
 
-      // Clear the previous conversation and its request ID.
+      // Clear the previous conversation, request ID, and preview specification.
       setMessages([]);
       setInfrastructureRequestId(null);
+      onRequirementsComplete(null);
+      onInfrastructureRequestIdChange(null);
       setInput("");
       setLoading(false);
       setError("");
@@ -662,16 +736,16 @@ export default function ChatPanel() {
           sx={{ textAlign: "center" }}
         >
           Messages and requirement progress are saved to PostgreSQL.
-          Requirement gathering is currently rule-based; OpenAI integration is
-          not enabled yet.
+          AI-assisted requirement extraction is enabled, with rule-based
+          fallback when the AI service is unavailable.
         </Typography>
       </Stack>
+
       {infrastructureRequestId !== null && (
-  <Typography variant="caption" color="text.secondary">
-    Infrastructure Request ID: {infrastructureRequestId}
-  </Typography>
-)}
+        <Typography variant="caption" color="text.secondary">
+          Infrastructure Request ID: {infrastructureRequestId}
+        </Typography>
+      )}
     </Paper>
   );
 }
-

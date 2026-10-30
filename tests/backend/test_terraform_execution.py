@@ -194,7 +194,7 @@ def test_command_failure_does_not_expose_raw_output(
         with pytest.raises(TerraformExecutionError) as exc:
             execute_terraform_plan(specification)
 
-    assert exc.value.code == "COMMAND_FAILED"
+    assert exc.value.code == "INIT_FAILED_GENERAL"
     assert "sensitive-diagnostic" not in str(exc.value)
 
 
@@ -223,4 +223,4 @@ def test_timeout_is_reported_safely(specification):
         with pytest.raises(TerraformExecutionError) as exc:
             execute_terraform_plan(specification)
 
-    assert exc.value.code == "COMMAND_TIMEOUT"
+    assert exc.value.code == "INIT_TIMEOUT"

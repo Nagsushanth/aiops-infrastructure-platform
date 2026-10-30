@@ -105,7 +105,7 @@ def extract_requirements(
             requirements["environment"] = environment
             break
 
-
+    
     # Region
     # Recognize Mumbai as the AWS Mumbai region when AWS is selected.
     if (

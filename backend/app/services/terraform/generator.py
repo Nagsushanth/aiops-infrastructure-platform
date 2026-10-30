@@ -151,12 +151,6 @@ resource "aws_security_group" "instance" {{
   description = "AIOps-generated EC2 security group; no inbound rules"
   vpc_id      = data.aws_vpc.default.id
 
-  egress {{
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }}
 
   tags = {{
     Name        = "aiops-ec2-security-group"

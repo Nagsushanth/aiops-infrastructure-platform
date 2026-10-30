@@ -36,12 +36,15 @@ def test_generates_configuration_for_supported_size():
     assert "encrypted = true" in result
 
 
+
 def test_public_access_assigns_public_ip_without_opening_inbound_ports():
     result = generate_terraform(make_spec(public_access=True))
 
     assert "associate_public_ip_address = true" in result
-    assert 'cidr_blocks = ["0.0.0.0/0"]' in result
     assert "ingress {" not in result
+    assert 'cidr_blocks = ["0.0.0.0/0"]' not in result
+    assert "egress {" not in result
+
 
 
 def test_rejects_unsupported_cpu_memory_combination():

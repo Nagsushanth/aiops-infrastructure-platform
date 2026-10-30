@@ -147,6 +147,20 @@ def valid_plan():
                 },
             }
         ],
+            "security_analysis": {
+            "policy_version": "initial-1",
+            "checks_completed": True,
+            "deployment_enabled": False,
+            "passed": True,
+            "finding_count": 0,
+            "severity_counts": {
+                "critical": 0,
+                "high": 0,
+                "medium": 0,
+                "low": 0,
+            },
+            "findings": [],
+        },
     }
 
 
@@ -681,3 +695,70 @@ def test_other_user_cannot_read_approval_or_audit(
 
     assert approval_response.status_code == 404
     assert audit_response.status_code == 404
+
+@pytest.mark.parametrize(
+    "security_changes",
+    [
+        {"passed": False},
+        {"checks_completed": False},
+        {"deployment_enabled": True},
+        {"finding_count": 1},
+        {"findings": [{"rule_id": "TEST_FINDING"}]},
+        {
+            "severity_counts": {
+                "critical": 0,
+                "high": 1,
+                "medium": 0,
+                "low": 0,
+            }
+        },
+    ],
+)
+def test_approval_rejects_security_failed_plan(
+    client, setup_data, valid_plan, security_changes
+):
+    plan = dict(valid_plan)
+    plan["security_analysis"] = {
+        **valid_plan["security_analysis"],
+        **security_changes,
+    }
+
+    plan_record_id = create_trusted_plan_record(
+        setup_data,
+        plan,
+    )
+
+    response = client.post(
+        "/approvals",
+        headers=setup_data["requester_headers"],
+        json={
+            "infrastructure_request_id": setup_data["infra_request_id"],
+            "terraform_plan_record_id": plan_record_id,
+        },
+    )
+
+    assert response.status_code == 409, response.text
+    assert "security checks" in response.json()["detail"]
+
+
+def test_approval_rejects_missing_security_analysis(
+    client, setup_data, valid_plan
+):
+    plan = dict(valid_plan)
+    plan.pop("security_analysis")
+
+    plan_record_id = create_trusted_plan_record(
+        setup_data,
+        plan,
+    )
+
+    response = client.post(
+        "/approvals",
+        headers=setup_data["requester_headers"],
+        json={
+            "infrastructure_request_id": setup_data["infra_request_id"],
+            "terraform_plan_record_id": plan_record_id,
+        },
+    )
+
+    assert response.status_code == 409, response.text

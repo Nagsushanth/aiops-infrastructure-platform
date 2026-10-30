@@ -1,5 +1,4 @@
-
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   Alert,
   Box,
@@ -19,6 +18,7 @@ import {
   createTerraformPreview,
   type TerraformPreviewResponse,
 } from "./api";
+import type { InfrastructureSpec } from "./ChatPanel";
 
 type Environment = "development" | "testing" | "staging" | "production";
 
@@ -32,18 +32,38 @@ const ENVIRONMENTS: Environment[] = [
 const CPU_OPTIONS = [2, 4, 8];
 const MEMORY_OPTIONS = [2, 4, 8, 16, 32];
 
-export default function TerraformPreview() {
+type TerraformPreviewProps = {
+  specification: InfrastructureSpec | null;
+};
+
+export default function TerraformPreview({
+  specification,
+}: TerraformPreviewProps) {
   const [region, setRegion] = useState("ap-south-1");
   const [environment, setEnvironment] =
     useState<Environment>("development");
   const [vcpus, setVcpus] = useState(4);
   const [memoryGb, setMemoryGb] = useState(8);
   const [publicAccess, setPublicAccess] = useState(false);
-
   const [preview, setPreview] =
     useState<TerraformPreviewResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (!specification) {
+      setPreview(null);
+      return;
+    }
+
+    setRegion(specification.region);
+    setEnvironment(specification.environment);
+    setVcpus(specification.vcpus);
+    setMemoryGb(specification.memory_gb);
+    setPublicAccess(specification.public_access);
+    setPreview(null);
+    setError("");
+  }, [specification]);
 
   async function generatePreview() {
     setLoading(true);
@@ -51,15 +71,55 @@ export default function TerraformPreview() {
     setPreview(null);
 
     try {
+      if (!specification) {
+        throw new Error(
+          "Complete your infrastructure requirements in the chat first.",
+        );
+      }
+
+      if (specification.cloud_provider !== "aws") {
+        throw new Error(
+          "The current Terraform preview generator supports AWS only.",
+        );
+      }
+
+      if (specification.resource_type.trim().toLowerCase() !== "ec2") {
+        throw new Error(
+          "The current Terraform preview generator supports EC2 instances only.",
+        );
+      }
+
+      if (region.trim() !== "ap-south-1") {
+        throw new Error(
+          "The current Terraform preview generator supports the Mumbai region (ap-south-1) only.",
+        );
+      }
+
+      const supportedOperatingSystems = [
+        "linux",
+        "amazon linux",
+        "amazon linux 2023",
+      ];
+
+      if (
+        !supportedOperatingSystems.includes(
+          specification.operating_system.trim().toLowerCase(),
+        )
+      ) {
+        throw new Error(
+          `The requested operating system "${specification.operating_system}" is not supported by the current generator. Amazon Linux 2023 is supported; update the request in chat rather than silently substituting an OS.`,
+        );
+      }
+
       const result = await createTerraformPreview({
-        cloud_provider: "aws",
-        resource_type: "EC2",
+        cloud_provider: specification.cloud_provider,
+        resource_type: specification.resource_type,
         environment,
         region: region.trim(),
         vcpus,
         memory_gb: memoryGb,
         public_access: publicAccess,
-        operating_system: "linux",
+        operating_system: specification.operating_system,
       });
 
       setPreview(result);

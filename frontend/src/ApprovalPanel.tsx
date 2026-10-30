@@ -1,5 +1,4 @@
-
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   Alert,
   Box,
@@ -18,8 +17,30 @@ import {
   type TrustedTerraformPlanResponse,
 } from "./api";
 
-export default function ApprovalPanel() {
-  const [requestId, setRequestId] = useState("");
+type ApprovalPanelProps = {
+  infrastructureRequestId: number | null;
+};
+
+export default function ApprovalPanel({
+  infrastructureRequestId,
+}: ApprovalPanelProps) {
+  const [requestId, setRequestId] = useState(
+    infrastructureRequestId === null
+      ? ""
+      : String(infrastructureRequestId),
+  );
+
+  useEffect(() => {
+    setRequestId(
+      infrastructureRequestId === null
+        ? ""
+        : String(infrastructureRequestId),
+    );
+    setPlan(null);
+    setApproval(null);
+    setError("");
+    setNotice("");
+  }, [infrastructureRequestId]);
   const [plan, setPlan] = useState<TrustedTerraformPlanResponse | null>(null);
   const [approval, setApproval] = useState<ApprovalResponse | null>(null);
   const [loadingPlan, setLoadingPlan] = useState(false);

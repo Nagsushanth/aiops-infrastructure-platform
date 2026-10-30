@@ -9,20 +9,19 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from backend.app.services.terraform.security_policy import (
-    evaluate_terraform_security,
-)
-
 from backend.app.schemas.infrastructure import (
     ValidatedInfrastructureSpecification,
 )
 from backend.app.services.terraform.generator import (
-    generate_terraform,
     TerraformGenerationError,
+    generate_terraform,
 )
 from backend.app.services.terraform.plan_parser import (
-    parse_terraform_plan,
     TerraformPlanParsingError,
+    parse_terraform_plan,
+)
+from backend.app.services.terraform.security_policy import (
+    evaluate_terraform_security,
 )
 
 
@@ -49,6 +48,107 @@ def _canonical_specification(
     ).encode("utf-8")
 
 
+def _failure_category(diagnostic: str) -> str:
+    """Classify Terraform output without exposing its raw contents."""
+    diagnostic = diagnostic.lower()
+
+    if any(
+        marker in diagnostic
+        for marker in (
+            "accessdenied",
+            "unauthorized",
+            "not authorized",
+            "permission denied",
+            "unable to locate credentials",
+            "no valid credential sources found",
+            "failed to retrieve credentials",
+            "invalidclienttokenid",
+            "invalid security token",
+            "expiredtoken",
+            "authfailure",
+            "signaturedoesnotmatch",
+        )
+    ):
+        return "PERMISSION"
+
+    if any(
+        marker in diagnostic
+        for marker in (
+            "could not connect",
+            "connection timed out",
+            "network is unreachable",
+            "failed to establish a new connection",
+        )
+    ):
+        return "NETWORK"
+
+    if (
+        "failed to query available provider packages" in diagnostic
+        or "could not retrieve the list of available versions" in diagnostic
+    ):
+        return "PROVIDER_DOWNLOAD"
+
+    if "no matching ami" in diagnostic or "no results" in diagnostic:
+        return "DATA_SOURCE"
+
+    if any(
+        marker in diagnostic
+        for marker in (
+            "unsupported argument",
+            "missing required argument",
+            "unsupported block type",
+            "invalid reference",
+            "invalid expression",
+            "invalid value for",
+            "invalid configuration",
+            "error: invalid ",
+            "configuration for provider",
+        )
+    ):
+        return "CONFIGURATION"
+
+    return "GENERAL"
+
+
+def _safe_diagnostic_marker(diagnostic: str) -> str:
+    """Return a known marker only; never return raw Terraform output."""
+    diagnostic = diagnostic.lower()
+
+    markers = (
+        "accessdenied",
+        "unauthorized",
+        "not authorized",
+        "permission denied",
+        "unable to locate credentials",
+        "no valid credential sources found",
+        "failed to retrieve credentials",
+        "invalidclienttokenid",
+        "invalid security token",
+        "expiredtoken",
+        "authfailure",
+        "signaturedoesnotmatch",
+        "no matching ami",
+        "no results",
+        "could not connect",
+        "connection timed out",
+        "network is unreachable",
+        "failed to establish a new connection",
+        "failed to query available provider packages",
+        "could not retrieve the list of available versions",
+        "unsupported argument",
+        "missing required argument",
+        "unsupported block type",
+        "invalid reference",
+        "invalid expression",
+        "invalid value for",
+        "invalid configuration",
+        "configuration for provider",
+    )
+
+    matched = [marker for marker in markers if marker in diagnostic]
+    return ", ".join(matched) if matched else "none matched"
+
+
 def _run(
     command: list[str],
     *,
@@ -56,7 +156,9 @@ def _run(
     timeout_seconds: int,
     env: dict[str, str],
 ) -> subprocess.CompletedProcess[str]:
-    """Execute a fixed Terraform command without a shell."""
+    """Run a fixed Terraform command and classify failures safely."""
+    stage = command[1].upper() if len(command) > 1 else "UNKNOWN"
+
     try:
         result = subprocess.run(
             command,
@@ -69,13 +171,25 @@ def _run(
             shell=False,
         )
     except subprocess.TimeoutExpired as exc:
-        raise TerraformExecutionError("COMMAND_TIMEOUT") from exc
+        raise TerraformExecutionError(f"{stage}_TIMEOUT") from exc
     except OSError as exc:
-        raise TerraformExecutionError("COMMAND_START_FAILED") from exc
+        raise TerraformExecutionError(f"{stage}_START_FAILED") from exc
 
     if result.returncode != 0:
-        # Do not expose or log raw Terraform output; it may contain sensitive data.
-        raise TerraformExecutionError("COMMAND_FAILED")
+        stdout = getattr(result, "stdout", "") or ""
+        stderr = getattr(result, "stderr", "") or ""
+        diagnostic = f"{stdout}\n{stderr}"
+
+        category = _failure_category(diagnostic)
+        marker = _safe_diagnostic_marker(diagnostic)
+
+        # Log only fixed, recognized marker phrases, never raw output.
+        print(
+            f"Terraform {stage} failed: "
+            f"category={category}; diagnostic_marker={marker}"
+        )
+
+        raise TerraformExecutionError(f"{stage}_FAILED_{category}")
 
     return result
 
@@ -97,35 +211,36 @@ def execute_terraform_plan(
     try:
         configuration = generate_terraform(specification)
     except TerraformGenerationError as exc:
-        raise TerraformExecutionError("UNSUPPORTED_SPECIFICATION") from exc
+        raise TerraformExecutionError(
+            "UNSUPPORTED_SPECIFICATION"
+        ) from exc
 
     specification_fingerprint = _sha256(
         _canonical_specification(specification)
     )
 
-    
-# Pass only the environment variables Terraform needs.
-# Do not forward unrelated application secrets.
     allowed_env_vars = (
-    "PATH",
-    "HOME",
-    "TMPDIR",
-    "SSL_CERT_FILE",
-    "SSL_CERT_DIR",
-    "AWS_ACCESS_KEY_ID",
-    "AWS_SECRET_ACCESS_KEY",
-    "AWS_SESSION_TOKEN",
-    "AWS_PROFILE",
-    "AWS_SHARED_CREDENTIALS_FILE",
-    "AWS_CONFIG_FILE",
-    "AWS_REGION",
-    "AWS_DEFAULT_REGION",
-    "AWS_ROLE_ARN",
-    "AWS_WEB_IDENTITY_TOKEN_FILE",
-    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
-    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
-    "AWS_CONTAINER_AUTHORIZATION_TOKEN",
-    "AWS_EC2_METADATA_DISABLED",
+        "PATH",
+        "HOME",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_PROFILE",
+        "AWS_SHARED_CREDENTIALS_FILE",
+        "AWS_CONFIG_FILE",
+        "AWS_REGION",
+        "AWS_DEFAULT_REGION",
+        "AWS_ROLE_ARN",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+        "AWS_EC2_METADATA_DISABLED",
     )
 
     env = {
@@ -133,12 +248,35 @@ def execute_terraform_plan(
         for key in allowed_env_vars
         if key in os.environ
     }
+
+    env.setdefault(
+        "AWS_SHARED_CREDENTIALS_FILE",
+        os.path.expanduser("~/.aws/credentials"),
+    )
+    env.setdefault(
+        "AWS_CONFIG_FILE",
+        os.path.expanduser("~/.aws/config"),
+    )
+
+    # Explicitly choose the temporary filesystem. If TMPDIR is set by the
+    # operator, respect it; otherwise use the system default.
+    temp_root = Path(
+        env.get("TMPDIR") or tempfile.gettempdir()
+    ).expanduser()
+    temp_root.mkdir(parents=True, exist_ok=True)
+
+    env["TMPDIR"] = str(temp_root)
+    env["TEMP"] = str(temp_root)
+    env["TMP"] = str(temp_root)
     env["TF_IN_AUTOMATION"] = "1"
     env["TF_INPUT"] = "0"
 
-
-    with tempfile.TemporaryDirectory(prefix="aiops-terraform-") as temp:
+    with tempfile.TemporaryDirectory(
+        prefix="aiops-terraform-",
+        dir=temp_root,
+    ) as temp:
         workspace = Path(temp)
+
         (workspace / "main.tf").write_text(
             configuration,
             encoding="utf-8",
@@ -175,7 +313,6 @@ def execute_terraform_plan(
         if not plan_file.is_file():
             raise TerraformExecutionError("PLAN_ARTIFACT_MISSING")
 
-        # Fingerprint the exact binary plan produced by Terraform.
         plan_fingerprint = _sha256(plan_file.read_bytes())
 
         shown = _run(
@@ -196,8 +333,6 @@ def execute_terraform_plan(
         ) as exc:
             raise TerraformExecutionError("PLAN_PARSE_FAILED") from exc
 
-        # Never return raw before/after attributes: parser redaction alone
-        # cannot guarantee that every sensitive value is marked correctly.
         resources = [
             {
                 "address": item.get("address"),

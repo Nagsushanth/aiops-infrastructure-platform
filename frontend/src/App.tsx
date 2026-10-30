@@ -21,7 +21,7 @@ import AccountTreeIcon from "@mui/icons-material/AccountTree";
 import CheckCircleIcon from "@mui/icons-material/CheckCircle";
 
 import AuthPanel from "./AuthPanel";
-import ChatPanel from "./ChatPanel";
+import ChatPanel, { type InfrastructureSpec } from "./ChatPanel";
 import TerraformPreview from "./TerraformPreview";
 import ApprovalPanel from "./ApprovalPanel";
 import ApprovalReviewPanel from "./ApprovalReviewPanel";
@@ -65,6 +65,10 @@ const features = [
 export default function App() {
   const [user, setUser] = useState<AuthUser | null>(null);
   const [authChecking, setAuthChecking] = useState(true);
+  const [infrastructureSpec, setInfrastructureSpec] =
+  useState<InfrastructureSpec | null>(null);
+  const [infrastructureRequestId, setInfrastructureRequestId] =
+  useState<number | null>(null);
 
   const [backend, setBackend] = useState<BackendStatus | null>(null);
   const [loading, setLoading] = useState(false);
@@ -342,7 +346,7 @@ export default function App() {
           </Box>
 
           <Box sx={{ mt: 3 }}>
-            <TerraformPreview />
+            <TerraformPreview specification={infrastructureSpec} />
           </Box>
 
           <Box sx={{ mt: 3 }}>
@@ -350,11 +354,12 @@ export default function App() {
           </Box>
 
           <Box sx={{ mt: 3 }}>
-            <ChatPanel />
+            <ChatPanel onRequirementsComplete={setInfrastructureSpec}
+            onInfrastructureRequestIdChange={setInfrastructureRequestId} />
           </Box>
 
           <Box sx={{ mt: 3 }}>
-            <ApprovalPanel />
+            <ApprovalPanel infrastructureRequestId={infrastructureRequestId} />
           </Box>
 
           <Box sx={{ mt: 3 }}>
