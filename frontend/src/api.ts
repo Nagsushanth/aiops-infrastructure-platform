@@ -279,19 +279,44 @@ export async function parseTerraformPlan(
   });
 }
 
-export interface ApprovalResponse {
-  id: number;
-  infrastructure_request_id: number;
-  requester_id: number;
-  reviewer_id: number | null;
-  status: string;
-  plan_summary: Record<string, unknown>;
-  reviewer_comments: string | null;
-  decided_at: string | null;
-  created_at: string;
-  updated_at: string;
+export interface TerraformSecurityFinding {
+  rule_id: string;
+  severity: "critical" | "high" | "medium" | "low";
+  address: string;
+  title: string;
+  detail: string;
+  remediation: string;
 }
 
+export interface TerraformSecurityAnalysis {
+  policy_version: string;
+  checks_completed: boolean;
+  deployment_enabled: boolean;
+  passed: boolean;
+  finding_count: number;
+  severity_counts: {
+    critical: number;
+    high: number;
+    medium: number;
+    low: number;
+  };
+  findings: TerraformSecurityFinding[];
+}
+
+export interface TerraformPlanSummary {
+  resource_summary?: Record<string, number>;
+  resources?: Array<{
+    address: string | null;
+    mode: string | null;
+    type: string | null;
+    name: string | null;
+    actions: string[];
+  }>;
+  terraform_version?: string | null;
+  format_version?: string | null;
+  security_analysis?: TerraformSecurityAnalysis;
+  cost_estimate?: TerraformCostEstimate;
+}
 
 export interface ApprovalResponse {
   id: number;
@@ -300,12 +325,13 @@ export interface ApprovalResponse {
   requester_id: number;
   reviewer_id: number | null;
   status: string;
-  plan_summary: Record<string, unknown>;
+  plan_summary: TerraformPlanSummary;
   reviewer_comments: string | null;
   decided_at: string | null;
   created_at: string;
   updated_at: string;
 }
+
 
 export interface TrustedTerraformPlanResponse {
   id: number;

@@ -12,7 +12,11 @@ from backend.app.main import app
 from backend.app.core.dependencies import get_db
 from backend.app.core.security import create_access_token
 from backend.app.models.base import Base
-from backend.app.models.approval import ApprovalAuditEvent, ApprovalRequest
+from backend.app.models.approval import (
+    ApprovalAuditEvent,
+    ApprovalRequest,
+    ApprovalStageReview,
+)
 from backend.app.models.conversation import Conversation
 from backend.app.models.infrastructure_request import InfrastructureRequest
 from backend.app.models.terraform_plan import TerraformPlanRecord
@@ -278,6 +282,15 @@ def create_pending_approval(setup_data, plan=None):
         db.add(approval)
         db.flush()
 
+        for stage in ("technical", "cost", "security"):
+            db.add(
+                ApprovalStageReview(
+                    approval_request_id=approval.id,
+                    stage=stage,
+                    status="pending",
+                )
+            )
+
         db.add(
             ApprovalAuditEvent(
                 approval_request_id=approval.id,
@@ -298,6 +311,47 @@ def create_pending_approval(setup_data, plan=None):
         return approval.id
     finally:
         db.close()
+
+
+def approve_all_stages(client, setup_data, approval_id):
+    """Complete all three review stages before final approval."""
+
+    headers = setup_data["reviewer_headers"]
+
+    # Technical review
+    response = client.post(
+        f"/approvals/{approval_id}/stages/technical/decision",
+        headers=headers,
+        json={
+            "decision": "approved",
+            "comments": "Technical configuration reviewed.",
+        },
+    )
+    assert response.status_code == 200, response.text
+
+    # The test fixture has no verified cost estimate, so require
+    # an explicit, documented manual override for this test only.
+    response = client.post(
+        f"/approvals/{approval_id}/stages/cost/decision",
+        headers=headers,
+        json={
+            "decision": "approved",
+            "comments": "Manual cost review completed; estimate unavailable.",
+            "manual_cost_override": True,
+        },
+    )
+    assert response.status_code == 200, response.text
+
+    # Security review
+    response = client.post(
+        f"/approvals/{approval_id}/stages/security/decision",
+        headers=headers,
+        json={
+            "decision": "approved",
+            "comments": "Security analysis reviewed.",
+        },
+    )
+    assert response.status_code == 200, response.text
 
 
 def test_client_submitted_plan_is_rejected(
@@ -528,6 +582,7 @@ def test_admin_can_approve_and_audit_is_recorded(
     client, setup_data, valid_plan
 ):
     approval_id = create_pending_approval(setup_data, valid_plan)
+    approve_all_stages(client, setup_data, approval_id)
 
     decision_response = client.post(
         f"/approvals/{approval_id}/decision",
@@ -556,6 +611,9 @@ def test_admin_can_approve_and_audit_is_recorded(
     events = audit_response.json()
     assert [event["event_type"] for event in events] == [
         "submitted",
+        "technical_approved",
+        "cost_approved",
+        "security_approved",
         "approved",
     ]
     assert events[-1]["actor_id"] == setup_data["reviewer_id"]
@@ -595,6 +653,7 @@ def test_cannot_decide_approval_twice(
     client, setup_data, valid_plan
 ):
     approval_id = create_pending_approval(setup_data, valid_plan)
+    approve_all_stages(client, setup_data, approval_id)
 
     first = client.post(
         f"/approvals/{approval_id}/decision",

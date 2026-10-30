@@ -47,3 +47,30 @@ class ApprovalAuditResponse(BaseModel):
     comments: str | None
     event_metadata: dict[str, Any]
     created_at: datetime
+
+
+
+class ApprovalStageDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision: Literal["approved", "rejected"]
+    comments: str | None = Field(default=None, max_length=5000)
+
+    # Only applicable to the cost review.
+    manual_cost_override: bool = False
+
+
+
+class ApprovalStageReviewResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    approval_request_id: int
+    stage: str
+    status: str
+    assigned_reviewer_id: int | None
+    decided_by_id: int | None
+    comments: str | None
+    decided_at: datetime | None
+    created_at: datetime
+    updated_at: datetime

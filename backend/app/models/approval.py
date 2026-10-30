@@ -7,6 +7,7 @@ from sqlalchemy import (
     JSON,
     String,
     Text,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.orm import Mapped, mapped_column
@@ -132,5 +133,80 @@ class ApprovalAuditEvent(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
+        nullable=False,
+    )
+
+
+class ApprovalStageReview(Base):
+    """Independent technical, cost and security review for an approval."""
+
+    __tablename__ = "approval_stage_reviews"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "approval_request_id",
+            "stage",
+            name="uq_approval_stage_review",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+
+    approval_request_id: Mapped[int] = mapped_column(
+        ForeignKey("approval_requests.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+
+    # technical, cost or security
+    stage: Mapped[str] = mapped_column(
+        String(30),
+        nullable=False,
+        index=True,
+    )
+
+    # pending, approved, rejected or blocked
+    status: Mapped[str] = mapped_column(
+        String(30),
+        nullable=False,
+        default="pending",
+        server_default="pending",
+        index=True,
+    )
+
+    # Admin-configurable reviewer assignment.
+    assigned_reviewer_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+
+    # Actual person who submitted the decision.
+    decided_by_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+
+    comments: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    decided_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
         nullable=False,
     )
