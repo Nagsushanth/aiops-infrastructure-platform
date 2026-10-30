@@ -1,4 +1,3 @@
-
 import { useCallback, useEffect, useState } from "react";
 import {
   Alert,
@@ -8,6 +7,8 @@ import {
   CardContent,
   Chip,
   CircularProgress,
+  Checkbox,
+  FormControlLabel,
   Divider,
   TextField,
   Typography,
@@ -24,7 +25,11 @@ import WarningAmberIcon from "@mui/icons-material/WarningAmber";
 import {
   apiRequest,
   getCurrentUser,
+  getApprovalStages,
+  decideApprovalStage,
   type ApprovalResponse,
+  type ApprovalStage,
+  type ApprovalStageReviewResponse,
   type AuthUser,
   type TerraformCostEstimate,
   type TerraformSecurityAnalysis,
@@ -399,10 +404,43 @@ function SecurityReview({
     </Card>
   );
 }
+const APPROVAL_STAGE_DETAILS: Record<
+  ApprovalStage,
+  { title: string; description: string }
+> = {
+  technical: {
+    title: "Technical review",
+    description:
+      "Review the Terraform configuration and planned resource changes.",
+  },
+  cost: {
+    title: "Cost review",
+    description:
+      "Review the cost estimate, budget status and any required override.",
+  },
+  security: {
+    title: "Security review",
+    description:
+      "Review security policy results and any identified findings.",
+  },
+};
 
 export default function ApprovalReviewPanel() {
   const [user, setUser] = useState<AuthUser | null>(null);
   const [approvals, setApprovals] = useState<ApprovalResponse[]>([]);
+
+  const [stageReviews, setStageReviews] = useState<
+    Record<number, ApprovalStageReviewResponse[]>
+  >({});
+
+  const [stageComments, setStageComments] = useState<
+    Record<string, string>
+  >({});
+
+  const [costOverrides, setCostOverrides] = useState<
+    Record<number, boolean>
+  >({});
+
   const [comments, setComments] = useState<Record<number, string>>({});
   const [audit, setAudit] = useState<Record<number, ApprovalAuditEvent[]>>({});
   const [loading, setLoading] = useState(true);
@@ -422,6 +460,19 @@ export default function ApprovalReviewPanel() {
 
       setUser(currentUser);
       setApprovals(result);
+
+      const stageEntries = await Promise.all(
+        result.map(async (approval) => {
+          try {
+            const stages = await getApprovalStages(approval.id);
+            return [approval.id, stages] as const;
+          } catch {
+            return [approval.id, []] as const;
+          }
+        }),
+      );
+
+      setStageReviews(Object.fromEntries(stageEntries));
     } catch (err) {
       setError(
         err instanceof Error
@@ -456,6 +507,72 @@ export default function ApprovalReviewPanel() {
           ? err.message
           : "Unable to load audit history.",
       );
+    }
+  }
+
+  async function decideStage(
+    approvalId: number,
+    stage: ApprovalStage,
+    decision: "approved" | "rejected",
+  ) {
+    const key = `${approvalId}-${stage}`;
+
+    const selectedApproval = approvals.find(
+      (item) => item.id === approvalId,
+    );
+
+    const estimate = selectedApproval?.plan_summary.cost_estimate;
+
+    const costNeedsOverride =
+      stage === "cost" &&
+      (!estimate ||
+        estimate.status !== "estimated" ||
+        [
+          "exceeds_threshold",
+          "not_configured",
+          "not_evaluated",
+        ].includes(estimate.budget_status));
+
+    if (
+      stage === "cost" &&
+      decision === "approved" &&
+      costNeedsOverride &&
+      (!costOverrides[approvalId] || !stageComments[key]?.trim())
+    ) {
+      setError(
+        "This cost review requires a manual override and a documented justification.",
+      );
+      return;
+    }
+
+    setWorkingId(approvalId);
+    setError("");
+    setNotice("");
+
+    try {
+      await decideApprovalStage(approvalId, stage, {
+        decision,
+        comments: stageComments[key]?.trim() || null,
+        manual_cost_override:
+          stage === "cost" && decision === "approved"
+            ? costOverrides[approvalId] === true
+            : false,
+      });
+
+      setNotice(
+        `${APPROVAL_STAGE_DETAILS[stage].title} ${decision}.`,
+      );
+
+      await loadApprovals();
+      await loadAudit(approvalId);
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : `Unable to ${decision} ${stage} review.`,
+      );
+    } finally {
+      setWorkingId(null);
     }
   }
 
@@ -554,7 +671,9 @@ export default function ApprovalReviewPanel() {
             <CircularProgress />
           </Box>
         ) : approvals.length === 0 ? (
-          <Alert severity="info">No approval requests found.</Alert>
+          <Alert severity="info">
+            No approval requests found.
+          </Alert>
         ) : (
           <Box sx={{ display: "flex", flexDirection: "column", gap: 2 }}>
             {approvals.map((approval) => {
@@ -582,24 +701,41 @@ export default function ApprovalReviewPanel() {
                       sx={{
                         display: "flex",
                         justifyContent: "space-between",
-                        alignItems: { xs: "flex-start", sm: "center" },
-                        flexDirection: { xs: "column", sm: "row" },
+                        alignItems: {
+                          xs: "flex-start",
+                          sm: "center",
+                        },
+                        flexDirection: {
+                          xs: "column",
+                          sm: "row",
+                        },
                         gap: 1,
                       }}
                     >
                       <Box>
-                        <Typography variant="h6" sx={{ fontWeight: 800 }}>
+                        <Typography
+                          variant="h6"
+                          sx={{ fontWeight: 800 }}
+                        >
                           Approval #{approval.id}
                         </Typography>
 
-                        <Typography variant="body2" color="text.secondary">
+                        <Typography
+                          variant="body2"
+                          color="text.secondary"
+                        >
                           Infrastructure Request #
                           {approval.infrastructure_request_id}
                         </Typography>
 
-                        <Typography variant="caption" color="text.secondary">
+                        <Typography
+                          variant="caption"
+                          color="text.secondary"
+                        >
                           Submitted:{" "}
-                          {new Date(approval.created_at).toLocaleString()}
+                          {new Date(
+                            approval.created_at,
+                          ).toLocaleString()}
                         </Typography>
                       </Box>
 
@@ -625,14 +761,17 @@ export default function ApprovalReviewPanel() {
                         sx={{ borderRadius: 2 }}
                       >
                         <CardContent>
-                          <SectionTitle icon={<CloudIcon color="primary" />}>
+                          <SectionTitle
+                            icon={<CloudIcon color="primary" />}
+                          >
                             Terraform resources
                           </SectionTitle>
 
                           <Box
                             sx={{
                               display: "grid",
-                              gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+                              gridTemplateColumns:
+                                "repeat(2, minmax(0, 1fr))",
                               gap: 1,
                             }}
                           >
@@ -647,7 +786,10 @@ export default function ApprovalReviewPanel() {
                                   borderRadius: 2,
                                 }}
                               >
-                                <Typography variant="h5" sx={{ fontWeight: 800 }}>
+                                <Typography
+                                  variant="h5"
+                                  sx={{ fontWeight: 800 }}
+                                >
                                   {count}
                                 </Typography>
 
@@ -714,12 +856,14 @@ export default function ApprovalReviewPanel() {
                                     mt: 0.5,
                                   }}
                                 >
-                                  {resource.actions.map((action, index) => (
-                                    <StatusChip
-                                      key={`${action}-${index}`}
-                                      status={action}
-                                    />
-                                  ))}
+                                  {resource.actions.map(
+                                    (action, index) => (
+                                      <StatusChip
+                                        key={`${action}-${index}`}
+                                        status={action}
+                                      />
+                                    ),
+                                  )}
                                 </Box>
                               </Box>
                             ))
@@ -740,71 +884,395 @@ export default function ApprovalReviewPanel() {
                     <Box sx={{ mt: 2 }}>
                       <SecurityReview analysis={security} />
                     </Box>
+                                        {/* Three-stage approval workflow */}
+                    <Divider sx={{ my: 3 }} />
 
-                    {approval.reviewer_comments && (
-                      <Alert severity="info" sx={{ mt: 2 }}>
-                        <strong>Reviewer comments:</strong>{" "}
-                        {approval.reviewer_comments}
-                      </Alert>
-                    )}
+                    <Typography
+                      variant="h6"
+                      sx={{ fontWeight: 800, mb: 1 }}
+                    >
+                      Multi-stage approval workflow
+                    </Typography>
 
-                    {canDecide && (
-                      <Box sx={{ mt: 2 }}>
-                        <Typography
-                          variant="h6"
-                          sx={{ fontWeight: 700, mb: 1.5 }}
-                        >
-                          Review decision
-                        </Typography>
+                    <Typography
+                      variant="body2"
+                      color="text.secondary"
+                      sx={{ mb: 2 }}
+                    >
+                      Technical, cost and security reviews must all be
+                      approved before final approval.
+                    </Typography>
 
-                        <TextField
-                          label="Reviewer comments (optional)"
-                          value={comments[approval.id] ?? ""}
-                          onChange={(event) =>
-                            setComments((previous) => ({
-                              ...previous,
-                              [approval.id]: event.target.value,
-                            }))
-                          }
-                          multiline
-                          minRows={2}
-                          fullWidth
-                        />
+                    {(() => {
+                      const stages = stageReviews[approval.id] ?? [];
 
-                        <Box
-                          sx={{
-                            display: "flex",
-                            flexWrap: "wrap",
-                            gap: 1,
-                            mt: 1.5,
-                          }}
-                        >
-                          <Button
-                            variant="contained"
-                            color="success"
-                            disabled={workingId !== null}
-                            onClick={() =>
-                              void decide(approval.id, "approved")
-                            }
-                          >
-                            {workingId === approval.id
-                              ? "Processing..."
-                              : "Approve"}
-                          </Button>
+                      const allStagesApproved =
+                        stages.length === 3 &&
+                        ([
+                          "technical",
+                          "cost",
+                          "security",
+                        ] as ApprovalStage[]).every((stage) =>
+                          stages.some(
+                            (review) =>
+                              review.stage === stage &&
+                              review.status === "approved",
+                          ),
+                        );
 
-                          <Button
-                            variant="outlined"
-                            color="error"
-                            disabled={workingId !== null}
-                            onClick={() =>
-                              void decide(approval.id, "rejected")
-                            }
-                          >
-                            Reject
-                          </Button>
-                        </Box>
-                      </Box>
-                    )}
+                      const stagesLoaded =
+                        Object.prototype.hasOwnProperty.call(
+                          stageReviews,
+                          approval.id,
+                        );
+
+                      return (
+                        <>
+                          {!stagesLoaded ? (
+                            <Alert severity="info">
+                              Loading approval stages...
+                            </Alert>
+                          ) : stages.length !== 3 ? (
+                            <Alert severity="warning">
+                              Three-stage review records are unavailable.
+                              Refresh or check the backend migration.
+                            </Alert>
+                          ) : (
+                            <Box
+                              sx={{
+                                display: "grid",
+                                gridTemplateColumns: {
+                                  xs: "1fr",
+                                  md: "repeat(3, minmax(0, 1fr))",
+                                },
+                                gap: 2,
+                              }}
+                            >
+                              {(
+                                [
+                                  "technical",
+                                  "cost",
+                                  "security",
+                                ] as ApprovalStage[]
+                              ).map((stage) => {
+                                const review = stages.find(
+                                  (item) => item.stage === stage,
+                                );
+
+                                if (!review) {
+                                  return (
+                                    <Alert
+                                      key={stage}
+                                      severity="warning"
+                                    >
+                                      Missing {stage} review record.
+                                    </Alert>
+                                  );
+                                }
+
+                                const key = `${approval.id}-${stage}`;
+
+                                const costNeedsOverride =
+                                  stage === "cost" &&
+                                  (!cost ||
+                                    cost.status !== "estimated" ||
+                                    [
+                                      "exceeds_threshold",
+                                      "not_configured",
+                                      "not_evaluated",
+                                    ].includes(cost.budget_status));
+
+                                const overrideReady =
+                                  !costNeedsOverride ||
+                                  (costOverrides[approval.id] === true &&
+                                    Boolean(
+                                      stageComments[key]?.trim(),
+                                    ));
+
+                                const canReviewStage =
+                                  canDecide &&
+                                  review.status === "pending";
+
+                                return (
+                                  <Card
+                                    key={stage}
+                                    variant="outlined"
+                                    sx={{
+                                      borderRadius: 2,
+                                      borderTop: 4,
+                                      borderTopColor:
+                                        review.status === "approved"
+                                          ? "success.main"
+                                          : review.status === "rejected"
+                                            ? "error.main"
+                                            : "warning.main",
+                                    }}
+                                  >
+                                    <CardContent>
+                                      <Typography
+                                        variant="subtitle1"
+                                        sx={{
+                                          fontWeight: 800,
+                                          mb: 1,
+                                        }}
+                                      >
+                                        {APPROVAL_STAGE_DETAILS[stage].title}
+                                      </Typography>
+
+                                      <Typography
+                                        variant="body2"
+                                        color="text.secondary"
+                                        sx={{ mb: 2 }}
+                                      >
+                                        {
+                                          APPROVAL_STAGE_DETAILS[stage]
+                                            .description
+                                        }
+                                      </Typography>
+
+                                      <StatusChip
+                                        status={review.status}
+                                      />
+
+                                      {review.decided_by_id !== null && (
+                                        <Typography
+                                          variant="caption"
+                                          color="text.secondary"
+                                          sx={{
+                                            display: "block",
+                                            mt: 1,
+                                          }}
+                                        >
+                                          Reviewed by user #
+                                          {review.decided_by_id}
+                                        </Typography>
+                                      )}
+
+                                      {review.decided_at && (
+                                        <Typography
+                                          variant="caption"
+                                          color="text.secondary"
+                                          sx={{
+                                            display: "block",
+                                          }}
+                                        >
+                                          {new Date(
+                                            review.decided_at,
+                                          ).toLocaleString()}
+                                        </Typography>
+                                      )}
+
+                                      {review.comments && (
+                                        <Alert
+                                          severity={
+                                            review.status === "rejected"
+                                              ? "error"
+                                              : "info"
+                                          }
+                                          sx={{ mt: 2 }}
+                                        >
+                                          {review.comments}
+                                        </Alert>
+                                      )}
+
+                                      {canReviewStage && (
+                                        <Box sx={{ mt: 2 }}>
+                                          <TextField
+                                            label="Reviewer comments"
+                                            value={
+                                              stageComments[key] ?? ""
+                                            }
+                                            onChange={(event) =>
+                                              setStageComments(
+                                                (previous) => ({
+                                                  ...previous,
+                                                  [key]:
+                                                    event.target.value,
+                                                }),
+                                              )
+                                            }
+                                            multiline
+                                            minRows={2}
+                                            fullWidth
+                                            size="small"
+                                          />
+
+                                          {costNeedsOverride && (
+                                            <Box sx={{ mt: 1 }}>
+                                              <Alert severity="warning">
+                                                Cost estimate or budget
+                                                evaluation is incomplete.
+                                                A documented manual override
+                                                is required to approve this
+                                                review.
+                                              </Alert>
+
+                                              <FormControlLabel
+                                                control={
+                                                  <Checkbox
+                                                    checked={
+                                                      costOverrides[
+                                                        approval.id
+                                                      ] === true
+                                                    }
+                                                    onChange={(event) =>
+                                                      setCostOverrides(
+                                                        (previous) => ({
+                                                          ...previous,
+                                                          [approval.id]:
+                                                            event.target
+                                                              .checked,
+                                                        }),
+                                                      )
+                                                    }
+                                                  />
+                                                }
+                                                label="I have manually reviewed and accept the cost risk."
+                                              />
+                                            </Box>
+                                          )}
+
+                                          <Box
+                                            sx={{
+                                              display: "flex",
+                                              flexWrap: "wrap",
+                                              gap: 1,
+                                              mt: 1.5,
+                                            }}
+                                          >
+                                            <Button
+                                              variant="contained"
+                                              color="success"
+                                              size="small"
+                                              disabled={
+                                                workingId !== null ||
+                                                !overrideReady
+                                              }
+                                              onClick={() =>
+                                                void decideStage(
+                                                  approval.id,
+                                                  stage,
+                                                  "approved",
+                                                )
+                                              }
+                                            >
+                                              {workingId === approval.id
+                                                ? "Processing..."
+                                                : "Approve"}
+                                            </Button>
+
+                                            <Button
+                                              variant="outlined"
+                                              color="error"
+                                              size="small"
+                                              disabled={
+                                                workingId !== null
+                                              }
+                                              onClick={() =>
+                                                void decideStage(
+                                                  approval.id,
+                                                  stage,
+                                                  "rejected",
+                                                )
+                                              }
+                                            >
+                                              Reject
+                                            </Button>
+                                          </Box>
+                                        </Box>
+                                      )}
+                                    </CardContent>
+                                  </Card>
+                                );
+                              })}
+                            </Box>
+                          )}
+
+                          <Box sx={{ mt: 3 }}>
+                            <Typography
+                              variant="subtitle1"
+                              sx={{ fontWeight: 800, mb: 1 }}
+                            >
+                              Final approval
+                            </Typography>
+
+                            <Alert
+                              severity={
+                                allStagesApproved
+                                  ? "success"
+                                  : "warning"
+                              }
+                              sx={{ mb: 2 }}
+                            >
+                              {allStagesApproved
+                                ? "All three review stages are approved. Final approval is now available."
+                                : "Final approval is locked until Technical, Cost and Security reviews are all approved."}
+                            </Alert>
+
+                            {canDecide && (
+                              <>
+                                <TextField
+                                  label="Final reviewer comments (optional)"
+                                  value={comments[approval.id] ?? ""}
+                                  onChange={(event) =>
+                                    setComments((previous) => ({
+                                      ...previous,
+                                      [approval.id]:
+                                        event.target.value,
+                                    }))
+                                  }
+                                  multiline
+                                  minRows={2}
+                                  fullWidth
+                                />
+
+                                <Box
+                                  sx={{
+                                    display: "flex",
+                                    flexWrap: "wrap",
+                                    gap: 1,
+                                    mt: 1.5,
+                                  }}
+                                >
+                                  <Button
+                                    variant="contained"
+                                    color="success"
+                                    disabled={
+                                      workingId !== null ||
+                                      !allStagesApproved
+                                    }
+                                    onClick={() =>
+                                      void decide(
+                                        approval.id,
+                                        "approved",
+                                      )
+                                    }
+                                  >
+                                    {workingId === approval.id
+                                      ? "Processing..."
+                                      : "Final approve"}
+                                  </Button>
+
+                                  <Button
+                                    variant="outlined"
+                                    color="error"
+                                    disabled={workingId !== null}
+                                    onClick={() =>
+                                      void decide(
+                                        approval.id,
+                                        "rejected",
+                                      )
+                                    }
+                                  >
+                                    Reject request
+                                  </Button>
+                                </Box>
+                              </>
+                            )}
+                          </Box>
+                        </>
+                      );
+                    })()}
 
                     {isAdmin &&
                       isRequester &&
@@ -865,11 +1333,16 @@ export default function ApprovalReviewPanel() {
                                 color="text.secondary"
                               >
                                 Actor #{event.actor_id} ·{" "}
-                                {new Date(event.created_at).toLocaleString()}
+                                {new Date(
+                                  event.created_at,
+                                ).toLocaleString()}
                               </Typography>
 
                               {event.comments && (
-                                <Typography variant="body2" sx={{ mt: 0.5 }}>
+                                <Typography
+                                  variant="body2"
+                                  sx={{ mt: 0.5 }}
+                                >
                                   {event.comments}
                                 </Typography>
                               )}

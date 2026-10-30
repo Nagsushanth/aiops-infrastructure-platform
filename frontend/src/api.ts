@@ -332,6 +332,30 @@ export interface ApprovalResponse {
   updated_at: string;
 }
 
+export type ApprovalStage =
+  | "technical"
+  | "cost"
+  | "security";
+
+export interface ApprovalStageReviewResponse {
+  id: number;
+  approval_request_id: number;
+  stage: ApprovalStage;
+  status: "pending" | "approved" | "rejected";
+  assigned_reviewer_id: number | null;
+  decided_by_id: number | null;
+  comments: string | null;
+  decided_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ApprovalStageDecision {
+  decision: "approved" | "rejected";
+  comments: string | null;
+  manual_cost_override?: boolean;
+}
+
 
 export interface TrustedTerraformPlanResponse {
   id: number;
@@ -365,4 +389,26 @@ export async function createApproval(
       terraform_plan_record_id: terraformPlanRecordId,
     }),
   });
+}
+
+export async function getApprovalStages(
+  approvalId: number,
+): Promise<ApprovalStageReviewResponse[]> {
+  return apiRequest<ApprovalStageReviewResponse[]>(
+    `/approvals/${approvalId}/stages`,
+  );
+}
+
+export async function decideApprovalStage(
+  approvalId: number,
+  stage: ApprovalStage,
+  payload: ApprovalStageDecision,
+): Promise<ApprovalStageReviewResponse> {
+  return apiRequest<ApprovalStageReviewResponse>(
+    `/approvals/${approvalId}/stages/${stage}/decision`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+  );
 }
