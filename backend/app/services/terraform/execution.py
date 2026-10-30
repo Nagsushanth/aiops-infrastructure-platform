@@ -24,6 +24,21 @@ from backend.app.services.terraform.security_policy import (
     evaluate_terraform_security,
 )
 
+from backend.app.core.terraform_pricing import (
+    BUDGET_THRESHOLD_USD,
+    PRICING_CATALOG,
+)
+
+from backend.app.services.terraform.generator import (
+    INSTANCE_CATALOG,
+    TerraformGenerationError,
+    generate_terraform,
+)
+
+from backend.app.services.terraform.cost_estimator import (
+    estimate_ec2_monthly_cost,
+)
+
 
 class TerraformExecutionError(RuntimeError):
     """A safe, non-sensitive Terraform execution failure."""
@@ -344,12 +359,24 @@ def execute_terraform_plan(
             for item in parsed["resources"]
         ]
 
+        instance_type = INSTANCE_CATALOG[
+            (specification.vcpus, specification.memory_gb)
+        ]
+
+        cost_estimate = estimate_ec2_monthly_cost(
+            instance_type=instance_type,
+            region=specification.region,
+            pricing_catalog=PRICING_CATALOG,
+            budget_threshold=BUDGET_THRESHOLD_USD,
+        )
+
         summary = {
             "resource_summary": parsed["resource_summary"],
             "resources": resources,
             "terraform_version": parsed.get("terraform_version"),
             "format_version": parsed.get("format_version"),
             "security_analysis": security_analysis,
+            "cost_estimate": cost_estimate,
         }
 
         return {

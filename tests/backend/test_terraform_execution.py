@@ -4,7 +4,7 @@ import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
-
+import backend.app.services.terraform.execution as execution_module
 import pytest
 
 from backend.app.schemas.infrastructure import (
@@ -224,3 +224,151 @@ def test_timeout_is_reported_safely(specification):
             execute_terraform_plan(specification)
 
     assert exc.value.code == "INIT_TIMEOUT"
+
+def test_plan_includes_unavailable_cost_estimate(specification):
+    commands = []
+
+    def fake_run(
+        command,
+        *,
+        cwd,
+        timeout=None,
+        capture_output=False,
+        text=False,
+        check=False,
+        shell=False,
+        env=None,
+        **kwargs,
+    ):
+        commands.append(command)
+
+        if command[1] == "plan":
+            (Path(cwd) / "tfplan").write_bytes(b"mock-binary-plan")
+            return completed_process()
+
+        if command[1] == "show":
+            plan_json = {
+                "terraform_version": "1.15.6",
+                "format_version": "1.2",
+                "resource_changes": [
+                    {
+                        "address": "aws_instance.this",
+                        "mode": "managed",
+                        "type": "aws_instance",
+                        "name": "this",
+                        "change": {
+                            "actions": ["create"],
+                            "before": None,
+                            "after": {"instance_type": "t3.small"},
+                            "after_sensitive": {},
+                        },
+                    }
+                ],
+            }
+            return completed_process(stdout=json.dumps(plan_json))
+
+        return completed_process()
+
+    with (
+        patch(
+            "backend.app.services.terraform.execution.subprocess.run",
+            side_effect=fake_run,
+        ),
+        patch.object(execution_module, "PRICING_CATALOG", {}),
+        patch.object(
+            execution_module,
+            "BUDGET_THRESHOLD_USD",
+            None,
+        ),
+    ):
+        result = execute_terraform_plan(specification)
+
+    estimate = result["plan_summary"]["cost_estimate"]
+
+    assert estimate["status"] == "unavailable"
+    assert estimate["instance_type"] == "t3.small"
+    assert estimate["region"] == "ap-south-1"
+    assert estimate["estimated_monthly_compute_cost"] is None
+    assert estimate["budget_status"] == "not_evaluated"
+
+
+def test_plan_includes_verified_cost_estimate(specification):
+    commands = []
+
+    def fake_run(
+        command,
+        *,
+        cwd,
+        timeout=None,
+        capture_output=False,
+        text=False,
+        check=False,
+        shell=False,
+        env=None,
+        **kwargs,
+    ):
+        commands.append(command)
+
+        if command[1] == "plan":
+            (Path(cwd) / "tfplan").write_bytes(b"mock-binary-plan")
+            return completed_process()
+
+        if command[1] == "show":
+            plan_json = {
+                "terraform_version": "1.15.6",
+                "format_version": "1.2",
+                "resource_changes": [
+                    {
+                        "address": "aws_instance.this",
+                        "mode": "managed",
+                        "type": "aws_instance",
+                        "name": "this",
+                        "change": {
+                            "actions": ["create"],
+                            "before": None,
+                            "after": {"instance_type": "t3.small"},
+                            "after_sensitive": {},
+                        },
+                    }
+                ],
+            }
+            return completed_process(stdout=json.dumps(plan_json))
+
+        return completed_process()
+
+    test_catalog = {
+        "ap-south-1": {
+            "t3.small": {
+                "hourly_usd": "0.0208",
+                "source": "Test fixture only",
+                "verified_on": "2026-10-30",
+            }
+        }
+    }
+
+    with (
+        patch(
+            "backend.app.services.terraform.execution.subprocess.run",
+            side_effect=fake_run,
+        ),
+        patch.object(
+            execution_module,
+            "PRICING_CATALOG",
+            test_catalog,
+        ),
+        patch.object(
+            execution_module,
+            "BUDGET_THRESHOLD_USD",
+            "20",
+        ),
+    ):
+        result = execute_terraform_plan(specification)
+
+    estimate = result["plan_summary"]["cost_estimate"]
+
+    assert estimate["status"] == "estimated"
+    assert estimate["estimated_monthly_compute_cost"] == "15.18"
+    assert estimate["budget_status"] == "within_threshold"
+    assert estimate["pricing_source"] == "Test fixture only"
+    assert estimate["pricing_verified_on"] == "2026-10-30"
+    assert estimate["assumptions"]["includes"] == ["EC2 compute only"]
