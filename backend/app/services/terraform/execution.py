@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any
+from backend.app.services.terraform.artifacts import save_plan_artifact
 
 from backend.app.schemas.infrastructure import (
     ValidatedInfrastructureSpecification,
@@ -328,7 +329,8 @@ def execute_terraform_plan(
         if not plan_file.is_file():
             raise TerraformExecutionError("PLAN_ARTIFACT_MISSING")
 
-        plan_fingerprint = _sha256(plan_file.read_bytes())
+        plan_bytes = plan_file.read_bytes()
+        plan_fingerprint = _sha256(plan_bytes)
 
         shown = _run(
             ["terraform", "show", "-json", "tfplan"],
@@ -379,6 +381,12 @@ def execute_terraform_plan(
             "cost_estimate": cost_estimate,
         }
 
+        # Persist the exact binary plan before the temporary workspace
+        # is removed. The artifact remains private on the server.
+        artifact_path, artifact_sha256 = save_plan_artifact(
+            plan_bytes
+        )
+
         return {
             "status": "succeeded",
             "preview_type": "trusted_server_terraform_plan",
@@ -388,4 +396,6 @@ def execute_terraform_plan(
             "specification_fingerprint": specification_fingerprint,
             "plan_fingerprint": plan_fingerprint,
             "plan_summary": summary,
+            "artifact_path": artifact_path,
+            "artifact_sha256": artifact_sha256,
         }

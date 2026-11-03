@@ -17,6 +17,9 @@ from backend.app.services.terraform.execution import (
     TerraformExecutionError,
     execute_terraform_plan,
 )
+from backend.app.services.terraform.artifacts import (
+    delete_plan_artifact,
+)
 
 router = APIRouter(prefix="/terraform", tags=["Terraform Plans"])
 
@@ -71,8 +74,7 @@ def create_trusted_terraform_plan(
             detail="Stored infrastructure requirements are invalid.",
         ) from exc
 
-    # Execute before creating a successful record. The execution service
-    # returns sanitized metadata, never the raw Terraform plan JSON.
+    # Generate the Terraform plan and persist its binary artifact.
     try:
         result = execute_terraform_plan(specification)
     except TerraformExecutionError as exc:
@@ -86,6 +88,7 @@ def create_trusted_terraform_plan(
             plan_summary={},
             error_code=exc.code,
         )
+
         db.add(failed_record)
         db.commit()
 
@@ -98,18 +101,42 @@ def create_trusted_terraform_plan(
             },
         ) from exc
 
+    # Store artifact metadata in PostgreSQL.
+    # Never return the private artifact path or binary plan to the client.
     record = TerraformPlanRecord(
         infrastructure_request_id=infrastructure_request.id,
         requester_id=current_user.id,
         status="succeeded",
         plan_fingerprint=result["plan_fingerprint"],
         specification_fingerprint=result["specification_fingerprint"],
+        artifact_path=result.get("artifact_path"),
+        artifact_sha256=result.get("artifact_sha256"),
         plan_summary=result["plan_summary"],
     )
 
     db.add(record)
-    db.commit()
-    db.refresh(record)
+
+    try:
+        db.commit()
+        db.refresh(record)
+
+    except Exception as exc:
+        db.rollback()
+
+        # Remove the saved artifact if its database record cannot
+        # be persisted. Do not expose filesystem details to the client.
+        artifact_path = result.get("artifact_path")
+
+        if artifact_path:
+            try:
+                delete_plan_artifact(artifact_path)
+            except Exception:
+                pass
+
+        raise HTTPException(
+            status_code=500,
+            detail="Terraform plan record could not be saved.",
+        ) from exc
 
     return {
         "id": record.id,

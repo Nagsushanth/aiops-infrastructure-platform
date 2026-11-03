@@ -123,6 +123,8 @@ def fake_result():
         "deployment_enabled": False,
         "specification_fingerprint": "a" * 64,
         "plan_fingerprint": "b" * 64,
+        "artifact_path": "/tmp/test-artifacts/mock.tfplan",
+        "artifact_sha256": "c" * 64,
         "plan_summary": {
             "resource_summary": {
                 "create": 1,
@@ -170,6 +172,8 @@ def test_owner_can_create_trusted_plan_record(
         assert record is not None
         assert record.status == "succeeded"
         assert record.plan_summary == fake_result["plan_summary"]
+        assert record.artifact_path == fake_result["artifact_path"]
+        assert record.artifact_sha256 == fake_result["artifact_sha256"]
     finally:
         db.close()
 

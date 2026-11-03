@@ -1,27 +1,17 @@
-
-"""Trusted server-side configuration for Terraform cost reviews.
-
-Keep this catalog empty until regional rates have been verified.
-Never populate it with example or test-only prices.
-"""
+"""Trusted server-side configuration for Terraform cost reviews."""
 
 from decimal import Decimal
 from typing import Any
 
-# Shape:
-# {
-#     "ap-south-1": {
-#         "verified-instance-type": {
-#             "hourly_usd": "verified rate",
-#             "source": "official pricing source",
-#             "verified_on": "YYYY-MM-DD",
-#         }
-#     }
-# }
-#
-# These entries must be verified before being added.
-PRICING_CATALOG: dict[str, Any] = {}
+PRICING_CATALOG: dict[str, Any] = {
+    "ap-south-1": {
+        "t3.small": {
+            "hourly_usd": "0.0224",
+            "source": "AWS Price List API - AmazonEC2 On-Demand",
+            "verified_on": "2026-10-01",
+        }
+    }
+}
 
-# None means no server-configured budget threshold.
-# Configure this from approved application settings when available.
+# Keep unset until the project budget is confirmed.
 BUDGET_THRESHOLD_USD: Decimal | None = None

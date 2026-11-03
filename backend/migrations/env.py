@@ -14,6 +14,12 @@ from backend.app.models.conversation import Conversation
 from backend.app.models.messages import Message
 from backend.app.models.infrastructure_request import InfrastructureRequest
 from backend.app.models.user import User
+from backend.app.models.infrastructure_operation import InfrastructureOperation
+from backend.app.models.approval import (
+    ApprovalAuditEvent,
+    ApprovalRequest,
+    ApprovalStageReview,
+)
 
 config = context.config
 

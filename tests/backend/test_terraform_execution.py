@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 import backend.app.services.terraform.execution as execution_module
 import pytest
-
+from backend.app.services.terraform.artifacts import load_plan_artifact
 from backend.app.schemas.infrastructure import (
     ValidatedInfrastructureSpecification,
 )
@@ -14,6 +14,16 @@ from backend.app.services.terraform.execution import (
     TerraformExecutionError,
     execute_terraform_plan,
 )
+
+@pytest.fixture(autouse=True)
+def isolate_terraform_artifacts(tmp_path, monkeypatch):
+    """Keep test-generated Terraform artifacts inside pytest's temp directory."""
+    artifact_dir = tmp_path / "terraform-artifacts"
+
+    monkeypatch.setenv(
+        "AIOPS_TERRAFORM_ARTIFACT_DIR",
+        str(artifact_dir),
+    )
 
 
 @pytest.fixture
@@ -152,6 +162,15 @@ def test_runs_plan_without_apply(specification):
     assert result["is_real_terraform_plan"] is True
     assert result["source_verified"] is False
     assert result["deployment_enabled"] is False
+    assert result["artifact_path"]
+    assert result["artifact_sha256"] == result["plan_fingerprint"]
+
+    saved_plan = load_plan_artifact(
+        result["artifact_path"],
+        result["artifact_sha256"],
+    )
+
+    assert saved_plan == b"mock-binary-plan"
 
     assert len(result["plan_fingerprint"]) == 64
     assert len(result["specification_fingerprint"]) == 64

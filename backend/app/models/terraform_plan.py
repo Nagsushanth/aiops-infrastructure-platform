@@ -43,16 +43,26 @@ class TerraformPlanRecord(Base):
         index=True,
     )
 
-    # SHA-256 of the canonical plan representation and associated request spec.
     plan_fingerprint: Mapped[str | None] = mapped_column(
         String(64),
         nullable=True,
     )
 
-    # SHA-256 of the canonical infrastructure requirements used for this plan.
     specification_fingerprint: Mapped[str] = mapped_column(
         String(64),
         nullable=False,
+    )
+
+    # Private filesystem reference; never return this through the API.
+    artifact_path: Mapped[str | None] = mapped_column(
+        String(1024),
+        nullable=True,
+    )
+
+    # SHA-256 of the persisted binary Terraform plan.
+    artifact_sha256: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
     )
 
     # Only a sanitized summary belongs here, never raw plan JSON or secrets.

@@ -142,3 +142,133 @@ def test_handles_empty_plan():
     assert result["resources"] == []
     assert result["resource_summary"]["total_resource_changes"] == 0
     assert result["deployment_enabled"] is False
+
+
+def test_extracts_resource_dependencies_and_creation_order():
+    plan = {
+        "configuration": {
+            "root_module": {
+                "resources": [
+                    {
+                        "address": "aws_instance.app",
+                        "depends_on": [
+                            "aws_security_group.app"
+                        ],
+                    },
+                    {
+                        "address": "aws_security_group.app",
+                        "depends_on": [],
+                    },
+                ]
+            }
+        },
+        "resource_changes": [
+            {
+                "address": "aws_instance.app",
+                "type": "aws_instance",
+                "name": "app",
+                "change": {"actions": ["create"]},
+            },
+            {
+                "address": "aws_security_group.app",
+                "type": "aws_security_group",
+                "name": "app",
+                "change": {"actions": ["create"]},
+            },
+        ],
+    }
+
+    result = parse_terraform_plan(plan)
+    analysis = result["dependency_analysis"]
+
+    assert analysis["dependencies"] == [
+        {
+            "resource": "aws_instance.app",
+            "depends_on": ["aws_security_group.app"],
+        },
+        {
+            "resource": "aws_security_group.app",
+            "depends_on": [],
+        },
+    ]
+
+    assert analysis["create_order"] == [
+        "aws_security_group.app",
+        "aws_instance.app",
+    ]
+
+
+def test_destroy_order_reverses_dependency_order():
+    plan = {
+        "configuration": {
+            "root_module": {
+                "resources": [
+                    {
+                        "address": "aws_instance.app",
+                        "depends_on": ["aws_security_group.app"],
+                    },
+                    {
+                        "address": "aws_security_group.app",
+                        "depends_on": [],
+                    },
+                ]
+            }
+        },
+        "resource_changes": [
+            {
+                "address": "aws_instance.app",
+                "type": "aws_instance",
+                "name": "app",
+                "change": {"actions": ["delete"]},
+            },
+            {
+                "address": "aws_security_group.app",
+                "type": "aws_security_group",
+                "name": "app",
+                "change": {"actions": ["delete"]},
+            },
+        ],
+    }
+
+    result = parse_terraform_plan(plan)
+
+    assert result["dependency_analysis"]["destroy_order"] == [
+        "aws_instance.app",
+        "aws_security_group.app",
+    ]
+
+
+def test_handles_plan_without_configuration():
+    result = parse_terraform_plan({
+        "resource_changes": []
+    })
+
+    assert result["dependency_analysis"] == {
+        "dependencies": [],
+        "resource_order": [],
+        "create_order": [],
+        "destroy_order": [],
+    }
+
+
+def test_detects_circular_dependencies():
+    plan = {
+        "configuration": {
+            "root_module": {
+                "resources": [
+                    {
+                        "address": "aws_instance.first",
+                        "depends_on": ["aws_instance.second"],
+                    },
+                    {
+                        "address": "aws_instance.second",
+                        "depends_on": ["aws_instance.first"],
+                    },
+                ]
+            }
+        },
+        "resource_changes": [],
+    }
+
+    with pytest.raises(TerraformPlanParsingError):
+        parse_terraform_plan(plan)
