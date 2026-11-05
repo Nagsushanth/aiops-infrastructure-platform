@@ -821,3 +821,201 @@ def test_approval_rejects_missing_security_analysis(
     )
 
     assert response.status_code == 409, response.text
+
+def create_fully_approved_lifecycle_request(
+    client,
+    setup_data,
+    valid_plan,
+):
+    """Create a fully approved request with a test-only verified artifact."""
+
+    from backend.app.services.terraform.artifacts import (
+        save_plan_artifact,
+    )
+
+    approval_id = create_pending_approval(
+        setup_data,
+        valid_plan,
+    )
+
+    approve_all_stages(client, setup_data, approval_id)
+
+    response = client.post(
+        f"/approvals/{approval_id}/decision",
+        headers=setup_data["reviewer_headers"],
+        json={
+            "decision": "approved",
+            "comments": "All lifecycle test reviews completed.",
+        },
+    )
+    assert response.status_code == 200, response.text
+
+    artifact_path, artifact_checksum = save_plan_artifact(
+        b"test-only-terraform-plan-artifact"
+    )
+
+    db = TestingSessionLocal()
+    try:
+        plan_record = db.scalar(
+            select(TerraformPlanRecord).where(
+                TerraformPlanRecord.infrastructure_request_id
+                == setup_data["infra_request_id"]
+            )
+        )
+
+        assert plan_record is not None
+
+        plan_record.artifact_path = artifact_path
+        plan_record.artifact_sha256 = artifact_checksum
+
+        db.commit()
+    finally:
+        db.close()
+
+    return approval_id, artifact_path
+
+def test_provision_rejects_approval_without_all_reviews(
+    client,
+    setup_data,
+    valid_plan,
+):
+    approval_id = create_pending_approval(
+        setup_data,
+        valid_plan,
+    )
+
+    response = client.post(
+        "/infrastructure-operations/provision",
+        headers=setup_data["requester_headers"],
+        json={"approval_request_id": approval_id},
+    )
+
+    assert response.status_code == 409
+    assert "finally approved" in response.json()["detail"]
+
+
+def test_fully_approved_request_queues_provision_operation(
+    client,
+    setup_data,
+    valid_plan,
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    from backend.app.workers.tasks import (
+        execute_provision_operation,
+    )
+    from backend.app.services.terraform.artifacts import (
+        delete_plan_artifact,
+    )
+
+    approval_id, artifact_path = (
+        create_fully_approved_lifecycle_request(
+            client,
+            setup_data,
+            valid_plan,
+        )
+    )
+
+    monkeypatch.setattr(
+        execute_provision_operation,
+        "delay",
+        lambda operation_id: SimpleNamespace(
+            id="test-celery-task-id"
+        ),
+    )
+
+    try:
+        response = client.post(
+            "/infrastructure-operations/provision",
+            headers=setup_data["requester_headers"],
+            json={
+                "approval_request_id": approval_id,
+                "comments": "Lifecycle API test",
+            },
+        )
+
+        assert response.status_code == 202, response.text
+
+        result = response.json()
+
+        assert result["operation"] == "provision"
+        assert result["status"] == "queued"
+        assert result["celery_task_id"] == "test-celery-task-id"
+        assert result["result_summary"]["terraform_apply_enabled"] is False
+
+        operation_id = result["id"]
+
+        detail = client.get(
+            f"/infrastructure-operations/{operation_id}",
+            headers=setup_data["requester_headers"],
+        )
+
+        assert detail.status_code == 200
+
+        audit = client.get(
+            f"/infrastructure-operations/{operation_id}/audit",
+            headers=setup_data["requester_headers"],
+        )
+
+        assert audit.status_code == 200
+        assert any(
+            event["event_type"] == "provision_requested"
+            for event in audit.json()
+        )
+
+    finally:
+        delete_plan_artifact(artifact_path)
+
+
+def test_duplicate_provision_operation_is_rejected(
+    client,
+    setup_data,
+    valid_plan,
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    from backend.app.workers.tasks import (
+        execute_provision_operation,
+    )
+    from backend.app.services.terraform.artifacts import (
+        delete_plan_artifact,
+    )
+
+    approval_id, artifact_path = (
+        create_fully_approved_lifecycle_request(
+            client,
+            setup_data,
+            valid_plan,
+        )
+    )
+
+    monkeypatch.setattr(
+        execute_provision_operation,
+        "delay",
+        lambda operation_id: SimpleNamespace(
+            id="test-celery-task-id"
+        ),
+    )
+
+    try:
+        first_response = client.post(
+            "/infrastructure-operations/provision",
+            headers=setup_data["requester_headers"],
+            json={"approval_request_id": approval_id},
+        )
+
+        assert first_response.status_code == 202, first_response.text
+
+        second_response = client.post(
+            "/infrastructure-operations/provision",
+            headers=setup_data["requester_headers"],
+            json={"approval_request_id": approval_id},
+        )
+
+        assert second_response.status_code == 409
+        assert "already exists" in second_response.json()["detail"]
+
+    finally:
+        delete_plan_artifact(artifact_path)

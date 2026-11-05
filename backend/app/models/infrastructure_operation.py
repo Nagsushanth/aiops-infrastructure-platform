@@ -53,7 +53,7 @@ class InfrastructureOperation(Base):
         nullable=False,
     )
 
-    # queued, running, succeeded or failed
+    # queued, running, blocked, succeeded or failed
     status: Mapped[str] = mapped_column(
         String(30),
         nullable=False,

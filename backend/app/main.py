@@ -20,6 +20,9 @@ from fastapi import Depends
 from backend.app.core.auth_dependencies import get_current_user
 from backend.app.models.user import User
 from backend.app.api.terraform_plans import router as terraform_plans_router
+from backend.app.api.infrastructure_operations import (
+    router as infrastructure_operations_router,
+)
 
 
 app = FastAPI(
@@ -34,6 +37,7 @@ app.include_router(terraform_preview_router)
 app.include_router(auth_router)
 app.include_router(approvals_router)
 app.include_router(terraform_plans_router)
+app.include_router(infrastructure_operations_router)
 
 app.add_middleware(
     CORSMiddleware,

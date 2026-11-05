@@ -15,6 +15,9 @@ from backend.app.models.messages import Message
 from backend.app.models.infrastructure_request import InfrastructureRequest
 from backend.app.models.user import User
 from backend.app.models.infrastructure_operation import InfrastructureOperation
+from backend.app.models.terraform_state import TerraformStateRecord
+from backend.app.models.terraform_state_version import TerraformStateVersion
+from backend.app.models.terraform_plan import TerraformPlanRecord
 from backend.app.models.approval import (
     ApprovalAuditEvent,
     ApprovalRequest,
