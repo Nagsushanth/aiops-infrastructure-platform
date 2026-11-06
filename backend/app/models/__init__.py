@@ -5,6 +5,9 @@ from backend.app.models.terraform_plan import TerraformPlanRecord
 from backend.app.models.infrastructure_operation import InfrastructureOperation
 from backend.app.models.terraform_state import TerraformStateRecord
 from backend.app.models.terraform_state_version import TerraformStateVersion
+from backend.app.models.infrastructure_operation_event import (
+    InfrastructureOperationEvent,
+)
 
 
 __all__ = [
@@ -15,4 +18,5 @@ __all__ = [
     "InfrastructureOperation",
     "TerraformStateRecord",
     "TerraformStateVersion",
+    "InfrastructureOperationEvent",
 ]

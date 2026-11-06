@@ -23,6 +23,9 @@ from backend.app.models.approval import (
     ApprovalRequest,
     ApprovalStageReview,
 )
+from backend.app.models.infrastructure_operation_event import (
+    InfrastructureOperationEvent,
+)
 
 config = context.config
 

@@ -20,9 +20,12 @@ from backend.app.models.terraform_plan import TerraformPlanRecord
 from backend.app.models.terraform_state import TerraformStateRecord
 from backend.app.models.terraform_state_version import TerraformStateVersion
 from backend.app.models.user import User
-
 import backend.app.api.infrastructure_operations as operations_api
+from datetime import datetime, timedelta, timezone
 
+from backend.app.models.infrastructure_operation_event import (
+    InfrastructureOperationEvent,
+)
 
 test_engine = create_engine(
     "sqlite://",
@@ -570,4 +573,158 @@ def test_provision_returns_409_for_database_uniqueness_conflict(
     assert response.status_code == 409
     assert response.json()["detail"] == (
         "A provision operation already exists for this approval."
+    )
+
+def test_operation_audit_is_visible_to_owner_only_and_chronological(
+    client,
+    setup_data,
+):
+    request_id = setup_data["request_id"]
+    requester_id = setup_data["requester_id"]
+
+    db = TestingSessionLocal()
+
+    try:
+        # Create a Terraform plan.
+        plan = TerraformPlanRecord(
+            infrastructure_request_id=request_id,
+            requester_id=requester_id,
+            status="succeeded",
+            plan_fingerprint="a" * 64,
+            specification_fingerprint="b" * 64,
+            plan_summary={},
+        )
+        db.add(plan)
+        db.flush()
+
+        # Create an approved approval request.
+        approval = ApprovalRequest(
+            infrastructure_request_id=request_id,
+            terraform_plan_record_id=plan.id,
+            requester_id=requester_id,
+            status="approved",
+            plan_summary={},
+            plan_fingerprint="a" * 64,
+        )
+        db.add(approval)
+        db.flush()
+
+        # Create the infrastructure operation.
+        operation = InfrastructureOperation(
+            infrastructure_request_id=request_id,
+            terraform_plan_record_id=plan.id,
+            approval_request_id=approval.id,
+            requester_id=requester_id,
+            operation="provision",
+            status="failed",
+            error_code="WORKER_STALE_OPERATION",
+            result_summary={"reason": "Worker lease expired"},
+        )
+        db.add(operation)
+        db.flush()
+
+        now = datetime.now(timezone.utc)
+
+        # Existing approval audit event.
+        approval_event = ApprovalAuditEvent(
+            approval_request_id=approval.id,
+            actor_id=requester_id,
+            event_type="provision_requested",
+            previous_status=None,
+            new_status="pending",
+            comments="Provisioning requested",
+            event_metadata={"source": "test"},
+            created_at=now - timedelta(minutes=2),
+        )
+
+        # System-generated recovery event.
+        recovery_event = InfrastructureOperationEvent(
+            operation_id=operation.id,
+            actor_id=None,
+            actor_type="system",
+            event_type="worker_lease_expired",
+            previous_status="running",
+            new_status="failed",
+            comments="Worker lease expired; manual review required.",
+            event_metadata={
+                "error_code": "WORKER_STALE_OPERATION",
+                "automatic_retry": False,
+            },
+            created_at=now,
+        )
+
+        db.add_all([approval_event, recovery_event])
+        db.commit()
+
+        operation_id = operation.id
+
+    finally:
+        db.close()
+
+    # Owner must be able to retrieve both audit events.
+    response = client.get(
+        f"/infrastructure-operations/{operation_id}/audit",
+        headers=setup_data["requester_headers"],
+    )
+
+    assert response.status_code == 200, response.text
+
+    events = response.json()
+
+    assert len(events) == 2
+
+    # Both approval and infrastructure operation events must be visible.
+    assert {event["source"] for event in events} == {
+        "approval",
+        "infrastructure_operation",
+    }
+
+    event_types = {event["event_type"] for event in events}
+
+    assert "provision_requested" in event_types
+    assert "worker_lease_expired" in event_types
+
+    # Verify the system recovery event has no human actor.
+    recovery_events = [
+        event
+        for event in events
+        if event["event_type"] == "worker_lease_expired"
+    ]
+
+    assert len(recovery_events) == 1
+    assert recovery_events[0]["actor_type"] == "system"
+    assert recovery_events[0]["actor_id"] is None
+    assert recovery_events[0]["new_status"] == "failed"
+
+    # Verify the approval event remains attributed to the requester.
+    approval_events = [
+        event
+        for event in events
+        if event["event_type"] == "provision_requested"
+    ]
+
+    assert len(approval_events) == 1
+    assert approval_events[0]["actor_type"] == "user"
+    assert approval_events[0]["actor_id"] == requester_id
+
+    # Verify events are returned oldest to newest.
+    timestamps = [
+        datetime.fromisoformat(event["created_at"])
+        for event in events
+    ]
+
+    assert timestamps == sorted(timestamps)
+
+    assert events[0]["event_type"] == "provision_requested"
+    assert events[1]["event_type"] == "worker_lease_expired"
+
+    # Another user must not access this operation's audit history.
+    other_user_response = client.get(
+        f"/infrastructure-operations/{operation_id}/audit",
+        headers=setup_data["other_user_headers"],
+    )
+
+    assert other_user_response.status_code == 404
+    assert other_user_response.json()["detail"] == (
+        "Infrastructure operation not found."
     )

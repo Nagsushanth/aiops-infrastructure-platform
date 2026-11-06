@@ -3,7 +3,8 @@
 
 import hashlib
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 
 from sqlalchemy import select, update
 
@@ -15,6 +16,9 @@ from backend.app.models.approval import (
 from backend.app.models.conversation import Conversation
 from backend.app.models.infrastructure_operation import (
     InfrastructureOperation,
+)
+from backend.app.models.infrastructure_operation_event import (
+    InfrastructureOperationEvent,
 )
 from backend.app.models.infrastructure_request import (
     InfrastructureRequest,
@@ -28,6 +32,9 @@ from backend.app.services.terraform.artifacts import (
     load_plan_artifact,
 )
 from backend.app.workers.celery_app import celery_app
+
+
+WORKER_LEASE_MINUTES = 15
 
 
 @celery_app.task(name="aiops.health_check")
@@ -49,13 +56,99 @@ def _fingerprint_specification(specification) -> str:
     return hashlib.sha256(canonical).hexdigest()
 
 
-def _block_operation(operation, error_code: str, message: str) -> None:
-    operation.status = "blocked"
-    operation.error_code = error_code
-    operation.completed_at = datetime.now(timezone.utc)
-    operation.result_summary = {
-        "message": message,
-        "preflight_passed": error_code == "TERRAFORM_APPLY_DISABLED",
+def _finish_operation(
+    db,
+    operation_id: int,
+    execution_token: str,
+    status: str,
+    error_code: str,
+    message: str,
+    preflight_passed: bool = False,
+) -> bool:
+    """Finish an operation only while this worker owns its lease."""
+
+    now = datetime.now(timezone.utc)
+
+    result = db.execute(
+        update(InfrastructureOperation)
+        .where(
+            InfrastructureOperation.id == operation_id,
+            InfrastructureOperation.status == "running",
+            InfrastructureOperation.execution_token == execution_token,
+        )
+        .values(
+            status=status,
+            error_code=error_code,
+            completed_at=now,
+            execution_token=None,
+            lease_expires_at=None,
+            result_summary={
+                "message": message,
+                "preflight_passed": preflight_passed,
+                "terraform_apply_enabled": False,
+            },
+        )
+    )
+
+    if result.rowcount != 1:
+        db.rollback()
+        return False
+
+    db.add(
+        InfrastructureOperationEvent(
+            operation_id=operation_id,
+            actor_id=None,
+            actor_type="system",
+            event_type="worker_operation_finished",
+            previous_status="running",
+            new_status=status,
+            comments=message,
+            event_metadata={
+                "source": "celery_worker",
+                "error_code": error_code,
+                "preflight_passed": preflight_passed,
+            },
+        )
+    )
+
+    db.commit()
+    return True
+
+
+def _owned_operation_result(
+    db,
+    operation_id: int,
+    execution_token: str,
+    status: str,
+    error_code: str,
+    message: str,
+    preflight_passed: bool = False,
+) -> dict:
+    finished = _finish_operation(
+        db=db,
+        operation_id=operation_id,
+        execution_token=execution_token,
+        status=status,
+        error_code=error_code,
+        message=message,
+        preflight_passed=preflight_passed,
+    )
+
+    if not finished:
+        db.expire_all()
+        operation = db.get(InfrastructureOperation, operation_id)
+
+        return {
+            "status": operation.status if operation else "not_found",
+            "operation_id": operation_id,
+            "message": "Worker no longer owns this operation.",
+        }
+
+    return {
+        "status": status,
+        "operation_id": operation_id,
+        "error_code": error_code,
+        "preflight_passed": preflight_passed,
         "terraform_apply_enabled": False,
     }
 
@@ -67,10 +160,12 @@ def execute_provision_operation(operation_id: int) -> dict:
     """Revalidate a provision request without executing Terraform apply."""
 
     db = SessionLocal()
+    execution_token = str(uuid4())
 
     try:
+        now = datetime.now(timezone.utc)
+
         # Atomically claim the operation.
-        # Only one worker can change queued -> running.
         claim_result = db.execute(
             update(InfrastructureOperation)
             .where(
@@ -79,7 +174,11 @@ def execute_provision_operation(operation_id: int) -> dict:
             )
             .values(
                 status="running",
-                started_at=datetime.now(timezone.utc),
+                started_at=now,
+                execution_token=execution_token,
+                lease_expires_at=now + timedelta(
+                    minutes=WORKER_LEASE_MINUTES
+                ),
             )
         )
 
@@ -104,8 +203,6 @@ def execute_provision_operation(operation_id: int) -> dict:
             }
 
         db.commit()
-
-        # Refresh ORM state after the atomic database update.
         db.expire_all()
 
         operation = db.get(
@@ -123,10 +220,12 @@ def execute_provision_operation(operation_id: int) -> dict:
             ApprovalRequest,
             operation.approval_request_id,
         )
+
         plan = db.get(
             TerraformPlanRecord,
             operation.terraform_plan_record_id,
         )
+
         infrastructure_request = db.get(
             InfrastructureRequest,
             operation.infrastructure_request_id,
@@ -138,13 +237,14 @@ def execute_provision_operation(operation_id: int) -> dict:
             or plan is None
             or infrastructure_request is None
         ):
-            _block_operation(
-                operation,
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
                 "OPERATION_RELATIONSHIP_INVALID",
                 "The operation references missing or invalid records.",
             )
-            db.commit()
-            return {"status": operation.status, "operation_id": operation_id}
 
         if (
             approval.requester_id != operation.requester_id
@@ -154,13 +254,14 @@ def execute_provision_operation(operation_id: int) -> dict:
             or plan.infrastructure_request_id != infrastructure_request.id
             or plan.requester_id != operation.requester_id
         ):
-            _block_operation(
-                operation,
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
                 "OPERATION_OWNERSHIP_MISMATCH",
                 "The operation ownership or record relationships are invalid.",
             )
-            db.commit()
-            return {"status": operation.status, "operation_id": operation_id}
 
         conversation = db.get(
             Conversation,
@@ -171,43 +272,47 @@ def execute_provision_operation(operation_id: int) -> dict:
             conversation is None
             or conversation.user_id != operation.requester_id
         ):
-            _block_operation(
-                operation,
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
                 "REQUEST_OWNERSHIP_MISMATCH",
                 "The infrastructure request ownership check failed.",
             )
-            db.commit()
-            return {"status": operation.status, "operation_id": operation_id}
 
         if approval.status != "approved":
-            _block_operation(
-                operation,
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
                 "APPROVAL_NOT_FINAL",
                 "The approval is no longer finally approved.",
             )
-            db.commit()
-            return {"status": operation.status, "operation_id": operation_id}
 
         if plan.status != "succeeded":
-            _block_operation(
-                operation,
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
                 "PLAN_NOT_SUCCEEDED",
                 "The Terraform plan is not in succeeded status.",
             )
-            db.commit()
-            return {"status": operation.status, "operation_id": operation_id}
 
         if (
             not plan.plan_fingerprint
             or approval.plan_fingerprint != plan.plan_fingerprint
         ):
-            _block_operation(
-                operation,
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
                 "PLAN_FINGERPRINT_MISMATCH",
                 "The approved plan fingerprint does not match.",
             )
-            db.commit()
-            return {"status": operation.status, "operation_id": operation_id}
 
         reviews = list(
             db.scalars(
@@ -231,13 +336,14 @@ def execute_provision_operation(operation_id: int) -> dict:
                 for stage in required_stages
             )
         ):
-            _block_operation(
-                operation,
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
                 "APPROVAL_STAGES_INCOMPLETE",
                 "All technical, cost and security reviews must be approved.",
             )
-            db.commit()
-            return {"status": operation.status, "operation_id": operation_id}
 
         try:
             specification = (
@@ -246,33 +352,36 @@ def execute_provision_operation(operation_id: int) -> dict:
                 )
             )
         except Exception:
-            _block_operation(
-                operation,
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
                 "SPECIFICATION_INVALID",
                 "The infrastructure specification is no longer valid.",
             )
-            db.commit()
-            return {"status": operation.status, "operation_id": operation_id}
 
         current_fingerprint = _fingerprint_specification(specification)
 
         if plan.specification_fingerprint != current_fingerprint:
-            _block_operation(
-                operation,
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
                 "SPECIFICATION_FINGERPRINT_MISMATCH",
                 "Infrastructure requirements changed after plan generation.",
             )
-            db.commit()
-            return {"status": operation.status, "operation_id": operation_id}
 
         if not plan.artifact_path or not plan.artifact_sha256:
-            _block_operation(
-                operation,
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
                 "PLAN_ARTIFACT_MISSING",
                 "The Terraform plan artifact is unavailable.",
             )
-            db.commit()
-            return {"status": operation.status, "operation_id": operation_id}
 
         try:
             load_plan_artifact(
@@ -280,56 +389,148 @@ def execute_provision_operation(operation_id: int) -> dict:
                 plan.artifact_sha256,
             )
         except TerraformArtifactError:
-            _block_operation(
-                operation,
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
                 "PLAN_ARTIFACT_INVALID",
                 "Terraform plan artifact integrity verification failed.",
             )
-            db.commit()
-            return {"status": operation.status, "operation_id": operation_id}
 
         # Deliberate safety boundary:
-        # persistent Terraform state and deployment safeguards must be
-        # completed before any real Terraform apply can be enabled.
-        _block_operation(
-            operation,
+        # Terraform apply remains disabled.
+        return _owned_operation_result(
+            db,
+            operation_id,
+            execution_token,
+            "blocked",
             "TERRAFORM_APPLY_DISABLED",
             (
                 "Preflight validation succeeded. Terraform apply remains "
                 "disabled until persistent state and deployment safeguards "
                 "are implemented."
             ),
+            preflight_passed=True,
         )
-        db.commit()
-
-        return {
-            "status": operation.status,
-            "operation_id": operation_id,
-            "preflight_passed": True,
-            "terraform_apply_enabled": False,
-        }
 
     except Exception:
         db.rollback()
 
-        operation = db.get(
-            InfrastructureOperation,
+        return _owned_operation_result(
+            db,
             operation_id,
+            execution_token,
+            "blocked",
+            "WORKER_PREFLIGHT_FAILED",
+            "An unexpected error occurred during operation preflight.",
         )
 
-        if operation is not None:
-            _block_operation(
-                operation,
-                "WORKER_PREFLIGHT_FAILED",
-                "An unexpected error occurred during operation preflight.",
+    finally:
+        db.close()
+
+
+@celery_app.task(
+    name="aiops.recover_stale_infrastructure_operations",
+)
+def recover_stale_infrastructure_operations(
+    grace_period_minutes: int = 0,
+) -> dict:
+    """Fail expired worker leases without retrying infrastructure actions."""
+
+    if (
+        isinstance(grace_period_minutes, bool)
+        or not isinstance(grace_period_minutes, int)
+        or not 0 <= grace_period_minutes <= 1440
+    ):
+        raise ValueError(
+            "grace_period_minutes must be an integer between 0 and 1440."
+        )
+
+    db = SessionLocal()
+    now = datetime.now(timezone.utc)
+    expiry_cutoff = now - timedelta(
+        minutes=grace_period_minutes
+    )
+
+    recovered_ids = []
+
+    try:
+        candidate_ids = list(
+            db.scalars(
+                select(InfrastructureOperation.id).where(
+                    InfrastructureOperation.status == "running",
+                    InfrastructureOperation.execution_token.is_not(None),
+                    InfrastructureOperation.lease_expires_at.is_not(None),
+                    InfrastructureOperation.lease_expires_at <= expiry_cutoff,
+                )
+            ).all()
+        )
+
+        for operation_id in candidate_ids:
+            result = db.execute(
+                update(InfrastructureOperation)
+                .where(
+                    InfrastructureOperation.id == operation_id,
+                    InfrastructureOperation.status == "running",
+                    InfrastructureOperation.execution_token.is_not(None),
+                    InfrastructureOperation.lease_expires_at <= expiry_cutoff,
+                )
+                .values(
+                    status="failed",
+                    error_code="WORKER_STALE_OPERATION",
+                    completed_at=now,
+                    execution_token=None,
+                    lease_expires_at=None,
+                    result_summary={
+                        "message": (
+                            "The worker lease expired. The operation was "
+                            "marked failed for manual review. No automatic "
+                            "infrastructure retry was performed."
+                        ),
+                        "recovery_source": "celery_recovery_task",
+                        "terraform_apply_enabled": False,
+                        "manual_review_required": True,
+                    },
+                )
             )
-            db.commit()
+
+            if result.rowcount != 1:
+                continue
+
+            db.add(
+                InfrastructureOperationEvent(
+                    operation_id=operation_id,
+                    actor_id=None,
+                    actor_type="system",
+                    event_type="worker_lease_expired",
+                    previous_status="running",
+                    new_status="failed",
+                    comments=(
+                        "Worker lease expired. Operation requires manual review."
+                    ),
+                    event_metadata={
+                        "source": "celery_recovery_task",
+                        "error_code": "WORKER_STALE_OPERATION",
+                        "automatic_retry": False,
+                    },
+                )
+            )
+
+            recovered_ids.append(operation_id)
+
+        db.commit()
 
         return {
-            "status": "blocked",
-            "operation_id": operation_id,
-            "error_code": "WORKER_PREFLIGHT_FAILED",
+            "status": "completed",
+            "recovered_count": len(recovered_ids),
+            "recovered_operation_ids": recovered_ids,
+            "automatic_retry": False,
         }
+
+    except Exception:
+        db.rollback()
+        raise
 
     finally:
         db.close()

@@ -2,7 +2,7 @@
 import pytest
 import hashlib
 import json
-
+from sqlalchemy import select
 from backend.app.schemas.infrastructure import (
     ValidatedInfrastructureSpecification,
 )
@@ -31,6 +31,11 @@ from backend.app.models.terraform_plan import TerraformPlanRecord
 from backend.app.models.user import User
 
 from backend.app.workers import tasks
+from datetime import datetime, timedelta, timezone
+
+from backend.app.models.infrastructure_operation_event import (
+    InfrastructureOperationEvent,
+)
 
 
 @pytest.fixture
@@ -291,3 +296,244 @@ def test_worker_passes_preflight_but_keeps_apply_disabled(worker_db):
 
     finally:
         delete_plan_artifact(artifact_path)
+
+
+def create_recovery_test_operation(
+    db,
+    email: str,
+    status: str,
+    lease_expires_at=None,
+):
+    """Create a minimal operation for recovery tests."""
+
+    user = User(
+        email=email,
+        password_hash="test-hash",
+        role="user",
+        is_active=True,
+    )
+    db.add(user)
+    db.flush()
+
+    conversation = Conversation(
+        user_id=user.id,
+        session_id=f"recovery-{email}",
+        title="Recovery test",
+    )
+    db.add(conversation)
+    db.flush()
+
+    request = InfrastructureRequest(
+        conversation_id=conversation.id,
+        status="complete",
+        requirements={},
+    )
+    db.add(request)
+    db.flush()
+
+    plan = TerraformPlanRecord(
+        infrastructure_request_id=request.id,
+        requester_id=user.id,
+        status="succeeded",
+        plan_fingerprint="a" * 64,
+        specification_fingerprint="b" * 64,
+        plan_summary={},
+    )
+    db.add(plan)
+    db.flush()
+
+    approval = ApprovalRequest(
+        infrastructure_request_id=request.id,
+        terraform_plan_record_id=plan.id,
+        requester_id=user.id,
+        status="approved",
+        plan_summary={},
+        plan_fingerprint="a" * 64,
+    )
+    db.add(approval)
+    db.flush()
+
+    operation = InfrastructureOperation(
+        infrastructure_request_id=request.id,
+        terraform_plan_record_id=plan.id,
+        approval_request_id=approval.id,
+        requester_id=user.id,
+        operation="provision",
+        status=status,
+        execution_token=(
+            "test-execution-token"
+            if status == "running"
+            else None
+        ),
+        lease_expires_at=lease_expires_at,
+        started_at=(
+            datetime.now(timezone.utc) - timedelta(minutes=20)
+            if status == "running"
+            else None
+        ),
+    )
+
+    db.add(operation)
+    db.commit()
+
+    return operation.id
+
+
+def test_recovery_marks_expired_operation_failed(worker_db):
+    db = worker_db()
+
+    try:
+        operation_id = create_recovery_test_operation(
+            db,
+            "expired-worker@example.com",
+            "running",
+            datetime.now(timezone.utc) - timedelta(minutes=5),
+        )
+    finally:
+        db.close()
+
+    result = tasks.recover_stale_infrastructure_operations.run()
+
+    assert result["status"] == "completed"
+    assert result["recovered_count"] == 1
+    assert operation_id in result["recovered_operation_ids"]
+    assert result["automatic_retry"] is False
+
+    db = worker_db()
+
+    try:
+        operation = db.get(InfrastructureOperation, operation_id)
+
+        assert operation.status == "failed"
+        assert operation.error_code == "WORKER_STALE_OPERATION"
+        assert operation.execution_token is None
+        assert operation.lease_expires_at is None
+        assert operation.completed_at is not None
+
+        assert operation.result_summary["manual_review_required"] is True
+        assert operation.result_summary["terraform_apply_enabled"] is False
+
+        event = db.scalar(
+            select(InfrastructureOperationEvent).where(
+                InfrastructureOperationEvent.operation_id == operation_id
+            )
+        )
+
+        assert event is not None
+        assert event.actor_type == "system"
+        assert event.actor_id is None
+        assert event.event_type == "worker_lease_expired"
+        assert event.previous_status == "running"
+        assert event.new_status == "failed"
+
+    finally:
+        db.close()
+
+
+def test_recovery_ignores_recent_running_operation(worker_db):
+    db = worker_db()
+
+    try:
+        operation_id = create_recovery_test_operation(
+            db,
+            "recent-worker@example.com",
+            "running",
+            datetime.now(timezone.utc) + timedelta(minutes=10),
+        )
+    finally:
+        db.close()
+
+    result = tasks.recover_stale_infrastructure_operations.run()
+
+    assert result["recovered_count"] == 0
+
+    db = worker_db()
+
+    try:
+        operation = db.get(InfrastructureOperation, operation_id)
+
+        assert operation.status == "running"
+        assert operation.execution_token == "test-execution-token"
+
+    finally:
+        db.close()
+
+
+def test_recovery_does_not_modify_queued_operation(worker_db):
+    db = worker_db()
+
+    try:
+        operation_id = create_recovery_test_operation(
+            db,
+            "queued-worker@example.com",
+            "queued",
+        )
+    finally:
+        db.close()
+
+    result = tasks.recover_stale_infrastructure_operations.run()
+
+    assert result["recovered_count"] == 0
+
+    db = worker_db()
+
+    try:
+        operation = db.get(InfrastructureOperation, operation_id)
+
+        assert operation.status == "queued"
+        assert operation.error_code is None
+
+    finally:
+        db.close()
+
+
+def test_recovery_is_idempotent(worker_db):
+    db = worker_db()
+
+    try:
+        operation_id = create_recovery_test_operation(
+            db,
+            "idempotent-worker@example.com",
+            "running",
+            datetime.now(timezone.utc) - timedelta(minutes=10),
+        )
+    finally:
+        db.close()
+
+    first_result = (
+        tasks.recover_stale_infrastructure_operations.run()
+    )
+    second_result = (
+        tasks.recover_stale_infrastructure_operations.run()
+    )
+
+    assert first_result["recovered_count"] == 1
+    assert second_result["recovered_count"] == 0
+
+    db = worker_db()
+
+    try:
+        events = list(
+            db.scalars(
+                select(InfrastructureOperationEvent).where(
+                    InfrastructureOperationEvent.operation_id
+                    == operation_id
+                )
+            ).all()
+        )
+
+        assert len(events) == 1
+
+    finally:
+        db.close()
+
+
+def test_recovery_rejects_invalid_grace_period(worker_db):
+    with pytest.raises(ValueError):
+        tasks.recover_stale_infrastructure_operations.run(-1)
+
+    with pytest.raises(ValueError):
+        tasks.recover_stale_infrastructure_operations.run(1441)
+
+    with pytest.raises(ValueError):
+        tasks.recover_stale_infrastructure_operations.run(True)

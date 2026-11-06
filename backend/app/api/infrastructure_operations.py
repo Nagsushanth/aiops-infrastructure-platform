@@ -51,6 +51,9 @@ from backend.app.services.terraform.state_version_manager import (
     TerraformStateVersionError,
     get_state_versions,
 )
+from backend.app.models.infrastructure_operation_event import (
+    InfrastructureOperationEvent,
+)
 
 router = APIRouter(
     prefix="/infrastructure-operations",
@@ -463,12 +466,104 @@ def get_operation(
     return operation
 
 
+
 @router.get("/{operation_id}/audit")
 def get_operation_audit(
     operation_id: int,
     current_user: CurrentUser,
     db: Session = Depends(get_db),
 ):
+    """Return approval and infrastructure operation audit history."""
+
+    operation = db.get(
+        InfrastructureOperation,
+        operation_id,
+    )
+
+    if operation is None or operation.requester_id != current_user.id:
+        raise HTTPException(
+            status_code=404,
+            detail="Infrastructure operation not found.",
+        )
+
+    approval_events = db.scalars(
+        select(ApprovalAuditEvent)
+        .where(
+            ApprovalAuditEvent.approval_request_id
+            == operation.approval_request_id
+        )
+        .order_by(
+            ApprovalAuditEvent.created_at,
+            ApprovalAuditEvent.id,
+        )
+    ).all()
+
+    operation_events = db.scalars(
+        select(InfrastructureOperationEvent)
+        .where(
+            InfrastructureOperationEvent.operation_id == operation.id
+        )
+        .order_by(
+            InfrastructureOperationEvent.created_at,
+            InfrastructureOperationEvent.id,
+        )
+    ).all()
+
+    events = []
+
+    for event in approval_events:
+        events.append(
+            {
+                "id": event.id,
+                "source": "approval",
+                "approval_request_id": event.approval_request_id,
+                "operation_id": operation.id,
+                "actor_id": event.actor_id,
+                "actor_type": "user",
+                "event_type": event.event_type,
+                "previous_status": event.previous_status,
+                "new_status": event.new_status,
+                "comments": event.comments,
+                "event_metadata": event.event_metadata,
+                "created_at": event.created_at,
+            }
+        )
+
+    for event in operation_events:
+        events.append(
+            {
+                "id": event.id,
+                "source": "infrastructure_operation",
+                "approval_request_id": operation.approval_request_id,
+                "operation_id": event.operation_id,
+                "actor_id": event.actor_id,
+                "actor_type": event.actor_type,
+                "event_type": event.event_type,
+                "previous_status": event.previous_status,
+                "new_status": event.new_status,
+                "comments": event.comments,
+                "event_metadata": event.event_metadata,
+                "created_at": event.created_at,
+            }
+        )
+
+    def audit_sort_key(event):
+        timestamp = event["created_at"]
+
+        # SQLite can return naive datetimes in tests.
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+
+        return (
+            timestamp.astimezone(timezone.utc),
+            event["source"],
+            event["id"],
+        )
+
+    events.sort(key=audit_sort_key)
+
+    return events
+
     """Return approval audit history for this operation."""
 
     operation = db.get(
