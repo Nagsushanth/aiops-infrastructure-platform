@@ -3,7 +3,7 @@
 
 import hashlib
 import re
-
+import uuid
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -46,7 +46,11 @@ def create_state_record(
     if backend_type not in VALID_BACKEND_TYPES:
         raise TerraformStateError("STATE_BACKEND_TYPE_INVALID")
 
-    if not isinstance(infrastructure_request_id, int) or infrastructure_request_id <= 0:
+    if (
+        not isinstance(infrastructure_request_id, int)
+        or isinstance(infrastructure_request_id, bool)
+        or infrastructure_request_id <= 0
+    ):
         raise TerraformStateError("STATE_REQUEST_ID_INVALID")
 
     if not all(
@@ -140,11 +144,16 @@ def update_state_metadata(
         record.state_serial = state_serial
 
     if state_lineage is not None:
-        if not isinstance(state_lineage, str) or not re.fullmatch(
-            r"[0-9a-fA-F-]{36}", state_lineage
-        ):
+        try:
+            parsed_lineage = uuid.UUID(state_lineage)
+
+            if str(parsed_lineage) != state_lineage.lower():
+                raise ValueError("Non-canonical UUID")
+
+        except (ValueError, TypeError, AttributeError):
             raise TerraformStateError("STATE_LINEAGE_INVALID")
-        record.state_lineage = state_lineage
+
+        record.state_lineage = state_lineage.lower()
 
     if state_sha256 is not None:
         if not isinstance(state_sha256, str) or not re.fullmatch(
@@ -154,7 +163,10 @@ def update_state_metadata(
         record.state_sha256 = state_sha256.lower()
 
     if status is not None:
-        if status not in VALID_STATUSES:
+        if not isinstance(status, str) or status not in VALID_STATUSES:
+            raise TerraformStateError("STATE_STATUS_INVALID")
+
+        if record.status not in VALID_STATE_TRANSITIONS:
             raise TerraformStateError("STATE_STATUS_INVALID")
 
         allowed_transitions = VALID_STATE_TRANSITIONS[record.status]

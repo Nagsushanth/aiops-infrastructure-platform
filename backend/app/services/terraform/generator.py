@@ -101,7 +101,7 @@ def generate_terraform(
     public_ip = "true" if specification.public_access else "false"
 
     return f'''terraform {{
-  required_version = ">= 1.5.0, < 2.0.0"
+  required_version = ">= 1.10.0, < 2.0.0"
 
   required_providers {{
     aws = {{

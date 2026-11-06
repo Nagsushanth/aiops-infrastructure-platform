@@ -16,10 +16,6 @@ from backend.app.services.terraform.backend_config import build_s3_backend_confi
 from backend.app.schemas.infrastructure import (
     ValidatedInfrastructureSpecification,
 )
-from backend.app.services.terraform.generator import (
-    TerraformGenerationError,
-    generate_terraform,
-)
 from backend.app.services.terraform.plan_parser import (
     TerraformPlanParsingError,
     parse_terraform_plan,
@@ -71,6 +67,46 @@ def _canonical_specification(
         ensure_ascii=False,
     ).encode("utf-8")
 
+def _inject_s3_backend(
+    configuration: str,
+    backend_config: dict[str, str],
+) -> str:
+    """Inject and verify the request-specific S3 backend configuration."""
+
+    terraform_block = "terraform {\n"
+
+    if configuration.count(terraform_block) != 1:
+        raise TerraformExecutionError(
+            "BACKEND_BLOCK_INJECTION_FAILED"
+        )
+
+    if 'backend "' in configuration:
+        raise TerraformExecutionError(
+            "BACKEND_BLOCK_ALREADY_CONFIGURED"
+        )
+
+    backend_block = (
+        '  backend "s3" {\n'
+        f'    bucket       = {json.dumps(backend_config["bucket"])}\n'
+        f'    key          = {json.dumps(backend_config["key"])}\n'
+        f'    region       = {json.dumps(backend_config["region"])}\n'
+        '    encrypt      = true\n'
+        '    use_lockfile = true\n'
+        '  }\n'
+    )
+
+    configured = configuration.replace(
+        terraform_block,
+        terraform_block + backend_block,
+        1,
+    )
+
+    if configured.count('backend "s3"') != 1:
+        raise TerraformExecutionError(
+            "BACKEND_BLOCK_INJECTION_FAILED"
+        )
+
+    return configured
 
 def _failure_category(diagnostic: str) -> str:
     """Classify Terraform output without exposing its raw contents."""
@@ -230,8 +266,14 @@ def execute_terraform_plan(
     read permissions may be needed because the configuration uses AWS data
     sources. Call only from a trusted, authenticated server-side workflow.
     """
-    if not 1 <= timeout_seconds <= 600:
-        raise ValueError("timeout_seconds must be between 1 and 600.")
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, int)
+        or not 1 <= timeout_seconds <= 600
+    ):
+        raise ValueError(
+            "timeout_seconds must be an integer between 1 and 600."
+        )
 
     try:
         configuration = generate_terraform(specification)
@@ -316,20 +358,9 @@ def execute_terraform_plan(
     ) as temp:
         workspace = Path(temp)
 
-        backend_block = (
-            '  backend "s3" {\n'
-            f'    bucket       = {json.dumps(backend_config["bucket"])}\n'
-            f'    key          = {json.dumps(backend_config["key"])}\n'
-            f'    region       = {json.dumps(backend_config["region"])}\n'
-            '    encrypt      = true\n'
-            '    use_lockfile = true\n'
-            '  }\n'
-        )
-
-        configuration = configuration.replace(
-            "terraform {\n",
-            "terraform {\n" + backend_block,
-            1,
+        configuration = _inject_s3_backend(
+            configuration,
+            backend_config,
         )
 
         (workspace / "main.tf").write_text(

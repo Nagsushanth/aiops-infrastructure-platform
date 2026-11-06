@@ -74,6 +74,89 @@ def test_rejects_invalid_timeout(specification):
             timeout_seconds=0,
         )
 
+@pytest.mark.parametrize(
+    "invalid_timeout",
+    [
+        True,
+        False,
+        1.5,
+        "180",
+        -1,
+        601,
+    ],
+)
+def test_rejects_invalid_timeout_types_and_ranges(
+    specification,
+    invalid_timeout,
+):
+    with pytest.raises(ValueError):
+        execute_terraform_plan(
+            specification,
+            infrastructure_request_id=123,
+            timeout_seconds=invalid_timeout,
+        )
+
+
+def test_rejects_missing_terraform_backend_injection_target(
+    specification,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        execution_module,
+        "generate_terraform",
+        lambda specification: 'provider "aws" {}',
+    )
+
+    with pytest.raises(TerraformExecutionError) as exc:
+        execute_terraform_plan(
+            specification,
+            infrastructure_request_id=123,
+        )
+
+    assert exc.value.code == "BACKEND_BLOCK_INJECTION_FAILED"
+
+def test_inject_s3_backend_adds_verified_configuration():
+    configuration = 'terraform {\n  required_version = ">= 1.10.0"\n}\n'
+
+    backend_config = {
+        "bucket": "test-terraform-state",
+        "key": "test/requests/123/terraform.tfstate",
+        "region": "ap-south-1",
+    }
+
+    result = execution_module._inject_s3_backend(
+        configuration,
+        backend_config,
+    )
+
+    assert result.count('backend "s3"') == 1
+    assert 'bucket       = "test-terraform-state"' in result
+    assert 'key          = "test/requests/123/terraform.tfstate"' in result
+    assert "encrypt      = true" in result
+    assert "use_lockfile = true" in result
+
+
+def test_inject_s3_backend_rejects_existing_backend():
+    configuration = (
+        'terraform {\n'
+        '  backend "local" {}\n'
+        '}\n'
+    )
+
+    backend_config = {
+        "bucket": "test-terraform-state",
+        "key": "test/requests/123/terraform.tfstate",
+        "region": "ap-south-1",
+    }
+
+    with pytest.raises(TerraformExecutionError) as exc:
+        execution_module._inject_s3_backend(
+            configuration,
+            backend_config,
+        )
+
+    assert exc.value.code == "BACKEND_BLOCK_ALREADY_CONFIGURED"
+
 
 def test_rejects_unsupported_specification():
     unsupported = ValidatedInfrastructureSpecification(

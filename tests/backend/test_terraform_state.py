@@ -335,3 +335,94 @@ def test_archived_state_cannot_be_reinitialized(db):
         )
 
     assert exc.value.args[0] == "STATE_TRANSITION_INVALID"
+
+@pytest.mark.parametrize("request_id", [True, False])
+def test_create_state_record_rejects_boolean_request_id(db, request_id):
+    session, _ = db
+
+    with pytest.raises(TerraformStateError) as exc:
+        create_state_record(
+            session,
+            request_id,
+            "aiops-test-state-bucket",
+            "requests/1/terraform.tfstate",
+            "ap-south-1",
+        )
+
+    assert exc.value.args[0] == "STATE_REQUEST_ID_INVALID"
+
+
+@pytest.mark.parametrize(
+    "lineage",
+    [
+        "12345678-1234-1234-1234-12345678901Z",
+        "12345678123412341234123456789012",
+        "{12345678-1234-1234-1234-123456789012}",
+        "",
+    ],
+)
+def test_noncanonical_state_lineage_is_rejected(db, lineage):
+    session, request_id = db
+
+    create_state_record(
+        session,
+        request_id,
+        "aiops-test-state-bucket",
+        f"requests/{request_id}/terraform.tfstate",
+        "ap-south-1",
+    )
+
+    with pytest.raises(TerraformStateError) as exc:
+        update_state_metadata(
+            session,
+            request_id,
+            state_lineage=lineage,
+        )
+
+    assert exc.value.args[0] == "STATE_LINEAGE_INVALID"
+
+
+def test_uppercase_valid_state_lineage_is_normalized(db):
+    session, request_id = db
+
+    create_state_record(
+        session,
+        request_id,
+        "aiops-test-state-bucket",
+        f"requests/{request_id}/terraform.tfstate",
+        "ap-south-1",
+    )
+
+    lineage = "12345678-1234-1234-1234-123456789ABC"
+
+    updated = update_state_metadata(
+        session,
+        request_id,
+        state_lineage=lineage,
+    )
+
+    assert updated.state_lineage == lineage.lower()
+
+
+def test_invalid_persisted_state_status_is_handled(db):
+    session, request_id = db
+
+    record = create_state_record(
+        session,
+        request_id,
+        "aiops-test-state-bucket",
+        f"requests/{request_id}/terraform.tfstate",
+        "ap-south-1",
+    )
+
+    record.status = "unexpected"
+    session.commit()
+
+    with pytest.raises(TerraformStateError) as exc:
+        update_state_metadata(
+            session,
+            request_id,
+            status="initializing",
+        )
+
+    assert exc.value.args[0] == "STATE_STATUS_INVALID"
