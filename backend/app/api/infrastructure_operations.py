@@ -387,35 +387,63 @@ def create_provision_operation(
         raise
 
     # Dispatch only after the database transaction has committed.
+    operation_id = operation.id
+
     try:
-        from backend.app.workers.tasks import (
-            execute_provision_operation,
-        )
+        from backend.app.workers.tasks import execute_provision_operation
 
-        task = execute_provision_operation.delay(operation.id)
-
-        operation.celery_task_id = task.id
-        db.commit()
-        db.refresh(operation)
+        task = execute_provision_operation.delay(operation_id)
 
     except Exception:
+        # The broker did not accept the task. Record the failure and its
+        # audit event together so the operation history remains consistent.
         db.rollback()
 
-        operation = db.get(
-            InfrastructureOperation,
-            operation.id,
+        operation = db.get(InfrastructureOperation, operation_id)
+
+        if operation is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="The operation record could not be reloaded after dispatch failure.",
+            )
+
+        operation.status = "failed"
+        operation.error_code = "CELERY_DISPATCH_FAILED"
+        operation.completed_at = datetime.now(timezone.utc)
+        operation.result_summary = {
+            "message": "The background worker could not be reached.",
+            "terraform_apply_enabled": False,
+            "automatic_retry": False,
+        }
+
+        db.add(
+            InfrastructureOperationEvent(
+                operation_id=operation.id,
+                actor_id=None,
+                actor_type="system",
+                event_type="celery_dispatch_failed",
+                previous_status="queued",
+                new_status="failed",
+                comments="The background worker could not be reached.",
+                event_metadata={
+                    "source": "infrastructure_operations_api",
+                    "error_code": "CELERY_DISPATCH_FAILED",
+                    "automatic_retry": False,
+                    "terraform_apply_enabled": False,
+                },
+            )
         )
 
-        if operation is not None:
-            operation.status = "failed"
-            operation.error_code = "CELERY_DISPATCH_FAILED"
-            operation.completed_at = datetime.now(timezone.utc)
-            operation.result_summary = {
-                "message": "The background worker could not be reached.",
-                "terraform_apply_enabled": False,
-            }
-            db.commit()
-            db.refresh(operation)
+        db.commit()
+        db.refresh(operation)
+        return operation
+
+    # The broker accepted the task. Persist the Celery task ID separately.
+    # If this database write fails, do not mark the operation failed: the
+    # worker may already have received or started the task.
+    operation.celery_task_id = task.id
+    db.commit()
+    db.refresh(operation)
 
     return operation
 
@@ -466,15 +494,13 @@ def get_operation(
     return operation
 
 
-
 @router.get("/{operation_id}/audit")
 def get_operation_audit(
     operation_id: int,
     current_user: CurrentUser,
     db: Session = Depends(get_db),
 ):
-    """Return approval and infrastructure operation audit history."""
-
+    """Return approval and infrastructure-operation audit history."""
     operation = db.get(
         InfrastructureOperation,
         operation_id,
@@ -563,46 +589,6 @@ def get_operation_audit(
     events.sort(key=audit_sort_key)
 
     return events
-
-    """Return approval audit history for this operation."""
-
-    operation = db.get(
-        InfrastructureOperation,
-        operation_id,
-    )
-
-    if operation is None or operation.requester_id != current_user.id:
-        raise HTTPException(
-            status_code=404,
-            detail="Infrastructure operation not found.",
-        )
-
-    events = db.scalars(
-        select(ApprovalAuditEvent)
-        .where(
-            ApprovalAuditEvent.approval_request_id
-            == operation.approval_request_id
-        )
-        .order_by(
-            ApprovalAuditEvent.created_at,
-            ApprovalAuditEvent.id,
-        )
-    ).all()
-
-    return [
-        {
-            "id": event.id,
-            "approval_request_id": event.approval_request_id,
-            "actor_id": event.actor_id,
-            "event_type": event.event_type,
-            "previous_status": event.previous_status,
-            "new_status": event.new_status,
-            "comments": event.comments,
-            "event_metadata": event.event_metadata,
-            "created_at": event.created_at,
-        }
-        for event in events
-    ]
 
 @router.post(
     "/requests/{infrastructure_request_id}/state-versions/sync",

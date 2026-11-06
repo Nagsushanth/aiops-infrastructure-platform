@@ -728,3 +728,98 @@ def test_operation_audit_is_visible_to_owner_only_and_chronological(
     assert other_user_response.json()["detail"] == (
         "Infrastructure operation not found."
     )
+
+def test_provision_dispatch_failure_is_audited(
+    client,
+    setup_data,
+    monkeypatch,
+):
+    from backend.app.workers import tasks
+
+    request_id = setup_data["request_id"]
+    requester_id = setup_data["requester_id"]
+
+    db = TestingSessionLocal()
+
+    try:
+        plan = TerraformPlanRecord(
+            infrastructure_request_id=request_id,
+            requester_id=requester_id,
+            status="succeeded",
+            plan_fingerprint="a" * 64,
+            specification_fingerprint="b" * 64,
+            plan_summary={},
+        )
+        db.add(plan)
+        db.flush()
+
+        approval = ApprovalRequest(
+            infrastructure_request_id=request_id,
+            terraform_plan_record_id=plan.id,
+            requester_id=requester_id,
+            status="approved",
+            plan_summary={},
+            plan_fingerprint="a" * 64,
+        )
+        db.add(approval)
+        db.commit()
+
+        approval_id = approval.id
+        plan_id = plan.id
+
+    finally:
+        db.close()
+
+    def fake_validate_approved_plan(
+        approval,
+        current_user_id,
+        db,
+    ):
+        return (
+            db.get(InfrastructureRequest, request_id),
+            db.get(TerraformPlanRecord, plan_id),
+        )
+
+    def fail_dispatch(operation_id):
+        raise RuntimeError("Broker unavailable")
+
+    monkeypatch.setattr(
+        operations_api,
+        "validate_approved_plan",
+        fake_validate_approved_plan,
+    )
+
+    monkeypatch.setattr(
+        tasks.execute_provision_operation,
+        "delay",
+        fail_dispatch,
+    )
+
+    response = client.post(
+        "/infrastructure-operations/provision",
+        headers=setup_data["requester_headers"],
+        json={"approval_request_id": approval_id},
+    )
+
+    assert response.status_code == 202
+    assert response.json()["status"] == "failed"
+    assert response.json()["error_code"] == "CELERY_DISPATCH_FAILED"
+
+    operation_id = response.json()["id"]
+
+    db = TestingSessionLocal()
+
+    try:
+        event = db.query(InfrastructureOperationEvent).filter_by(
+            operation_id=operation_id,
+            event_type="celery_dispatch_failed",
+        ).one()
+
+        assert event.actor_type == "system"
+        assert event.actor_id is None
+        assert event.previous_status == "queued"
+        assert event.new_status == "failed"
+        assert event.event_metadata["automatic_retry"] is False
+
+    finally:
+        db.close()

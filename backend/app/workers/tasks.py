@@ -466,7 +466,7 @@ def execute_provision_operation(operation_id: int) -> dict:
             db,
             operation_id,
             execution_token,
-            "blocked",
+            "failed",
             "WORKER_PREFLIGHT_FAILED",
             "An unexpected error occurred during operation preflight.",
         )
