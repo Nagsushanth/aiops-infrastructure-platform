@@ -55,6 +55,51 @@ def _fingerprint_specification(specification) -> str:
 
     return hashlib.sha256(canonical).hexdigest()
 
+def _renew_operation_lease(
+    operation_id: int,
+    execution_token: str,
+    lease_minutes: int = WORKER_LEASE_MINUTES,
+) -> bool:
+    """Renew a lease only while this worker still owns a running operation."""
+
+    if (
+        not isinstance(lease_minutes, int)
+        or isinstance(lease_minutes, bool)
+        or lease_minutes <= 0
+    ):
+        raise ValueError("lease_minutes must be a positive integer.")
+
+    db = SessionLocal()
+
+    try:
+        now = datetime.now(timezone.utc)
+
+        result = db.execute(
+            update(InfrastructureOperation)
+            .where(
+                InfrastructureOperation.id == operation_id,
+                InfrastructureOperation.status == "running",
+                InfrastructureOperation.execution_token == execution_token,
+            )
+            .values(
+                lease_expires_at=now + timedelta(minutes=lease_minutes),
+            )
+        )
+
+        if result.rowcount != 1:
+            db.rollback()
+            return False
+
+        db.commit()
+        return True
+
+    except Exception:
+        db.rollback()
+        raise
+
+    finally:
+        db.close()
+
 
 def _finish_operation(
     db,

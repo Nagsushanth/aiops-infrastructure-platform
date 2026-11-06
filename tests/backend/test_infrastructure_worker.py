@@ -537,3 +537,113 @@ def test_recovery_rejects_invalid_grace_period(worker_db):
 
     with pytest.raises(ValueError):
         tasks.recover_stale_infrastructure_operations.run(True)
+
+def test_lease_renewal_succeeds_for_current_worker(worker_db):
+    db = worker_db()
+
+    try:
+        operation_id = create_recovery_test_operation(
+            db,
+            "lease-renewal@example.com",
+            "running",
+            datetime.now(timezone.utc) + timedelta(minutes=1),
+        )
+
+        operation = db.get(InfrastructureOperation, operation_id)
+        previous_expiry = operation.lease_expires_at
+
+    finally:
+        db.close()
+
+    renewed = tasks._renew_operation_lease(
+        operation_id,
+        "test-execution-token",
+    )
+
+    assert renewed is True
+
+    db = worker_db()
+
+    try:
+        operation = db.get(InfrastructureOperation, operation_id)
+
+        assert operation.status == "running"
+        assert operation.execution_token == "test-execution-token"
+        assert operation.lease_expires_at > previous_expiry
+
+    finally:
+        db.close()
+
+
+def test_lease_renewal_rejects_wrong_execution_token(worker_db):
+    db = worker_db()
+
+    try:
+        operation_id = create_recovery_test_operation(
+            db,
+            "wrong-token@example.com",
+            "running",
+            datetime.now(timezone.utc) + timedelta(minutes=1),
+        )
+
+        operation = db.get(InfrastructureOperation, operation_id)
+        previous_expiry = operation.lease_expires_at
+
+    finally:
+        db.close()
+
+    renewed = tasks._renew_operation_lease(
+        operation_id,
+        "incorrect-token",
+    )
+
+    assert renewed is False
+
+    db = worker_db()
+
+    try:
+        operation = db.get(InfrastructureOperation, operation_id)
+
+        assert operation.status == "running"
+        assert operation.execution_token == "test-execution-token"
+        assert operation.lease_expires_at == previous_expiry
+
+    finally:
+        db.close()
+
+
+def test_lease_renewal_rejects_non_running_operation(worker_db):
+    db = worker_db()
+
+    try:
+        operation_id = create_recovery_test_operation(
+            db,
+            "terminal-operation@example.com",
+            "running",
+            datetime.now(timezone.utc) + timedelta(minutes=1),
+        )
+
+        operation = db.get(InfrastructureOperation, operation_id)
+        operation.status = "blocked"
+        db.commit()
+
+    finally:
+        db.close()
+
+    renewed = tasks._renew_operation_lease(
+        operation_id,
+        "test-execution-token",
+    )
+
+    assert renewed is False
+
+
+def test_lease_renewal_rejects_invalid_duration():
+    with pytest.raises(ValueError):
+        tasks._renew_operation_lease(1, "test-token", 0)
+
+    with pytest.raises(ValueError):
+        tasks._renew_operation_lease(1, "test-token", -1)
+
+    with pytest.raises(ValueError):
+        tasks._renew_operation_lease(1, "test-token", True)
