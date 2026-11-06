@@ -1,10 +1,11 @@
+
 """Background tasks for infrastructure lifecycle operations."""
 
 import hashlib
 import json
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from backend.app.core.database import SessionLocal
 from backend.app.models.approval import (
@@ -68,24 +69,55 @@ def execute_provision_operation(operation_id: int) -> dict:
     db = SessionLocal()
 
     try:
-        operation = db.get(InfrastructureOperation, operation_id)
+        # Atomically claim the operation.
+        # Only one worker can change queued -> running.
+        claim_result = db.execute(
+            update(InfrastructureOperation)
+            .where(
+                InfrastructureOperation.id == operation_id,
+                InfrastructureOperation.status == "queued",
+            )
+            .values(
+                status="running",
+                started_at=datetime.now(timezone.utc),
+            )
+        )
 
-        if operation is None:
-            return {
-                "status": "not_found",
-                "operation_id": operation_id,
-            }
+        if claim_result.rowcount != 1:
+            db.rollback()
 
-        if operation.status != "queued":
+            operation = db.get(
+                InfrastructureOperation,
+                operation_id,
+            )
+
+            if operation is None:
+                return {
+                    "status": "not_found",
+                    "operation_id": operation_id,
+                }
+
             return {
                 "status": operation.status,
                 "operation_id": operation_id,
                 "message": "Operation is not queued.",
             }
 
-        operation.status = "running"
-        operation.started_at = datetime.now(timezone.utc)
         db.commit()
+
+        # Refresh ORM state after the atomic database update.
+        db.expire_all()
+
+        operation = db.get(
+            InfrastructureOperation,
+            operation_id,
+        )
+
+        if operation is None:
+            return {
+                "status": "not_found",
+                "operation_id": operation_id,
+            }
 
         approval = db.get(
             ApprovalRequest,

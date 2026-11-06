@@ -9,6 +9,7 @@ from sqlalchemy import (
     JSON,
     String,
     Text,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.orm import Mapped, mapped_column
@@ -112,5 +113,10 @@ class InfrastructureOperation(Base):
             "ix_infrastructure_operation_request_created",
             "infrastructure_request_id",
             "created_at",
+        ),
+        UniqueConstraint(
+            "approval_request_id",
+            "operation",
+            name="uq_infrastructure_operation_approval_operation",
         ),
     )
