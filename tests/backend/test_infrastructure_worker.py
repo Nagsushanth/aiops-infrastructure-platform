@@ -298,6 +298,170 @@ def test_worker_passes_preflight_but_keeps_apply_disabled(worker_db):
         delete_plan_artifact(artifact_path)
 
 
+def test_worker_marks_unexpected_preflight_exception_failed(
+    worker_db,
+    monkeypatch,
+):
+    requirements = {
+        "cloud_provider": "aws",
+        "resource_type": "EC2",
+        "environment": "development",
+        "region": "ap-south-1",
+        "vcpus": 2,
+        "memory_gb": 4,
+        "public_access": False,
+    }
+
+    specification = ValidatedInfrastructureSpecification.model_validate(
+        requirements
+    )
+
+    canonical = json.dumps(
+        specification.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+    specification_fingerprint = hashlib.sha256(
+        canonical
+    ).hexdigest()
+
+    artifact_path, artifact_checksum = save_plan_artifact(
+        b"valid-test-terraform-plan"
+    )
+
+    db = worker_db()
+
+    try:
+        user = User(
+            email="worker-failure@example.com",
+            password_hash="test-hash",
+            role="user",
+            is_active=True,
+        )
+        db.add(user)
+        db.flush()
+
+        conversation = Conversation(
+            user_id=user.id,
+            session_id="worker-failure-session",
+            title="Worker failure test",
+        )
+        db.add(conversation)
+        db.flush()
+
+        request = InfrastructureRequest(
+            conversation_id=conversation.id,
+            status="complete",
+            requirements=requirements,
+        )
+        db.add(request)
+        db.flush()
+
+        plan = TerraformPlanRecord(
+            infrastructure_request_id=request.id,
+            requester_id=user.id,
+            status="succeeded",
+            plan_fingerprint="a" * 64,
+            specification_fingerprint=specification_fingerprint,
+            plan_summary={},
+            artifact_path=artifact_path,
+            artifact_sha256=artifact_checksum,
+        )
+        db.add(plan)
+        db.flush()
+
+        approval = ApprovalRequest(
+            infrastructure_request_id=request.id,
+            terraform_plan_record_id=plan.id,
+            requester_id=user.id,
+            status="approved",
+            plan_summary={},
+            plan_fingerprint="a" * 64,
+        )
+        db.add(approval)
+        db.flush()
+
+        for stage in ("technical", "cost", "security"):
+            db.add(
+                ApprovalStageReview(
+                    approval_request_id=approval.id,
+                    stage=stage,
+                    status="approved",
+                )
+            )
+
+        operation = InfrastructureOperation(
+            infrastructure_request_id=request.id,
+            terraform_plan_record_id=plan.id,
+            approval_request_id=approval.id,
+            requester_id=user.id,
+            operation="provision",
+            status="queued",
+        )
+        db.add(operation)
+        db.commit()
+
+        operation_id = operation.id
+
+    finally:
+        db.close()
+
+    def raise_unexpected_error(specification):
+        raise RuntimeError("Simulated preflight failure")
+
+    monkeypatch.setattr(
+        tasks,
+        "_fingerprint_specification",
+        raise_unexpected_error,
+    )
+
+    try:
+        result = tasks.execute_provision_operation.run(operation_id)
+
+        assert result["status"] == "failed"
+        assert result["operation_id"] == operation_id
+        assert result["error_code"] == "WORKER_PREFLIGHT_FAILED"
+
+        db = worker_db()
+
+        try:
+            operation = db.get(
+                InfrastructureOperation,
+                operation_id,
+            )
+
+            assert operation.status == "failed"
+            assert operation.error_code == "WORKER_PREFLIGHT_FAILED"
+            assert operation.execution_token is None
+            assert operation.lease_expires_at is None
+            assert operation.completed_at is not None
+
+            event = db.scalar(
+                select(InfrastructureOperationEvent).where(
+                    InfrastructureOperationEvent.operation_id
+                    == operation_id
+                )
+            )
+
+            assert event is not None
+            assert event.actor_type == "system"
+            assert event.event_type == "worker_operation_finished"
+            assert event.previous_status == "running"
+            assert event.new_status == "failed"
+            assert event.event_metadata["error_code"] == (
+                "WORKER_PREFLIGHT_FAILED"
+            )
+
+        finally:
+            db.close()
+
+    finally:
+        delete_plan_artifact(artifact_path)
+
+
+
 def create_recovery_test_operation(
     db,
     email: str,
