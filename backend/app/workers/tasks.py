@@ -427,6 +427,19 @@ def execute_provision_operation(operation_id: int) -> dict:
                 "PLAN_ARTIFACT_MISSING",
                 "The Terraform plan artifact is unavailable.",
             )
+        
+        if plan.plan_fingerprint != plan.artifact_sha256:
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "PLAN_ARTIFACT_FINGERPRINT_MISMATCH",
+                (
+                    "The approved plan fingerprint does not match "
+                    "the stored artifact checksum."
+                ),
+            )
 
         try:
             load_plan_artifact(

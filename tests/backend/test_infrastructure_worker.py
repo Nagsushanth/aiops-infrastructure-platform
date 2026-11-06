@@ -146,7 +146,15 @@ def test_worker_ignores_operation_that_is_not_queued(worker_db):
     assert result["operation_id"] == operation_id
     assert result["message"] == "Operation is not queued."
 
-def test_worker_passes_preflight_but_keeps_apply_disabled(worker_db):
+
+@pytest.mark.parametrize(
+    "fingerprint_matches_artifact",
+    [True, False],
+)
+def test_worker_validates_plan_artifact_fingerprint(
+    worker_db,
+    fingerprint_matches_artifact,
+):
     requirements = {
         "cloud_provider": "aws",
         "resource_type": "EC2",
@@ -172,10 +180,14 @@ def test_worker_passes_preflight_but_keeps_apply_disabled(worker_db):
         canonical
     ).hexdigest()
 
-    plan_fingerprint = "a" * 64
-
     artifact_path, artifact_checksum = save_plan_artifact(
         b"valid-test-terraform-plan"
+    )
+
+    plan_fingerprint = (
+        artifact_checksum
+        if fingerprint_matches_artifact
+        else "a" * 64
     )
 
     db = worker_db()
@@ -256,13 +268,23 @@ def test_worker_passes_preflight_but_keeps_apply_disabled(worker_db):
         db.close()
 
     try:
-                # First execution: worker claims the queued operation.
+        # First execution: worker claims the queued operation.
         result = tasks.execute_provision_operation.run(operation_id)
 
         assert result["status"] == "blocked"
         assert result["operation_id"] == operation_id
-        assert result["preflight_passed"] is True
         assert result["terraform_apply_enabled"] is False
+
+        if fingerprint_matches_artifact:
+            assert result["preflight_passed"] is True
+            expected_error_code = "TERRAFORM_APPLY_DISABLED"
+        else:
+            assert result["error_code"] == (
+                "PLAN_ARTIFACT_FINGERPRINT_MISMATCH"
+            )
+            expected_error_code = (
+                "PLAN_ARTIFACT_FINGERPRINT_MISMATCH"
+            )
 
         # Second execution: duplicate task delivery must not claim it again.
         duplicate_result = tasks.execute_provision_operation.run(
@@ -282,15 +304,23 @@ def test_worker_passes_preflight_but_keeps_apply_disabled(worker_db):
 
             assert saved_operation is not None
             assert saved_operation.status == "blocked"
-            assert (
-                saved_operation.error_code
-                == "TERRAFORM_APPLY_DISABLED"
-            )
-            assert saved_operation.result_summary["preflight_passed"] is True
+            assert saved_operation.error_code == expected_error_code
             assert (
                 saved_operation.result_summary["terraform_apply_enabled"]
                 is False
             )
+
+            if fingerprint_matches_artifact:
+                assert (
+                    saved_operation.result_summary["preflight_passed"]
+                    is True
+                )
+            else:
+                assert (
+                    saved_operation.result_summary.get("preflight_passed")
+                    is not True
+                )
+
         finally:
             verification_db.close()
 
@@ -459,7 +489,6 @@ def test_worker_marks_unexpected_preflight_exception_failed(
 
     finally:
         delete_plan_artifact(artifact_path)
-
 
 
 def create_recovery_test_operation(
@@ -701,6 +730,7 @@ def test_recovery_rejects_invalid_grace_period(worker_db):
 
     with pytest.raises(ValueError):
         tasks.recover_stale_infrastructure_operations.run(True)
+
 
 def test_lease_renewal_succeeds_for_current_worker(worker_db):
     db = worker_db()
