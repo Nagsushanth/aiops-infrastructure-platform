@@ -24,6 +24,13 @@ VALID_STATUSES = {
     "failed",
     "archived",
 }
+VALID_STATE_TRANSITIONS = {
+    "pending": {"initializing", "failed"},
+    "initializing": {"initializing", "active", "failed"},
+    "active": {"active", "archived"},
+    "failed": {"initializing", "archived"},
+    "archived": set(),
+}
 
 
 def create_state_record(
@@ -149,6 +156,12 @@ def update_state_metadata(
     if status is not None:
         if status not in VALID_STATUSES:
             raise TerraformStateError("STATE_STATUS_INVALID")
+
+        allowed_transitions = VALID_STATE_TRANSITIONS[record.status]
+
+        if status not in allowed_transitions:
+            raise TerraformStateError("STATE_TRANSITION_INVALID")
+
         record.status = status
 
     try:

@@ -24,6 +24,9 @@ def isolate_terraform_artifacts(tmp_path, monkeypatch):
         "AIOPS_TERRAFORM_ARTIFACT_DIR",
         str(artifact_dir),
     )
+    monkeypatch.setenv("TF_STATE_BUCKET", "test-terraform-state")
+    monkeypatch.setenv("TF_STATE_REGION", "ap-south-1")
+    monkeypatch.setenv("TF_STATE_PREFIX", "test/requests")
 
 
 @pytest.fixture
@@ -67,6 +70,7 @@ def test_rejects_invalid_timeout(specification):
     with pytest.raises(ValueError):
         execute_terraform_plan(
             specification,
+            infrastructure_request_id=123,
             timeout_seconds=0,
         )
 
@@ -83,7 +87,10 @@ def test_rejects_unsupported_specification():
     )
 
     with pytest.raises(TerraformExecutionError) as exc:
-        execute_terraform_plan(unsupported)
+        execute_terraform_plan(
+            unsupported,
+            infrastructure_request_id=123,
+        )
 
     assert exc.value.code == "UNSUPPORTED_SPECIFICATION"
 
@@ -104,6 +111,20 @@ def test_runs_plan_without_apply(specification):
         **kwargs,
     ):
         commands.append(command)
+
+        if command[1] == "init":
+            terraform_config = (
+                Path(cwd) / "main.tf"
+            ).read_text(encoding="utf-8")
+
+            assert 'backend "s3"' in terraform_config
+            assert 'bucket       = "test-terraform-state"' in terraform_config
+            assert 'key          = "test/requests/123/terraform.tfstate"' in terraform_config
+            assert 'region       = "ap-south-1"' in terraform_config
+            assert "use_lockfile = true" in terraform_config
+            assert "-backend=false" not in command
+
+            return completed_process()
 
         if command[1] == "plan":
             (Path(cwd) / "tfplan").write_bytes(
@@ -145,7 +166,10 @@ def test_runs_plan_without_apply(specification):
         "backend.app.services.terraform.execution.subprocess.run",
         side_effect=fake_run,
     ):
-        result = execute_terraform_plan(specification)
+        result = execute_terraform_plan(
+            specification,
+            infrastructure_request_id=123,
+        )
 
     assert [command[1] for command in commands] == [
         "init",
@@ -211,7 +235,10 @@ def test_command_failure_does_not_expose_raw_output(
         side_effect=fake_run,
     ):
         with pytest.raises(TerraformExecutionError) as exc:
-            execute_terraform_plan(specification)
+            execute_terraform_plan(
+            specification,
+            infrastructure_request_id=123,
+        )
 
     assert exc.value.code == "INIT_FAILED_GENERAL"
     assert "sensitive-diagnostic" not in str(exc.value)
@@ -240,7 +267,10 @@ def test_timeout_is_reported_safely(specification):
         side_effect=fake_run,
     ):
         with pytest.raises(TerraformExecutionError) as exc:
-            execute_terraform_plan(specification)
+            execute_terraform_plan(
+            specification,
+            infrastructure_request_id=123,
+        )
 
     assert exc.value.code == "INIT_TIMEOUT"
 
@@ -300,7 +330,10 @@ def test_plan_includes_unavailable_cost_estimate(specification):
             None,
         ),
     ):
-        result = execute_terraform_plan(specification)
+        result = execute_terraform_plan(
+            specification,
+            infrastructure_request_id=123,
+        )
 
     estimate = result["plan_summary"]["cost_estimate"]
 
@@ -381,7 +414,10 @@ def test_plan_includes_verified_cost_estimate(specification):
             "20",
         ),
     ):
-        result = execute_terraform_plan(specification)
+        result = execute_terraform_plan(
+            specification,
+            infrastructure_request_id=123,
+        )
 
     estimate = result["plan_summary"]["cost_estimate"]
 

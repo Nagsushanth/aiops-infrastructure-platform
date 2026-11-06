@@ -1,6 +1,6 @@
 
 """Authenticated API for trusted Terraform plan generation."""
-
+import os
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -19,6 +19,16 @@ from backend.app.services.terraform.execution import (
 )
 from backend.app.services.terraform.artifacts import (
     delete_plan_artifact,
+)
+
+from backend.app.services.terraform.backend_config import (
+    build_s3_backend_config,
+)
+from backend.app.services.terraform.state_manager import (
+    TerraformStateError,
+    create_state_record,
+    get_state_record,
+    update_state_metadata,
 )
 
 router = APIRouter(prefix="/terraform", tags=["Terraform Plans"])
@@ -74,10 +84,113 @@ def create_trusted_terraform_plan(
             detail="Stored infrastructure requirements are invalid.",
         ) from exc
 
+    # Build the same request-specific backend configuration
+    # used by the Terraform execution service.
+    bucket = os.getenv("TF_STATE_BUCKET", "").strip()
+
+    if not bucket:
+        raise HTTPException(
+            status_code=503,
+            detail="Terraform state backend is not configured.",
+        )
+
+    try:
+        backend_config = build_s3_backend_config(
+            infrastructure_request_id=infrastructure_request.id,
+            bucket=bucket,
+            region=os.getenv("TF_STATE_REGION", "ap-south-1"),
+            prefix=os.getenv("TF_STATE_PREFIX", "training/requests"),
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Terraform state backend configuration is invalid.",
+        ) from exc
+
+    # Retrieve or create the state metadata record.
+    state_record = get_state_record(
+        db,
+        infrastructure_request.id,
+    )
+
+    if state_record is not None:
+        # Never silently change an existing request's state location.
+        if (
+            state_record.backend_type != "s3"
+            or state_record.state_bucket != backend_config["bucket"]
+            or state_record.state_key != backend_config["key"]
+            or state_record.state_region != backend_config["region"]
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Terraform state backend does not match the existing record.",
+            )
+    else:
+        try:
+            state_record = create_state_record(
+                db=db,
+                infrastructure_request_id=infrastructure_request.id,
+                state_bucket=backend_config["bucket"],
+                state_key=backend_config["key"],
+                state_region=backend_config["region"],
+            )
+        except TerraformStateError as exc:
+            # Handle a concurrent request creating the same record.
+            state_record = get_state_record(
+                db,
+                infrastructure_request.id,
+            )
+
+            if state_record is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Terraform state record could not be created.",
+                ) from exc
+
+            if (
+                state_record.backend_type != "s3"
+                or state_record.state_bucket != backend_config["bucket"]
+                or state_record.state_key != backend_config["key"]
+                or state_record.state_region != backend_config["region"]
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Terraform state backend does not match the existing record.",
+                ) from exc
+
+    # Preserve an already active state record.
+    if state_record.status != "active":
+        try:
+            state_record = update_state_metadata(
+                db,
+                infrastructure_request.id,
+                status="initializing",
+            )
+        except TerraformStateError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail="Terraform state metadata could not be updated.",
+            ) from exc
+
     # Generate the Terraform plan and persist its binary artifact.
     try:
-        result = execute_terraform_plan(specification)
+        result = execute_terraform_plan(
+            specification,
+            infrastructure_request_id=infrastructure_request.id,
+        )
     except TerraformExecutionError as exc:
+        # An initialization failure indicates a backend setup problem.
+        # Do not mark an existing active state as failed.
+        if exc.code.startswith("INIT_") and state_record.status != "active":
+            try:
+                update_state_metadata(
+                    db,
+                    infrastructure_request.id,
+                    status="failed",
+                )
+            except TerraformStateError:
+                db.rollback()
+
         failed_record = TerraformPlanRecord(
             infrastructure_request_id=infrastructure_request.id,
             requester_id=current_user.id,

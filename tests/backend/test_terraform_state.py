@@ -148,6 +148,12 @@ def test_update_state_metadata(db):
 
     checksum = hashlib.sha256(b"terraform-state").hexdigest()
 
+    update_state_metadata(
+        session,
+        request_id,
+        status="initializing",
+    )
+
     updated = update_state_metadata(
         session,
         request_id,
@@ -262,3 +268,70 @@ def test_empty_state_content_is_rejected():
         calculate_state_sha256(b"")
 
     assert exc.value.args[0] == "STATE_CONTENT_INVALID"
+
+def test_pending_to_active_transition_is_rejected(db):
+    session, request_id = db
+
+    create_state_record(
+        session,
+        request_id,
+        "aiops-test-state-bucket",
+        f"requests/{request_id}/terraform.tfstate",
+        "ap-south-1",
+    )
+
+    with pytest.raises(TerraformStateError) as exc:
+        update_state_metadata(
+            session,
+            request_id,
+            status="active",
+        )
+
+    assert exc.value.args[0] == "STATE_TRANSITION_INVALID"
+
+
+def test_failed_state_can_retry_initialization(db):
+    session, request_id = db
+
+    create_state_record(
+        session,
+        request_id,
+        "aiops-test-state-bucket",
+        f"requests/{request_id}/terraform.tfstate",
+        "ap-south-1",
+    )
+
+    update_state_metadata(session, request_id, status="failed")
+
+    updated = update_state_metadata(
+        session,
+        request_id,
+        status="initializing",
+    )
+
+    assert updated.status == "initializing"
+
+
+def test_archived_state_cannot_be_reinitialized(db):
+    session, request_id = db
+
+    create_state_record(
+        session,
+        request_id,
+        "aiops-test-state-bucket",
+        f"requests/{request_id}/terraform.tfstate",
+        "ap-south-1",
+    )
+
+    update_state_metadata(session, request_id, status="initializing")
+    update_state_metadata(session, request_id, status="active")
+    update_state_metadata(session, request_id, status="archived")
+
+    with pytest.raises(TerraformStateError) as exc:
+        update_state_metadata(
+            session,
+            request_id,
+            status="initializing",
+        )
+
+    assert exc.value.args[0] == "STATE_TRANSITION_INVALID"

@@ -33,3 +33,26 @@ class InfrastructureOperationResponse(BaseModel):
     completed_at: datetime | None
     created_at: datetime
     updated_at: datetime
+
+class TerraformStateVersionResponse(BaseModel):
+    """Safe metadata for one Terraform state version."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    version_id: str
+    state_serial: int
+    state_lineage: str
+    state_sha256: str
+    size_bytes: int
+    created_at: datetime
+
+
+class TerraformStateVersionSyncResponse(BaseModel):
+    """Result of synchronizing S3 state-version history."""
+
+    infrastructure_request_id: int
+    total_versions: int
+    recorded: int
+    skipped: int
+    versions: list[TerraformStateVersionResponse]

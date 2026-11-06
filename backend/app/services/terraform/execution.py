@@ -7,8 +7,11 @@ import os
 import subprocess
 import tempfile
 from pathlib import Path
+
+from dotenv import load_dotenv
 from typing import Any
 from backend.app.services.terraform.artifacts import save_plan_artifact
+from backend.app.services.terraform.backend_config import build_s3_backend_config
 
 from backend.app.schemas.infrastructure import (
     ValidatedInfrastructureSpecification,
@@ -39,6 +42,10 @@ from backend.app.services.terraform.generator import (
 from backend.app.services.terraform.cost_estimator import (
     estimate_ec2_monthly_cost,
 )
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[4]
+load_dotenv(PROJECT_ROOT / ".env")
 
 
 class TerraformExecutionError(RuntimeError):
@@ -213,6 +220,7 @@ def _run(
 def execute_terraform_plan(
     specification: ValidatedInfrastructureSpecification,
     *,
+    infrastructure_request_id: int,
     timeout_seconds: int = 180,
 ) -> dict[str, Any]:
     """Generate a real plan and return fingerprints plus a sanitized summary.
@@ -234,6 +242,20 @@ def execute_terraform_plan(
     specification_fingerprint = _sha256(
         _canonical_specification(specification)
     )
+
+    bucket = os.getenv("TF_STATE_BUCKET", "").strip()
+    if not bucket:
+        raise TerraformExecutionError("STATE_BACKEND_NOT_CONFIGURED")
+
+    try:
+        backend_config = build_s3_backend_config(
+            infrastructure_request_id=infrastructure_request_id,
+            bucket=bucket,
+            region=os.getenv("TF_STATE_REGION", "ap-south-1"),
+            prefix=os.getenv("TF_STATE_PREFIX", "training/requests"),
+        )
+    except ValueError as exc:
+        raise TerraformExecutionError("INVALID_STATE_BACKEND_CONFIG") from exc
 
     allowed_env_vars = (
         "PATH",
@@ -293,6 +315,22 @@ def execute_terraform_plan(
     ) as temp:
         workspace = Path(temp)
 
+        backend_block = (
+            '  backend "s3" {\n'
+            f'    bucket       = {json.dumps(backend_config["bucket"])}\n'
+            f'    key          = {json.dumps(backend_config["key"])}\n'
+            f'    region       = {json.dumps(backend_config["region"])}\n'
+            '    encrypt      = true\n'
+            '    use_lockfile = true\n'
+            '  }\n'
+        )
+
+        configuration = configuration.replace(
+            "terraform {\n",
+            "terraform {\n" + backend_block,
+            1,
+        )
+
         (workspace / "main.tf").write_text(
             configuration,
             encoding="utf-8",
@@ -302,7 +340,6 @@ def execute_terraform_plan(
             [
                 "terraform",
                 "init",
-                "-backend=false",
                 "-input=false",
                 "-no-color",
             ],
@@ -317,7 +354,6 @@ def execute_terraform_plan(
                 "plan",
                 "-input=false",
                 "-no-color",
-                "-refresh=false",
                 "-out=tfplan",
             ],
             cwd=workspace,

@@ -96,16 +96,12 @@ def record_state_version(
 
     try:
         db.add(version)
-        db.commit()
+        db.flush()
         db.refresh(version)
     except IntegrityError as exc:
-        db.rollback()
         raise TerraformStateVersionError(
             "STATE_VERSION_CREATION_CONFLICT"
         ) from exc
-    except Exception:
-        db.rollback()
-        raise
 
     return version
 

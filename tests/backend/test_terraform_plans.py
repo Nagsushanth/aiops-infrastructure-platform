@@ -15,6 +15,7 @@ from backend.app.models.terraform_plan import TerraformPlanRecord
 from backend.app.models.user import User
 import backend.app.api.terraform_plans as terraform_plans_api
 from backend.app.services.terraform.execution import TerraformExecutionError
+from backend.app.models.terraform_state import TerraformStateRecord
 
 
 test_engine = create_engine(
@@ -31,7 +32,11 @@ TestingSessionLocal = sessionmaker(
 
 
 @pytest.fixture
-def client():
+def client(monkeypatch):
+
+    monkeypatch.setenv("TF_STATE_BUCKET", "test-terraform-state")
+    monkeypatch.setenv("TF_STATE_REGION", "ap-south-1")
+    monkeypatch.setenv("TF_STATE_PREFIX", "test/requests")
     Base.metadata.create_all(bind=test_engine)
 
     def override_get_db():
@@ -152,7 +157,7 @@ def test_owner_can_create_trusted_plan_record(
     monkeypatch.setattr(
         terraform_plans_api,
         "execute_terraform_plan",
-        lambda specification: fake_result,
+        lambda specification, **kwargs: fake_result,
     )
 
     response = client.post(
@@ -174,6 +179,19 @@ def test_owner_can_create_trusted_plan_record(
         assert record.plan_summary == fake_result["plan_summary"]
         assert record.artifact_path == fake_result["artifact_path"]
         assert record.artifact_sha256 == fake_result["artifact_sha256"]
+        state_record = db.query(TerraformStateRecord).filter_by(
+            infrastructure_request_id=setup_data["request_id"]
+        ).one()
+
+        assert state_record.backend_type == "s3"
+        assert state_record.state_bucket == "test-terraform-state"
+        assert (
+            state_record.state_key
+            == f"test/requests/{setup_data['request_id']}/terraform.tfstate"
+        )
+        assert state_record.state_region == "ap-south-1"
+        assert state_record.status == "initializing"
+        assert state_record.state_version_id is None
     finally:
         db.close()
 
@@ -232,7 +250,7 @@ def test_incomplete_request_cannot_generate_plan(
 def test_terraform_failure_is_recorded_safely(
     client, setup_data, monkeypatch
 ):
-    def fail_execution(specification):
+    def fail_execution(specification, **kwargs):
         raise TerraformExecutionError("COMMAND_FAILED")
 
     monkeypatch.setattr(
@@ -308,7 +326,7 @@ def test_successful_plan_keeps_deployment_disabled(
     monkeypatch.setattr(
         terraform_plans_api,
         "execute_terraform_plan",
-        lambda specification: fake_result,
+        lambda specification, **kwargs: fake_result,
     )
 
     response = client.post(
@@ -327,5 +345,174 @@ def test_successful_plan_keeps_deployment_disabled(
         assert record is not None
         assert record.status == "succeeded"
         assert record.plan_fingerprint == "b" * 64
+    finally:
+        db.close()
+
+def test_repeated_plan_request_reuses_state_record(
+    client, setup_data, fake_result, monkeypatch
+):
+    execution_calls = []
+
+    def fake_execution(specification, **kwargs):
+        execution_calls.append(kwargs["infrastructure_request_id"])
+        return fake_result
+
+    monkeypatch.setattr(
+        terraform_plans_api,
+        "execute_terraform_plan",
+        fake_execution,
+    )
+
+    endpoint = (
+        f"/terraform/requests/{setup_data['request_id']}/plan"
+    )
+    headers = setup_data["requester_headers"]
+
+    first_response = client.post(endpoint, headers=headers)
+    second_response = client.post(endpoint, headers=headers)
+
+    assert first_response.status_code == 201, first_response.text
+    assert second_response.status_code == 201, second_response.text
+
+    assert execution_calls == [
+        setup_data["request_id"],
+        setup_data["request_id"],
+    ]
+
+    db = TestingSessionLocal()
+    try:
+        state_records = (
+            db.query(TerraformStateRecord)
+            .filter_by(
+                infrastructure_request_id=setup_data["request_id"]
+            )
+            .all()
+        )
+
+        assert len(state_records) == 1
+
+        state_record = state_records[0]
+
+        assert state_record.backend_type == "s3"
+        assert state_record.state_bucket == "test-terraform-state"
+        assert (
+            state_record.state_key
+            == f"test/requests/{setup_data['request_id']}/terraform.tfstate"
+        )
+        assert state_record.status == "initializing"
+    finally:
+        db.close()
+
+def test_plan_rejects_mismatched_existing_state_backend(
+    client, setup_data, monkeypatch
+):
+    db = TestingSessionLocal()
+    try:
+        db.add(
+            TerraformStateRecord(
+                infrastructure_request_id=setup_data["request_id"],
+                backend_type="s3",
+                state_bucket="different-state-bucket",
+                state_key=(
+                    f"test/requests/{setup_data['request_id']}/terraform.tfstate"
+                ),
+                state_region="ap-south-1",
+                status="pending",
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    def must_not_run(specification, **kwargs):
+        pytest.fail("Terraform must not run with a mismatched state backend")
+
+    monkeypatch.setattr(
+        terraform_plans_api,
+        "execute_terraform_plan",
+        must_not_run,
+    )
+
+    response = client.post(
+        f"/terraform/requests/{setup_data['request_id']}/plan",
+        headers=setup_data["requester_headers"],
+    )
+
+    assert response.status_code == 409
+    assert "does not match" in response.json()["detail"]
+
+def test_backend_initialization_failure_marks_new_state_failed(
+    client, setup_data, monkeypatch
+):
+    def fail_execution(specification, **kwargs):
+        raise TerraformExecutionError("INIT_BACKEND_FAILED")
+
+    monkeypatch.setattr(
+        terraform_plans_api,
+        "execute_terraform_plan",
+        fail_execution,
+    )
+
+    response = client.post(
+        f"/terraform/requests/{setup_data['request_id']}/plan",
+        headers=setup_data["requester_headers"],
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["error_code"] == "INIT_BACKEND_FAILED"
+
+    db = TestingSessionLocal()
+    try:
+        state_record = db.query(TerraformStateRecord).filter_by(
+            infrastructure_request_id=setup_data["request_id"]
+        ).one()
+
+        assert state_record.status == "failed"
+    finally:
+        db.close()
+
+def test_backend_initialization_failure_preserves_active_state(
+    client, setup_data, monkeypatch
+):
+    db = TestingSessionLocal()
+    try:
+        state_record = TerraformStateRecord(
+            infrastructure_request_id=setup_data["request_id"],
+            backend_type="s3",
+            state_bucket="test-terraform-state",
+            state_key=(
+                f"test/requests/{setup_data['request_id']}/terraform.tfstate"
+            ),
+            state_region="ap-south-1",
+            status="active",
+        )
+        db.add(state_record)
+        db.commit()
+    finally:
+        db.close()
+
+    def fail_execution(specification, **kwargs):
+        raise TerraformExecutionError("INIT_BACKEND_FAILED")
+
+    monkeypatch.setattr(
+        terraform_plans_api,
+        "execute_terraform_plan",
+        fail_execution,
+    )
+
+    response = client.post(
+        f"/terraform/requests/{setup_data['request_id']}/plan",
+        headers=setup_data["requester_headers"],
+    )
+
+    assert response.status_code == 422
+
+    db = TestingSessionLocal()
+    try:
+        state_record = db.query(TerraformStateRecord).filter_by(
+            infrastructure_request_id=setup_data["request_id"]
+        ).one()
+
+        assert state_record.status == "active"
     finally:
         db.close()
