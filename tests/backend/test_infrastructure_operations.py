@@ -1,9 +1,9 @@
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
-
+import sqlite3
 from backend.app.main import app
 from backend.app.core.dependencies import get_db
 from backend.app.core.security import create_access_token
@@ -468,4 +468,106 @@ def test_sync_rejects_archived_state(
     assert response.status_code == 409
     assert response.json()["detail"] == (
         "Archived Terraform state cannot be synchronized."
+    )
+
+
+def test_provision_returns_409_for_database_uniqueness_conflict(
+    client, setup_data, monkeypatch
+):
+    request_id = setup_data["request_id"]
+
+    db = TestingSessionLocal()
+
+    try:
+        infrastructure_request = db.get(
+            InfrastructureRequest,
+            request_id,
+        )
+
+        plan = TerraformPlanRecord(
+            infrastructure_request_id=request_id,
+            requester_id=setup_data["requester_id"],
+            status="succeeded",
+            plan_fingerprint="a" * 64,
+            specification_fingerprint="b" * 64,
+            plan_summary={},
+        )
+        db.add(plan)
+        db.flush()
+
+        approval = ApprovalRequest(
+            infrastructure_request_id=request_id,
+            terraform_plan_record_id=plan.id,
+            requester_id=setup_data["requester_id"],
+            status="approved",
+            plan_summary={},
+            plan_fingerprint="a" * 64,
+        )
+        db.add(approval)
+        db.commit()
+
+        approval_id = approval.id
+        plan_id = plan.id
+
+    finally:
+        db.close()
+
+    # Bypass plan validation because this test focuses specifically
+    # on the database uniqueness-conflict handling.
+    def fake_validate_approved_plan(
+        approval,
+        current_user_id,
+        db,
+    ):
+        return (
+            db.get(InfrastructureRequest, request_id),
+            db.get(TerraformPlanRecord, plan_id),
+        )
+
+    monkeypatch.setattr(
+        operations_api,
+        "validate_approved_plan",
+        fake_validate_approved_plan,
+    )
+
+    original_flush = Session.flush
+
+    def simulate_unique_constraint_conflict(
+        self,
+        *args,
+        **kwargs,
+    ):
+        if any(
+            isinstance(item, InfrastructureOperation)
+            for item in self.new
+        ):
+            raise operations_api.IntegrityError(
+                "INSERT",
+                {},
+                sqlite3.IntegrityError(
+                    "UNIQUE constraint failed: "
+                    "infrastructure_operations.approval_request_id, "
+                    "infrastructure_operations.operation"
+                ),
+            )
+
+        return original_flush(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        Session,
+        "flush",
+        simulate_unique_constraint_conflict,
+    )
+
+    response = client.post(
+        "/infrastructure-operations/provision",
+        headers=setup_data["requester_headers"],
+        json={
+            "approval_request_id": approval_id,
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "A provision operation already exists for this approval."
     )

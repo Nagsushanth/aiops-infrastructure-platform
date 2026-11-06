@@ -251,12 +251,22 @@ def test_worker_passes_preflight_but_keeps_apply_disabled(worker_db):
         db.close()
 
     try:
+                # First execution: worker claims the queued operation.
         result = tasks.execute_provision_operation.run(operation_id)
 
         assert result["status"] == "blocked"
         assert result["operation_id"] == operation_id
         assert result["preflight_passed"] is True
         assert result["terraform_apply_enabled"] is False
+
+        # Second execution: duplicate task delivery must not claim it again.
+        duplicate_result = tasks.execute_provision_operation.run(
+            operation_id
+        )
+
+        assert duplicate_result["status"] == "blocked"
+        assert duplicate_result["operation_id"] == operation_id
+        assert duplicate_result["message"] == "Operation is not queued."
 
         verification_db = worker_db()
         try:

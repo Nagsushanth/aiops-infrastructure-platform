@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from backend.app.core.auth_dependencies import CurrentUser
@@ -115,6 +116,32 @@ def is_valid_fingerprint(value: str | None) -> bool:
             for character in value.lower()
         )
     )
+
+def is_duplicate_operation_integrity_error(
+    exc: IntegrityError,
+) -> bool:
+    """Identify only the infrastructure-operation uniqueness violation."""
+
+    constraint_name = getattr(
+        getattr(exc.orig, "diag", None),
+        "constraint_name",
+        None,
+    )
+
+    if (
+        constraint_name
+        == "uq_infrastructure_operation_approval_operation"
+    ):
+        return True
+
+    # SQLite fallback for tests.
+    error_message = str(exc.orig)
+
+    return (
+        "UNIQUE constraint failed: "
+        "infrastructure_operations.approval_request_id, "
+        "infrastructure_operations.operation"
+    ) in error_message
 
 
 def validate_approved_plan(
@@ -337,6 +364,20 @@ def create_provision_operation(
 
         db.commit()
         db.refresh(operation)
+
+    except IntegrityError as exc:
+        db.rollback()
+
+        if is_duplicate_operation_integrity_error(exc):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "A provision operation already exists "
+                    "for this approval."
+                ),
+            ) from exc
+
+        raise
 
     except Exception:
         db.rollback()
