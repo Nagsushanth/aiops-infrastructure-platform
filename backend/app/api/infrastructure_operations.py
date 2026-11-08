@@ -268,10 +268,19 @@ def validate_approved_plan(
             ),
         )
 
-    if not plan.artifact_path or not plan.artifact_sha256:
+    if (
+        not plan.artifact_path
+        or not is_valid_fingerprint(plan.artifact_sha256)
+    ):
         raise HTTPException(
             status_code=409,
             detail="The Terraform plan artifact is unavailable.",
+        )
+
+    if plan.plan_fingerprint != plan.artifact_sha256:
+        raise HTTPException(
+            status_code=409,
+            detail="Terraform plan fingerprint does not match its artifact.",
         )
 
     try:

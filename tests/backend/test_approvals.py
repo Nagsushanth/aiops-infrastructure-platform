@@ -1,4 +1,3 @@
-
 import hashlib
 import json
 
@@ -23,6 +22,11 @@ from backend.app.models.terraform_plan import TerraformPlanRecord
 from backend.app.models.user import User
 from backend.app.schemas.infrastructure import (
     ValidatedInfrastructureSpecification,
+)
+from backend.app.services.terraform.artifacts import (
+    TerraformArtifactError,
+    delete_plan_artifact,
+    save_plan_artifact,
 )
 
 
@@ -63,7 +67,9 @@ def client():
 
 @pytest.fixture
 def setup_data(client):
+    artifact_paths = []
     db = TestingSessionLocal()
+
     try:
         requester = User(
             email="requester@example.com",
@@ -105,10 +111,11 @@ def setup_data(client):
         db.add(infra_request)
         db.commit()
 
-        return {
+        setup_data = {
             "requester_id": requester.id,
             "reviewer_id": reviewer.id,
             "infra_request_id": infra_request.id,
+            "artifact_paths": artifact_paths,
             "requester_headers": {
                 "Authorization": (
                     f"Bearer {create_access_token(str(requester.id))}"
@@ -122,6 +129,16 @@ def setup_data(client):
         }
     finally:
         db.close()
+
+    try:
+        yield setup_data
+    finally:
+        for artifact_path in artifact_paths:
+            try:
+                delete_plan_artifact(artifact_path)
+            except TerraformArtifactError:
+                # A test may deliberately remove or invalidate an artifact.
+                pass
 
 
 @pytest.fixture
@@ -184,22 +201,18 @@ def _fingerprint_specification(requirements):
     ).hexdigest()
 
 
-def _fingerprint_plan(plan):
-    """Generate a deterministic fingerprint for test fixtures."""
-    canonical_plan = json.dumps(
-        plan,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
+def _create_test_plan_artifact(setup_data):
+    """Create and register a private test-only binary plan artifact."""
+    artifact_path, artifact_checksum = save_plan_artifact(
+        b"test-only-terraform-plan-artifact"
     )
-    return hashlib.sha256(
-        canonical_plan.encode("utf-8")
-    ).hexdigest()
+    setup_data["artifact_paths"].append(artifact_path)
+    return artifact_path, artifact_checksum
 
 
 def create_trusted_plan_record(setup_data, plan=None):
     """
-    Create a successful Terraform plan record for isolated tests.
+    Create a successful test plan record with a verified test artifact.
 
     This is test-only database setup. It does not run Terraform or
     prove that the fixture represents a real cloud plan.
@@ -209,6 +222,8 @@ def create_trusted_plan_record(setup_data, plan=None):
             "preview_type": "test_fixture",
             "resources": [],
         }
+
+    artifact_path, artifact_checksum = _create_test_plan_artifact(setup_data)
 
     db = TestingSessionLocal()
     try:
@@ -222,11 +237,13 @@ def create_trusted_plan_record(setup_data, plan=None):
             infrastructure_request_id=infra_request.id,
             requester_id=setup_data["requester_id"],
             status="succeeded",
-            plan_fingerprint=_fingerprint_plan(plan),
+            plan_fingerprint=artifact_checksum,
             specification_fingerprint=_fingerprint_specification(
                 infra_request.requirements
             ),
             plan_summary=plan,
+            artifact_path=artifact_path,
+            artifact_sha256=artifact_checksum,
         )
         db.add(plan_record)
         db.commit()
@@ -250,6 +267,8 @@ def create_pending_approval(setup_data, plan=None):
             "resources": [],
         }
 
+    artifact_path, artifact_checksum = _create_test_plan_artifact(setup_data)
+
     db = TestingSessionLocal()
     try:
         infra_request = db.get(
@@ -262,11 +281,13 @@ def create_pending_approval(setup_data, plan=None):
             infrastructure_request_id=infra_request.id,
             requester_id=setup_data["requester_id"],
             status="succeeded",
-            plan_fingerprint=_fingerprint_plan(plan),
+            plan_fingerprint=artifact_checksum,
             specification_fingerprint=_fingerprint_specification(
                 infra_request.requirements
             ),
             plan_summary=plan,
+            artifact_path=artifact_path,
+            artifact_sha256=artifact_checksum,
         )
         db.add(plan_record)
         db.flush()
@@ -277,7 +298,7 @@ def create_pending_approval(setup_data, plan=None):
             requester_id=setup_data["requester_id"],
             status="pending",
             plan_summary=plan,
-            plan_fingerprint=plan_record.plan_fingerprint,
+            plan_fingerprint=artifact_checksum,
         )
         db.add(approval)
         db.flush()
@@ -564,6 +585,83 @@ def test_approval_uses_trusted_plan_record(
     assert result["plan_summary"] == valid_plan
 
 
+
+@pytest.mark.parametrize(
+    "artifact_change,expected_detail",
+    [
+        ("missing_path", "artifact is unavailable"),
+        ("missing_checksum", "artifact is unavailable"),
+        ("fingerprint_mismatch", "does not match its artifact"),
+    ],
+)
+def test_approval_rejects_invalid_artifact_metadata(
+    client,
+    setup_data,
+    valid_plan,
+    artifact_change,
+    expected_detail,
+):
+    plan_record_id = create_trusted_plan_record(setup_data, valid_plan)
+
+    db = TestingSessionLocal()
+    try:
+        plan_record = db.get(TerraformPlanRecord, plan_record_id)
+        assert plan_record is not None
+
+        if artifact_change == "missing_path":
+            plan_record.artifact_path = None
+        elif artifact_change == "missing_checksum":
+            plan_record.artifact_sha256 = None
+        else:
+            plan_record.artifact_sha256 = "a" * 64
+
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.post(
+        "/approvals",
+        headers=setup_data["requester_headers"],
+        json={
+            "infrastructure_request_id": setup_data["infra_request_id"],
+            "terraform_plan_record_id": plan_record_id,
+        },
+    )
+
+    assert response.status_code == 409, response.text
+    assert expected_detail in response.json()["detail"]
+
+
+def test_approval_rejects_modified_plan_artifact(
+    client,
+    setup_data,
+    valid_plan,
+):
+    plan_record_id = create_trusted_plan_record(setup_data, valid_plan)
+
+    db = TestingSessionLocal()
+    try:
+        plan_record = db.get(TerraformPlanRecord, plan_record_id)
+        assert plan_record is not None
+        artifact_path = plan_record.artifact_path
+    finally:
+        db.close()
+
+    with open(artifact_path, "wb") as artifact_file:
+        artifact_file.write(b"modified-test-plan-artifact")
+
+    response = client.post(
+        "/approvals",
+        headers=setup_data["requester_headers"],
+        json={
+            "infrastructure_request_id": setup_data["infra_request_id"],
+            "terraform_plan_record_id": plan_record_id,
+        },
+    )
+
+    assert response.status_code == 409, response.text
+    assert "integrity verification failed" in response.json()["detail"]
+
 def test_non_admin_cannot_make_approval_decision(
     client, setup_data, valid_plan
 ):
@@ -827,16 +925,26 @@ def create_fully_approved_lifecycle_request(
     setup_data,
     valid_plan,
 ):
-    """Create a fully approved request with a test-only verified artifact."""
-
-    from backend.app.services.terraform.artifacts import (
-        save_plan_artifact,
-    )
+    """Create a fully approved request with a verified test artifact."""
 
     approval_id = create_pending_approval(
         setup_data,
         valid_plan,
     )
+
+    db = TestingSessionLocal()
+    try:
+        plan_record = db.scalar(
+            select(TerraformPlanRecord).where(
+                TerraformPlanRecord.infrastructure_request_id
+                == setup_data["infra_request_id"]
+            )
+        )
+        assert plan_record is not None
+        artifact_path = plan_record.artifact_path
+        assert artifact_path
+    finally:
+        db.close()
 
     approve_all_stages(client, setup_data, approval_id)
 
@@ -850,29 +958,8 @@ def create_fully_approved_lifecycle_request(
     )
     assert response.status_code == 200, response.text
 
-    artifact_path, artifact_checksum = save_plan_artifact(
-        b"test-only-terraform-plan-artifact"
-    )
-
-    db = TestingSessionLocal()
-    try:
-        plan_record = db.scalar(
-            select(TerraformPlanRecord).where(
-                TerraformPlanRecord.infrastructure_request_id
-                == setup_data["infra_request_id"]
-            )
-        )
-
-        assert plan_record is not None
-
-        plan_record.artifact_path = artifact_path
-        plan_record.artifact_sha256 = artifact_checksum
-
-        db.commit()
-    finally:
-        db.close()
-
     return approval_id, artifact_path
+
 
 def test_provision_rejects_approval_without_all_reviews(
     client,
@@ -967,6 +1054,31 @@ def test_fully_approved_request_queues_provision_operation(
     finally:
         delete_plan_artifact(artifact_path)
 
+
+
+def test_provision_rejects_modified_plan_artifact(
+    client,
+    setup_data,
+    valid_plan,
+    monkeypatch,
+):
+    approval_id, artifact_path = create_fully_approved_lifecycle_request(
+        client,
+        setup_data,
+        valid_plan,
+    )
+
+    with open(artifact_path, "wb") as artifact_file:
+        artifact_file.write(b"modified-after-approval")
+
+    response = client.post(
+        "/infrastructure-operations/provision",
+        headers=setup_data["requester_headers"],
+        json={"approval_request_id": approval_id},
+    )
+
+    assert response.status_code == 409, response.text
+    assert "integrity verification failed" in response.json()["detail"]
 
 def test_duplicate_provision_operation_is_rejected(
     client,

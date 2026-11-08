@@ -28,6 +28,10 @@ from backend.app.schemas.approval import (
 from backend.app.schemas.infrastructure import (
     ValidatedInfrastructureSpecification,
 )
+from backend.app.services.terraform.artifacts import (
+    TerraformArtifactError,
+    load_plan_artifact,
+)
 
 router = APIRouter(prefix="/approvals", tags=["Approvals"])
 
@@ -243,6 +247,32 @@ def create_approval(
             status_code=status.HTTP_409_CONFLICT,
             detail="The Terraform plan record has no valid fingerprint.",
         )
+
+    if (
+        not plan_record.artifact_path
+        or not _is_sha256_fingerprint(plan_record.artifact_sha256)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The Terraform plan artifact is unavailable.",
+        )
+
+    if plan_record.plan_fingerprint != plan_record.artifact_sha256:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The Terraform plan fingerprint does not match its artifact.",
+        )
+
+    try:
+        load_plan_artifact(
+            plan_record.artifact_path,
+            plan_record.artifact_sha256,
+        )
+    except TerraformArtifactError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Terraform plan artifact integrity verification failed.",
+        ) from exc
 
     if not _is_sha256_fingerprint(plan_record.specification_fingerprint):
         raise HTTPException(
