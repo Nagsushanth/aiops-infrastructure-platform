@@ -26,6 +26,7 @@ from datetime import datetime, timedelta, timezone
 from backend.app.models.infrastructure_operation_event import (
     InfrastructureOperationEvent,
 )
+from backend.app.models.infrastructure_resource import InfrastructureResource
 
 test_engine = create_engine(
     "sqlite://",
@@ -820,6 +821,326 @@ def test_provision_dispatch_failure_is_audited(
         assert event.previous_status == "queued"
         assert event.new_status == "failed"
         assert event.event_metadata["automatic_retry"] is False
+
+    finally:
+        db.close()
+
+def test_owner_can_sync_infrastructure_inventory(
+    client, setup_data, monkeypatch
+):
+    request_id = setup_data["request_id"]
+
+    db = TestingSessionLocal()
+    try:
+        db.add(
+            TerraformStateRecord(
+                infrastructure_request_id=request_id,
+                backend_type="s3",
+                state_bucket="test-state-bucket",
+                state_key=f"requests/{request_id}/terraform.tfstate",
+                state_region="ap-south-1",
+                status="active",
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    client_regions = []
+    read_calls = []
+
+    def fake_create_s3_client(region_name=None):
+        client_regions.append(region_name)
+        return "mock-s3-client"
+
+    def fake_read_state_object(client, bucket, key):
+        read_calls.append((client, bucket, key))
+        return {
+            "content": b"mock-terraform-state",
+            "sha256": "test-checksum",
+        }
+
+    resources = [
+        {
+            "resource_address": "aws_instance.web",
+            "resource_type": "aws_instance",
+            "resource_name": "web",
+            "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+            "mode": "managed",
+            "module": None,
+            "instance_key": None,
+            "resource_id": "i-test123",
+            "tags": {"Name": "web"},
+            "dependencies": [],
+            "instance_status": "unknown",
+        }
+    ]
+
+    def fake_parse_terraform_state(content):
+        assert content == b"mock-terraform-state"
+        return {
+            "serial": 1,
+            "lineage": "test-lineage",
+            "resources": resources,
+        }
+
+    monkeypatch.setattr(
+        operations_api,
+        "create_s3_client",
+        fake_create_s3_client,
+    )
+    monkeypatch.setattr(
+        operations_api,
+        "read_state_object",
+        fake_read_state_object,
+    )
+    monkeypatch.setattr(
+        operations_api,
+        "parse_terraform_state",
+        fake_parse_terraform_state,
+    )
+
+    response = client.post(
+        f"/infrastructure-operations/requests/{request_id}/inventory/sync",
+        headers=setup_data["requester_headers"],
+    )
+
+    assert response.status_code == 200, response.text
+
+    body = response.json()
+
+    assert body == {
+        "infrastructure_request_id": request_id,
+        "total_resources": 1,
+        "created": 1,
+        "updated": 0,
+        "unchanged": 0,
+        "marked_absent": 0,
+    }
+
+    assert client_regions == ["ap-south-1"]
+
+    assert read_calls == [
+        (
+            "mock-s3-client",
+            "test-state-bucket",
+            f"requests/{request_id}/terraform.tfstate",
+        )
+    ]
+
+    db = TestingSessionLocal()
+    try:
+        inventory = db.query(InfrastructureResource).filter_by(
+            infrastructure_request_id=request_id
+        ).one()
+
+        assert inventory.resource_address == "aws_instance.web"
+        assert inventory.resource_type == "aws_instance"
+        assert inventory.resource_id == "i-test123"
+        assert inventory.state_serial == 1
+        assert inventory.is_present is True
+    finally:
+        db.close()
+
+def test_another_user_cannot_sync_infrastructure_inventory(
+    client, setup_data, monkeypatch
+):
+    request_id = setup_data["request_id"]
+
+    def must_not_run(*args, **kwargs):
+        pytest.fail("S3 must not be accessed by another user")
+
+    monkeypatch.setattr(
+        operations_api,
+        "create_s3_client",
+        must_not_run,
+    )
+
+    response = client.post(
+        f"/infrastructure-operations/requests/{request_id}/inventory/sync",
+        headers=setup_data["other_user_headers"],
+    )
+
+    assert response.status_code == 404
+
+def test_inventory_sync_returns_502_for_invalid_state(
+    client, setup_data, monkeypatch
+):
+    request_id = setup_data["request_id"]
+
+    db = TestingSessionLocal()
+    try:
+        db.add(
+            TerraformStateRecord(
+                infrastructure_request_id=request_id,
+                backend_type="s3",
+                state_bucket="test-state-bucket",
+                state_key=f"requests/{request_id}/terraform.tfstate",
+                state_region="ap-south-1",
+                status="active",
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    monkeypatch.setattr(
+        operations_api,
+        "create_s3_client",
+        lambda region_name=None: "mock-s3-client",
+    )
+
+    monkeypatch.setattr(
+        operations_api,
+        "read_state_object",
+        lambda *args, **kwargs: {
+            "content": b"invalid-state",
+        },
+    )
+
+    def fake_parse(content):
+        raise operations_api.S3StateStorageError(
+            "S3_STATE_JSON_INVALID"
+        )
+
+    monkeypatch.setattr(
+        operations_api,
+        "parse_terraform_state",
+        fake_parse,
+    )
+
+    response = client.post(
+        f"/infrastructure-operations/requests/{request_id}/inventory/sync",
+        headers=setup_data["requester_headers"],
+    )
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == (
+        "Terraform state retrieval or validation failed."
+    )
+
+def test_inventory_sync_updates_unchanged_and_marks_absent(
+    client, setup_data
+):
+    request_id = setup_data["request_id"]
+
+    resource = {
+        "resource_address": "aws_instance.web",
+        "resource_type": "aws_instance",
+        "resource_name": "web",
+        "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+        "mode": "managed",
+        "module": None,
+        "instance_key": None,
+        "resource_id": "i-test123",
+        "tags": {"Name": "web"},
+        "dependencies": [],
+        "instance_status": "unknown",
+    }
+
+    db = TestingSessionLocal()
+
+    try:
+        db.add(
+            TerraformStateRecord(
+                infrastructure_request_id=request_id,
+                backend_type="s3",
+                state_bucket="test-state-bucket",
+                state_key=f"requests/{request_id}/terraform.tfstate",
+                state_region="ap-south-1",
+                status="active",
+            )
+        )
+        db.commit()
+
+        # First synchronization: create resource.
+        result = operations_api.sync_infrastructure_inventory(
+            db, request_id, 1, [resource]
+        )
+
+        assert result["created"] == 1
+
+        # Second synchronization: unchanged resource.
+        result = operations_api.sync_infrastructure_inventory(
+            db, request_id, 1, [resource]
+        )
+
+        assert result["unchanged"] == 1
+        assert result["created"] == 0
+
+        # Third synchronization: update resource metadata.
+        updated_resource = {
+            **resource,
+            "tags": {"Name": "web-updated"},
+        }
+
+        result = operations_api.sync_infrastructure_inventory(
+            db, request_id, 2, [updated_resource]
+        )
+
+        assert result["updated"] == 1
+
+        # Fourth synchronization: resource is absent from newer state.
+        result = operations_api.sync_infrastructure_inventory(
+            db, request_id, 3, []
+        )
+
+        assert result["total_resources"] == 0
+        assert result["marked_absent"] == 1
+
+        inventory = db.query(InfrastructureResource).filter_by(
+            infrastructure_request_id=request_id
+        ).one()
+
+        assert inventory.is_present is False
+        assert inventory.state_serial == 3
+
+    finally:
+        db.close()
+
+def test_empty_inventory_state_serial_is_persisted_and_protected(
+    client, setup_data
+):
+    request_id = setup_data["request_id"]
+
+    db = TestingSessionLocal()
+
+    try:
+        state_record = TerraformStateRecord(
+            infrastructure_request_id=request_id,
+            backend_type="s3",
+            state_bucket="test-state-bucket",
+            state_key=f"requests/{request_id}/terraform.tfstate",
+            state_region="ap-south-1",
+            status="active",
+        )
+
+        db.add(state_record)
+        db.commit()
+
+        # Synchronize an empty state with serial 5.
+        result = operations_api.sync_infrastructure_inventory(
+            db, request_id, 5, []
+        )
+
+        assert result["total_resources"] == 0
+        assert result["created"] == 0
+        assert result["marked_absent"] == 0
+
+        db.refresh(state_record)
+        assert state_record.state_serial == 5
+
+        # An older empty state must not overwrite serial 5.
+        with pytest.raises(
+            operations_api.InfrastructureInventoryError,
+            match="INVENTORY_STATE_SERIAL_STALE",
+        ):
+            operations_api.sync_infrastructure_inventory(
+                db, request_id, 4, []
+            )
+
+        db.refresh(state_record)
+        assert state_record.state_serial == 5
 
     finally:
         db.close()

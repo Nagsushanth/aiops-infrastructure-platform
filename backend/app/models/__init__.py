@@ -8,6 +8,7 @@ from backend.app.models.terraform_state_version import TerraformStateVersion
 from backend.app.models.infrastructure_operation_event import (
     InfrastructureOperationEvent,
 )
+from backend.app.models.infrastructure_resource import InfrastructureResource
 
 
 __all__ = [
@@ -19,4 +20,5 @@ __all__ = [
     "TerraformStateRecord",
     "TerraformStateVersion",
     "InfrastructureOperationEvent",
+    "InfrastructureResource",
 ]

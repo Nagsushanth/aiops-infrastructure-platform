@@ -32,6 +32,7 @@ from backend.app.schemas.infrastructure import (
     ValidatedInfrastructureSpecification,
 )
 from backend.app.schemas.infrastructure_operation import (
+    InfrastructureInventorySyncResponse,
     InfrastructureOperationCreate,
     InfrastructureOperationResponse,
     TerraformStateVersionResponse,
@@ -44,8 +45,14 @@ from backend.app.services.terraform.artifacts import (
 )
 from backend.app.services.terraform.s3_state_storage import (
     S3StateStorageError,
+    read_state_object,
+    parse_terraform_state,
     create_s3_client,
     sync_s3_state_versions,
+)
+from backend.app.services.terraform.inventory_manager import (
+    InfrastructureInventoryError,
+    sync_infrastructure_inventory,
 )
 from backend.app.services.terraform.state_version_manager import (
     TerraformStateVersionError,
@@ -674,4 +681,83 @@ def synchronize_state_versions(
         "infrastructure_request_id": infrastructure_request_id,
         **result,
         "versions": versions,
+    }
+
+@router.post(
+    "/requests/{infrastructure_request_id}/inventory/sync",
+    response_model=InfrastructureInventorySyncResponse,
+)
+def synchronize_infrastructure_inventory(
+    infrastructure_request_id: int,
+    current_user: CurrentUser,
+    db: Session = Depends(get_db),
+):
+    """Synchronize resource inventory from the current Terraform state."""
+
+    get_owned_infrastructure_request(
+        infrastructure_request_id,
+        current_user.id,
+        db,
+    )
+
+    state_record = db.scalar(
+        select(TerraformStateRecord).where(
+            TerraformStateRecord.infrastructure_request_id
+            == infrastructure_request_id
+        )
+    )
+
+    if state_record is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Terraform state record not found.",
+        )
+
+    if state_record.backend_type != "s3":
+        raise HTTPException(
+            status_code=409,
+            detail="Only S3 state backends are supported.",
+        )
+
+    if state_record.status == "archived":
+        raise HTTPException(
+            status_code=409,
+            detail="Archived Terraform state cannot be synchronized.",
+        )
+
+    try:
+        client = create_s3_client(
+            region_name=state_record.state_region,
+        )
+
+        state = read_state_object(
+            client,
+            state_record.state_bucket,
+            state_record.state_key,
+        )
+
+        metadata = parse_terraform_state(state["content"])
+
+        result = sync_infrastructure_inventory(
+            db,
+            infrastructure_request_id,
+            metadata["serial"],
+            metadata["resources"],
+        )
+
+    except S3StateStorageError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Terraform state retrieval or validation failed.",
+        ) from exc
+
+    except InfrastructureInventoryError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="Infrastructure inventory synchronization failed.",
+        ) from exc
+
+    return {
+        "infrastructure_request_id": infrastructure_request_id,
+        **result,
     }

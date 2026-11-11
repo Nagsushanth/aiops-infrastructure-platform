@@ -263,6 +263,191 @@ def test_parse_valid_terraform_state():
     assert result["lineage"] == lineage
 
 
+def test_parse_terraform_state_extracts_resource_inventory():
+    lineage = str(uuid.uuid4())
+
+    content = json.dumps({
+        "version": 4,
+        "terraform_version": "1.15.6",
+        "serial": 3,
+        "lineage": lineage,
+        "outputs": {},
+        "resources": [
+            {
+                "mode": "managed",
+                "type": "aws_instance",
+                "name": "app_server",
+                "provider": (
+                    'provider["registry.terraform.io/hashicorp/aws"]'
+                ),
+                "instances": [
+                    {
+                        "index_key": 0,
+                        "attributes": {
+                            "id": "i-example123",
+                            "instance_type": "t3.micro",
+                            "tags": {
+                                "Name": "aiops-server",
+                                "Environment": "dev",
+                                "Password": "do-not-store",
+                                "UnknownTag": "ignore-me",
+                            },
+                        },
+                        "dependencies": [
+                            "aws_security_group.app"
+                        ],
+                    }
+                ],
+            }
+        ],
+    }).encode()
+
+    result = parse_terraform_state(content)
+
+    assert result["serial"] == 3
+    assert result["lineage"] == lineage
+    assert len(result["resources"]) == 1
+
+    resource = result["resources"][0]
+
+    assert resource["resource_address"] == "aws_instance.app_server[0]"
+    assert resource["resource_type"] == "aws_instance"
+    assert resource["resource_name"] == "app_server"
+    assert resource["resource_id"] == "i-example123"
+    assert resource["mode"] == "managed"
+    assert resource["tags"] == {
+        "Name": "aiops-server",
+        "Environment": "dev",
+    }
+    assert resource["dependencies"] == [
+        "aws_security_group.app"
+    ]
+
+
+def test_parse_terraform_state_supports_for_each():
+    content = json.dumps({
+        "version": 4,
+        "serial": 1,
+        "lineage": str(uuid.uuid4()),
+        "resources": [
+            {
+                "mode": "managed",
+                "type": "aws_s3_bucket",
+                "name": "buckets",
+                "provider": "provider[aws]",
+                "instances": [
+                    {
+                        "index_key": "logs",
+                        "attributes": {"id": "logs-bucket"},
+                    }
+                ],
+            }
+        ],
+    }).encode()
+
+    result = parse_terraform_state(content)
+
+    assert result["resources"][0]["resource_address"] == (
+        'aws_s3_bucket.buckets["logs"]'
+    )
+
+
+def test_parse_terraform_state_supports_module_resources():
+    content = json.dumps({
+        "version": 4,
+        "serial": 1,
+        "lineage": str(uuid.uuid4()),
+        "resources": [
+            {
+                "module": "module.network",
+                "mode": "managed",
+                "type": "aws_vpc",
+                "name": "main",
+                "provider": "provider[aws]",
+                "instances": [
+                    {
+                        "attributes": {"id": "vpc-example"},
+                    }
+                ],
+            }
+        ],
+    }).encode()
+
+    result = parse_terraform_state(content)
+
+    assert result["resources"][0]["resource_address"] == (
+        "module.network.aws_vpc.main"
+    )
+
+
+def test_parse_terraform_state_supports_data_resources():
+    content = json.dumps({
+        "version": 4,
+        "serial": 1,
+        "lineage": str(uuid.uuid4()),
+        "resources": [
+            {
+                "mode": "data",
+                "type": "aws_ami",
+                "name": "selected",
+                "provider": "provider[aws]",
+                "instances": [
+                    {
+                        "attributes": {"id": "ami-example"},
+                    }
+                ],
+            }
+        ],
+    }).encode()
+
+    result = parse_terraform_state(content)
+
+    assert result["resources"][0]["resource_address"] == (
+        "data.aws_ami.selected"
+    )
+
+
+@pytest.mark.parametrize(
+    "resources",
+    [
+        None,
+        {},
+        ["invalid-resource"],
+        [
+            {
+                "mode": "managed",
+                "type": "aws_instance",
+                "name": "server",
+                "provider": "provider[aws]",
+                "instances": "invalid",
+            }
+        ],
+        [
+            {
+                "mode": "invalid",
+                "type": "aws_instance",
+                "name": "server",
+                "provider": "provider[aws]",
+                "instances": [],
+            }
+        ],
+    ],
+)
+def test_parse_terraform_state_rejects_invalid_resources(resources):
+    content = json.dumps({
+        "version": 4,
+        "serial": 1,
+        "lineage": str(uuid.uuid4()),
+        "resources": resources,
+    }).encode()
+
+    with pytest.raises(S3StateStorageError) as exc:
+        parse_terraform_state(content)
+
+    assert exc.value.args[0] == "S3_STATE_JSON_INVALID"
+
+
+
 @pytest.mark.parametrize(
     "content",
     [

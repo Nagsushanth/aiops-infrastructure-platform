@@ -56,3 +56,13 @@ class TerraformStateVersionSyncResponse(BaseModel):
     recorded: int
     skipped: int
     versions: list[TerraformStateVersionResponse]
+
+class InfrastructureInventorySyncResponse(BaseModel):
+    """Result of synchronizing Terraform resource inventory."""
+
+    infrastructure_request_id: int
+    total_resources: int
+    created: int
+    updated: int
+    unchanged: int
+    marked_absent: int

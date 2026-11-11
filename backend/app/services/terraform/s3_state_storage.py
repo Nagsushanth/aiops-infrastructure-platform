@@ -154,11 +154,222 @@ def list_state_object_versions(
             "S3_STATE_VERSION_LIST_FAILED"
         ) from exc
 
+SAFE_INVENTORY_TAGS = {
+    "name",
+    "environment",
+    "project",
+    "owner",
+    "managedby",
+    "costcenter",
+    "application",
+    "department",
+    "team",
+}
+
+SENSITIVE_TAG_PARTS = {
+    "secret",
+    "password",
+    "token",
+    "credential",
+    "private",
+    "accesskey",
+    "apikey",
+}
+
+
+def _safe_inventory_tags(attributes: dict) -> dict[str, str]:
+    """Extract a limited set of non-sensitive inventory tags."""
+
+    tags = attributes.get("tags")
+
+    if not isinstance(tags, dict):
+        tags = attributes.get("tags_all")
+
+    if not isinstance(tags, dict):
+        return {}
+
+    safe_tags = {}
+
+    for key, value in tags.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            continue
+
+        normalized_key = key.lower().replace("-", "").replace("_", "")
+
+        if normalized_key not in SAFE_INVENTORY_TAGS:
+            continue
+
+        if any(part in normalized_key for part in SENSITIVE_TAG_PARTS):
+            continue
+
+        if len(key) > 100 or len(value) > 256:
+            continue
+
+        if any(ord(character) < 32 for character in value):
+            continue
+
+        safe_tags[key] = value
+
+    return safe_tags
+
+
+def _terraform_resource_address(
+    resource: dict,
+    index_key: str | int | None,
+) -> str:
+    """Build a Terraform resource instance address."""
+
+    mode = resource["mode"]
+    resource_type = resource["type"]
+    resource_name = resource["name"]
+    module = resource.get("module")
+
+    prefix = ""
+
+    if module:
+        prefix = f"{module}."
+
+    if mode == "data":
+        prefix += "data."
+
+    address = f"{prefix}{resource_type}.{resource_name}"
+
+    if isinstance(index_key, bool):
+        raise ValueError("Invalid Terraform instance key.")
+
+    if isinstance(index_key, int):
+        address += f"[{index_key}]"
+    elif isinstance(index_key, str):
+        address += f"[{json.dumps(index_key, ensure_ascii=False)}]"
+
+    return address
+
+
+def _parse_state_resources(resources: Any) -> list[dict[str, Any]]:
+    """Extract safe inventory metadata from Terraform state resources."""
+
+    if not isinstance(resources, list):
+        raise ValueError("Invalid Terraform resources collection.")
+
+    inventory = []
+    seen_addresses = set()
+
+    for resource in resources:
+        if not isinstance(resource, dict):
+            raise ValueError("Invalid Terraform resource.")
+
+        mode = resource.get("mode")
+        resource_type = resource.get("type")
+        resource_name = resource.get("name")
+        provider = resource.get("provider")
+        module = resource.get("module")
+
+        if mode not in {"managed", "data"}:
+            raise ValueError("Invalid Terraform resource mode.")
+
+        for value in (resource_type, resource_name, provider):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError("Invalid Terraform resource metadata.")
+
+        if (
+            module is not None
+            and (
+                not isinstance(module, str)
+                or not module.startswith("module.")
+            )
+        ):
+            raise ValueError("Invalid Terraform module address.")
+
+        instances = resource.get("instances")
+
+        if not isinstance(instances, list):
+            raise ValueError("Invalid Terraform resource instances.")
+
+        for instance in instances:
+            if not isinstance(instance, dict):
+                raise ValueError("Invalid Terraform resource instance.")
+
+            # Deposed instances represent old objects retained during
+            # replacement. They are not the current inventory entry.
+            if instance.get("deposed") is not None:
+                continue
+
+            index_key = instance.get("index_key")
+
+            if (
+                index_key is not None
+                and (
+                    isinstance(index_key, bool)
+                    or not isinstance(index_key, (str, int))
+                )
+            ):
+                raise ValueError("Invalid Terraform instance key.")
+
+            attributes = instance.get("attributes", {})
+
+            if not isinstance(attributes, dict):
+                raise ValueError("Invalid Terraform resource attributes.")
+
+            dependencies = instance.get("dependencies", [])
+
+            if (
+                not isinstance(dependencies, list)
+                or any(
+                    not isinstance(dependency, str)
+                    or not dependency.strip()
+                    for dependency in dependencies
+                )
+            ):
+                raise ValueError("Invalid Terraform dependencies.")
+
+            address = _terraform_resource_address(
+                resource,
+                index_key,
+            )
+
+            if address in seen_addresses:
+                raise ValueError("Duplicate Terraform resource address.")
+
+            seen_addresses.add(address)
+
+            resource_id = attributes.get("id")
+
+            if (
+                not isinstance(resource_id, str)
+                or not resource_id.strip()
+                or len(resource_id) > 256
+                or any(ord(character) < 32 for character in resource_id)
+            ):
+                resource_id = None
+
+            instance_status = instance.get("status", "unknown")
+
+            if not isinstance(instance_status, str):
+                raise ValueError("Invalid Terraform instance status.")
+
+            inventory.append(
+                {
+                    "resource_address": address,
+                    "resource_type": resource_type,
+                    "resource_name": resource_name,
+                    "provider": provider,
+                    "mode": mode,
+                    "module": module,
+                    "instance_key": index_key,
+                    "resource_id": resource_id,
+                    "tags": _safe_inventory_tags(attributes),
+                    "dependencies": sorted(set(dependencies)),
+                    "instance_status": instance_status,
+                }
+            )
+
+    return inventory
+
 
 def parse_terraform_state(
     state_content: bytes,
 ) -> dict[str, Any]:
-    """Parse and validate Terraform state JSON."""
+    """Parse Terraform state and extract safe resource inventory metadata."""
 
     if not isinstance(state_content, bytes) or not state_content:
         raise S3StateStorageError("S3_STATE_CONTENT_INVALID")
@@ -169,7 +380,13 @@ def parse_terraform_state(
         if not isinstance(state, dict):
             raise ValueError("State must be a JSON object.")
 
-        if state.get("version") != 4:
+        version = state.get("version")
+
+        if (
+            not isinstance(version, int)
+            or isinstance(version, bool)
+            or version != 4
+        ):
             raise ValueError("Unsupported Terraform state format.")
 
         serial = state.get("serial")
@@ -191,16 +408,23 @@ def parse_terraform_state(
         if str(parsed_lineage) != lineage.lower():
             raise ValueError("Non-canonical Terraform state lineage.")
 
+        resources = _parse_state_resources(state.get("resources"))
+
         return {
             "serial": serial,
             "lineage": lineage.lower(),
+            "resources": resources,
         }
 
-    except (ValueError, TypeError, UnicodeDecodeError) as exc:
+    except (
+        ValueError,
+        TypeError,
+        UnicodeDecodeError,
+        AttributeError,
+    ) as exc:
         raise S3StateStorageError(
             "S3_STATE_JSON_INVALID"
         ) from exc
-
 
 def sync_s3_state_versions(
     db: Session,
