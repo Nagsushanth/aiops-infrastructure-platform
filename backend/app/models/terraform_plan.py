@@ -65,7 +65,7 @@ class TerraformPlanRecord(Base):
         nullable=True,
     )
 
-        # Private filesystem reference for the Terraform provider lock file.
+    # Private filesystem reference for the Terraform provider lock file.
     provider_lock_path: Mapped[str | None] = mapped_column(
         String(1024),
         nullable=True,
@@ -73,6 +73,18 @@ class TerraformPlanRecord(Base):
 
     # SHA-256 of the preserved Terraform provider lock file.
     provider_lock_sha256: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+    )
+
+        # Private filesystem reference for the exact generated Terraform configuration.
+    configuration_artifact_path: Mapped[str | None] = mapped_column(
+        String(1024),
+        nullable=True,
+    )
+
+    # SHA-256 of the preserved Terraform configuration.
+    configuration_artifact_sha256: Mapped[str | None] = mapped_column(
         String(64),
         nullable=True,
     )

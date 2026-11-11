@@ -1,22 +1,28 @@
-
 """Run a real Terraform plan without applying infrastructure changes."""
 
 import hashlib
 import json
 import os
+import signal
 import subprocess
 import tempfile
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
-import signal
-import time
 
 from dotenv import load_dotenv
 
 from backend.app.services.terraform.artifacts import (
+    TerraformArtifactError,
+    delete_configuration_artifact,
+    load_configuration_artifact,
+    load_plan_artifact,
+    load_provider_lock_artifact,
+    save_configuration_artifact,
     save_plan_artifact,
     save_provider_lock_artifact,
-    TerraformArtifactError,
 )
 from backend.app.services.terraform.backend_config import (
     build_s3_backend_config,
@@ -43,6 +49,8 @@ from backend.app.services.terraform.generator import (
 from backend.app.services.terraform.cost_estimator import (
     estimate_ec2_monthly_cost,
 )
+from contextlib import contextmanager
+from collections.abc import Iterator
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
@@ -446,6 +454,157 @@ def _run_controlled_process(
     return result
 
 
+@contextmanager
+def reconstructed_terraform_workspace(
+    *,
+    configuration_artifact_path: str,
+    configuration_artifact_sha256: str,
+    provider_lock_path: str,
+    provider_lock_sha256: str,
+    plan_artifact_path: str,
+    plan_artifact_sha256: str,
+    temp_root: Path | None = None,
+) -> Iterator[Path]:
+    """Reconstruct an isolated workspace from verified Terraform artifacts."""
+
+    try:
+        configuration = load_configuration_artifact(
+            configuration_artifact_path,
+            configuration_artifact_sha256,
+        )
+        provider_lock = load_provider_lock_artifact(
+            provider_lock_path,
+            provider_lock_sha256,
+        )
+        plan_bytes = load_plan_artifact(
+            plan_artifact_path,
+            plan_artifact_sha256,
+        )
+    except TerraformArtifactError as exc:
+        raise TerraformExecutionError(
+            "WORKSPACE_ARTIFACT_VALIDATION_FAILED"
+        ) from exc
+
+    if not configuration.strip() or not provider_lock or not plan_bytes:
+        raise TerraformExecutionError(
+            "WORKSPACE_ARTIFACT_CONTENT_INVALID"
+        )
+
+    with tempfile.TemporaryDirectory(
+        prefix="aiops-terraform-apply-",
+        dir=temp_root,
+    ) as temp:
+        workspace = Path(temp)
+
+        files = {
+            "main.tf": configuration.encode("utf-8"),
+            ".terraform.lock.hcl": provider_lock,
+            "tfplan": plan_bytes,
+        }
+
+        try:
+            for filename, content in files.items():
+                file_path = workspace / filename
+                file_descriptor = os.open(
+                    file_path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+
+                with os.fdopen(file_descriptor, "wb") as file:
+                    file.write(content)
+                    file.flush()
+                    os.fsync(file.fileno())
+
+        except OSError as exc:
+            raise TerraformExecutionError(
+                "WORKSPACE_RECONSTRUCTION_FAILED"
+            ) from exc
+
+        # Exceptions from the caller must propagate unchanged.
+        yield workspace
+
+
+def initialize_terraform_apply_workspace(
+    workspace: Path,
+    *,
+    timeout_seconds: int,
+    env: dict[str, str],
+    lease_renewal_callback,
+) -> subprocess.CompletedProcess[str]:
+    """Initialize a reconstructed workspace without changing provider locks."""
+
+    return _run_controlled_process(
+        [
+            "terraform",
+            "init",
+            "-input=false",
+            "-no-color",
+            "-lockfile=readonly",
+        ],
+        cwd=workspace,
+        timeout_seconds=timeout_seconds,
+        env=env,
+        lease_renewal_callback=lease_renewal_callback,
+    )
+
+
+def build_terraform_environment() -> tuple[dict[str, str], Path]:
+    """Build a restricted Terraform environment and private temp root."""
+
+    allowed_env_vars = (
+        "PATH",
+        "HOME",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_PROFILE",
+        "AWS_SHARED_CREDENTIALS_FILE",
+        "AWS_CONFIG_FILE",
+        "AWS_REGION",
+        "AWS_DEFAULT_REGION",
+        "AWS_ROLE_ARN",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+        "AWS_EC2_METADATA_DISABLED",
+    )
+
+    env = {
+        key: os.environ[key]
+        for key in allowed_env_vars
+        if key in os.environ
+    }
+
+    env.setdefault(
+        "AWS_SHARED_CREDENTIALS_FILE",
+        os.path.expanduser("~/.aws/credentials"),
+    )
+    env.setdefault(
+        "AWS_CONFIG_FILE",
+        os.path.expanduser("~/.aws/config"),
+    )
+
+    temp_root = Path(
+        env.get("TMPDIR") or tempfile.gettempdir()
+    ).expanduser()
+
+    temp_root.mkdir(parents=True, exist_ok=True)
+
+    env["TMPDIR"] = str(temp_root)
+    env["TEMP"] = str(temp_root)
+    env["TMP"] = str(temp_root)
+    env["TF_IN_AUTOMATION"] = "1"
+    env["TF_INPUT"] = "0"
+
+    return env, temp_root
+
 
 def execute_terraform_plan(
     specification: ValidatedInfrastructureSpecification,
@@ -497,57 +656,7 @@ def execute_terraform_plan(
             "INVALID_STATE_BACKEND_CONFIG"
         ) from exc
 
-    allowed_env_vars = (
-        "PATH",
-        "HOME",
-        "TMPDIR",
-        "TEMP",
-        "TMP",
-        "SSL_CERT_FILE",
-        "SSL_CERT_DIR",
-        "AWS_ACCESS_KEY_ID",
-        "AWS_SECRET_ACCESS_KEY",
-        "AWS_SESSION_TOKEN",
-        "AWS_PROFILE",
-        "AWS_SHARED_CREDENTIALS_FILE",
-        "AWS_CONFIG_FILE",
-        "AWS_REGION",
-        "AWS_DEFAULT_REGION",
-        "AWS_ROLE_ARN",
-        "AWS_WEB_IDENTITY_TOKEN_FILE",
-        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
-        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
-        "AWS_CONTAINER_AUTHORIZATION_TOKEN",
-        "AWS_EC2_METADATA_DISABLED",
-    )
-
-    env = {
-        key: os.environ[key]
-        for key in allowed_env_vars
-        if key in os.environ
-    }
-
-    env.setdefault(
-        "AWS_SHARED_CREDENTIALS_FILE",
-        os.path.expanduser("~/.aws/credentials"),
-    )
-    env.setdefault(
-        "AWS_CONFIG_FILE",
-        os.path.expanduser("~/.aws/config"),
-    )
-
-    # Explicitly choose the temporary filesystem. If TMPDIR is set by the
-    # operator, respect it; otherwise use the system default.
-    temp_root = Path(
-        env.get("TMPDIR") or tempfile.gettempdir()
-    ).expanduser()
-    temp_root.mkdir(parents=True, exist_ok=True)
-
-    env["TMPDIR"] = str(temp_root)
-    env["TEMP"] = str(temp_root)
-    env["TMP"] = str(temp_root)
-    env["TF_IN_AUTOMATION"] = "1"
-    env["TF_INPUT"] = "0"
+    env, temp_root = build_terraform_environment()
 
     with tempfile.TemporaryDirectory(
         prefix="aiops-terraform-",
@@ -669,11 +778,31 @@ def execute_terraform_plan(
             "cost_estimate": cost_estimate,
         }
 
+        # Persist the exact Terraform configuration used to generate this plan.
+        # This includes the injected S3 backend configuration.
+        try:
+            configuration_artifact_path, configuration_artifact_sha256 = (
+                save_configuration_artifact(configuration)
+            )
+        except (OSError, TerraformArtifactError) as exc:
+            raise TerraformExecutionError(
+                "CONFIGURATION_ARTIFACT_SAVE_FAILED"
+            ) from exc
+
         # Persist the exact binary plan before the temporary workspace
         # is removed. The artifact remains private on the server.
-        artifact_path, artifact_sha256 = save_plan_artifact(
-            plan_bytes
-        )
+        try:
+            artifact_path, artifact_sha256 = save_plan_artifact(
+                plan_bytes
+            )
+        except (OSError, TerraformArtifactError) as exc:
+            delete_configuration_artifact(
+                configuration_artifact_path
+            )
+            raise TerraformExecutionError(
+                "PLAN_ARTIFACT_SAVE_FAILED"
+            ) from exc
+            raise
 
         return {
             "status": "succeeded",
@@ -688,4 +817,6 @@ def execute_terraform_plan(
             "artifact_sha256": artifact_sha256,
             "provider_lock_path": provider_lock_path,
             "provider_lock_sha256": provider_lock_sha256,
+            "configuration_artifact_path": configuration_artifact_path,
+            "configuration_artifact_sha256": configuration_artifact_sha256,
         }

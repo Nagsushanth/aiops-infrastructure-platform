@@ -32,15 +32,18 @@ from backend.app.services.terraform.artifacts import (
     TerraformArtifactError,
     load_plan_artifact,
     load_provider_lock_artifact,
+    load_configuration_artifact,
 )
 from backend.app.workers.celery_app import celery_app
 from backend.app.services.terraform.execution import (
+    TerraformExecutionError,
     _run_controlled_process,
+    build_terraform_environment,
+    reconstructed_terraform_workspace,
+    initialize_terraform_apply_workspace,
 )
 
-
 WORKER_LEASE_MINUTES = 15
-
 
 @celery_app.task(name="aiops.health_check")
 def health_check() -> dict[str, str]:
@@ -514,6 +517,75 @@ def execute_provision_operation(operation_id: int) -> dict:
                 "PROVIDER_LOCK_ARTIFACT_INVALID",
                 "Terraform provider lock artifact integrity verification failed.",
             )
+
+        # Verify the exact Terraform configuration used to generate the plan.
+        if (
+            not plan.configuration_artifact_path
+            or not plan.configuration_artifact_sha256
+        ):
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "CONFIGURATION_ARTIFACT_MISSING",
+                "The Terraform configuration artifact is unavailable.",
+            )
+
+        try:
+            load_configuration_artifact(
+                plan.configuration_artifact_path,
+                plan.configuration_artifact_sha256,
+            )
+        except TerraformArtifactError:
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "CONFIGURATION_ARTIFACT_INVALID",
+                "Terraform configuration artifact integrity verification failed.",
+            )
+
+        
+        # Reconstruct the exact approved Terraform workspace.
+        env, temp_root = build_terraform_environment()
+
+        try:
+            with reconstructed_terraform_workspace(
+                configuration_artifact_path=(
+                    plan.configuration_artifact_path
+                ),
+                configuration_artifact_sha256=(
+                    plan.configuration_artifact_sha256
+                ),
+                provider_lock_path=plan.provider_lock_path,
+                provider_lock_sha256=plan.provider_lock_sha256,
+                plan_artifact_path=plan.artifact_path,
+                plan_artifact_sha256=plan.artifact_sha256,
+                temp_root=temp_root,
+            ) as workspace:
+                initialize_terraform_apply_workspace(
+                    workspace,
+                    timeout_seconds=180,
+                    env=env,
+                    lease_renewal_callback=lambda: _renew_operation_lease(
+                        operation_id,
+                        execution_token,
+                    ),
+                )
+
+        except TerraformExecutionError as exc:
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "failed",
+                exc.code,
+                "Terraform initialization failed safely.",
+                preflight_passed=True,
+            )
+
 
 
         # Deliberate safety boundary:

@@ -18,12 +18,14 @@ from backend.app.services.terraform.artifacts import (
     delete_plan_artifact,
     save_provider_lock_artifact,
     delete_provider_lock_artifact,
+    save_configuration_artifact,
+    delete_configuration_artifact,
 )
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
-
+from contextlib import contextmanager
 from backend.app.models.base import Base
 from backend.app.models.approval import (
     ApprovalRequest,
@@ -169,6 +171,8 @@ def test_worker_validates_plan_artifact_fingerprint(
     worker_db,
     fingerprint_matches_artifact,
     lock_artifact_mode,
+    monkeypatch,
+    tmp_path,
 ):
     requirements = {
         "cloud_provider": "aws",
@@ -202,6 +206,12 @@ def test_worker_validates_plan_artifact_fingerprint(
     provider_lock_path, provider_lock_checksum = (
         save_provider_lock_artifact(
             b'# Test provider lock file\n'
+        )
+    )
+
+    configuration_path, configuration_checksum = (
+        save_configuration_artifact(
+            'terraform {\n  required_version = ">= 1.10.0"\n}\n'
         )
     )
 
@@ -256,6 +266,8 @@ def test_worker_validates_plan_artifact_fingerprint(
             artifact_sha256=artifact_checksum,
             provider_lock_path=provider_lock_path,
             provider_lock_sha256=provider_lock_checksum,
+            configuration_artifact_path=configuration_path,
+            configuration_artifact_sha256=configuration_checksum,
         )
         db.add(plan)
         db.flush()
@@ -296,6 +308,52 @@ def test_worker_validates_plan_artifact_fingerprint(
     finally:
         db.close()
 
+    initialization_calls = {}
+
+    def fake_build_environment():
+        return {
+            "PATH": os.environ.get("PATH", ""),
+            "TF_INPUT": "0",
+            "TF_IN_AUTOMATION": "1",
+        }, tmp_path
+
+    @contextmanager
+    def fake_reconstructed_workspace(**kwargs):
+        initialization_calls["workspace_artifacts"] = kwargs
+        yield tmp_path / "fake-terraform-workspace"
+
+    def fake_initialize_workspace(
+        workspace,
+        *,
+        timeout_seconds,
+        env,
+        lease_renewal_callback,
+    ):
+        initialization_calls["initialization"] = {
+            "workspace": workspace,
+            "timeout_seconds": timeout_seconds,
+            "env": env,
+        }
+        initialization_calls["lease_renewed"] = (
+            lease_renewal_callback()
+        )
+
+    monkeypatch.setattr(
+        tasks,
+        "build_terraform_environment",
+        fake_build_environment,
+    )
+    monkeypatch.setattr(
+        tasks,
+        "reconstructed_terraform_workspace",
+        fake_reconstructed_workspace,
+    )
+    monkeypatch.setattr(
+        tasks,
+        "initialize_terraform_apply_workspace",
+        fake_initialize_workspace,
+    )
+
     try:
         # First execution: worker claims the queued operation.
         result = tasks.execute_provision_operation.run(operation_id)
@@ -315,6 +373,34 @@ def test_worker_validates_plan_artifact_fingerprint(
         else:
             assert result["preflight_passed"] is True
             expected_error_code = "TERRAFORM_APPLY_DISABLED"
+
+            assert "workspace_artifacts" in initialization_calls
+            assert "initialization" in initialization_calls
+
+            reconstructed = initialization_calls["workspace_artifacts"]
+            assert reconstructed["configuration_artifact_path"] == (
+                configuration_path
+            )
+            assert reconstructed["configuration_artifact_sha256"] == (
+                configuration_checksum
+            )
+            assert reconstructed["provider_lock_path"] == (
+                provider_lock_path
+            )
+            assert reconstructed["provider_lock_sha256"] == (
+                provider_lock_checksum
+            )
+            assert reconstructed["plan_artifact_path"] == artifact_path
+            assert reconstructed["plan_artifact_sha256"] == artifact_checksum
+            assert reconstructed["temp_root"] == tmp_path
+
+            initialized = initialization_calls["initialization"]
+            assert initialized["workspace"] == (
+                tmp_path / "fake-terraform-workspace"
+            )
+            assert initialized["timeout_seconds"] == 180
+            assert initialized["env"]["TF_INPUT"] == "0"
+            assert initialization_calls["lease_renewed"] is True
 
         if expected_error_code != "TERRAFORM_APPLY_DISABLED":
             assert result["error_code"] == expected_error_code
@@ -360,6 +446,7 @@ def test_worker_validates_plan_artifact_fingerprint(
     finally:
         delete_plan_artifact(artifact_path)
         delete_provider_lock_artifact(provider_lock_path)
+        delete_configuration_artifact(configuration_path)
 
 
 def test_worker_marks_unexpected_preflight_exception_failed(

@@ -20,6 +20,7 @@ from backend.app.schemas.infrastructure import (
 from backend.app.services.terraform.artifacts import (
     delete_plan_artifact,
     delete_provider_lock_artifact,
+    delete_configuration_artifact,
 )
 from backend.app.services.terraform.backend_config import (
     build_s3_backend_config,
@@ -230,6 +231,8 @@ def create_trusted_terraform_plan(
         artifact_sha256=result.get("artifact_sha256"),
         provider_lock_path=result.get("provider_lock_path"),
         provider_lock_sha256=result.get("provider_lock_sha256"),
+        configuration_artifact_path=result.get("configuration_artifact_path"),
+        configuration_artifact_sha256=result.get("configuration_artifact_sha256"),
         plan_summary=result["plan_summary"],
     )
 
@@ -246,6 +249,7 @@ def create_trusted_terraform_plan(
         # Do not expose filesystem details to the client.
         artifact_path = result.get("artifact_path")
         provider_lock_path = result.get("provider_lock_path")
+        configuration_artifact_path = result.get("configuration_artifact_path")
 
         if artifact_path:
             try:
@@ -256,6 +260,14 @@ def create_trusted_terraform_plan(
         if provider_lock_path:
             try:
                 delete_provider_lock_artifact(provider_lock_path)
+            except Exception:
+                pass
+
+        if configuration_artifact_path:
+            try:
+                delete_configuration_artifact(
+                    configuration_artifact_path
+                )
             except Exception:
                 pass
 

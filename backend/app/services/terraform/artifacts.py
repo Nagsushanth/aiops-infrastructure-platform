@@ -160,6 +160,130 @@ def delete_plan_artifact(artifact_path: str) -> bool:
     return True
 
 
+def save_configuration_artifact(
+    configuration: str,
+) -> tuple[str, str]:
+    """Save Terraform configuration securely and return path and SHA-256."""
+
+    if not isinstance(configuration, str) or not configuration.strip():
+        raise TerraformArtifactError(
+            "CONFIGURATION_ARTIFACT_CONTENT_INVALID"
+        )
+
+    configuration_bytes = configuration.encode("utf-8")
+    directory = _artifact_directory()
+
+    artifact_path = directory / f"{secrets.token_hex(24)}.tf"
+    file_descriptor = None
+
+    try:
+        file_descriptor = os.open(
+            artifact_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+
+        with os.fdopen(file_descriptor, "wb") as artifact_file:
+            file_descriptor = None
+            artifact_file.write(configuration_bytes)
+            artifact_file.flush()
+            os.fsync(artifact_file.fileno())
+
+    except OSError as exc:
+        if file_descriptor is not None:
+            os.close(file_descriptor)
+
+        try:
+            artifact_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+        raise TerraformArtifactError(
+            "CONFIGURATION_ARTIFACT_SAVE_FAILED"
+        ) from exc
+
+    checksum = hashlib.sha256(configuration_bytes).hexdigest()
+
+    return str(artifact_path), checksum
+
+
+def load_configuration_artifact(
+    artifact_path: str,
+    expected_sha256: str,
+) -> str:
+    """Load Terraform configuration after verifying its SHA-256."""
+
+    if (
+        not isinstance(expected_sha256, str)
+        or len(expected_sha256) != 64
+        or any(
+            character not in "0123456789abcdefABCDEF"
+            for character in expected_sha256
+        )
+    ):
+        raise TerraformArtifactError(
+            "CONFIGURATION_ARTIFACT_CHECKSUM_INVALID"
+        )
+
+    path = _resolve_artifact_path(artifact_path)
+
+    if path.suffix != ".tf":
+        raise TerraformArtifactError(
+            "CONFIGURATION_ARTIFACT_PATH_INVALID"
+        )
+
+    try:
+        configuration_bytes = path.read_bytes()
+    except OSError as exc:
+        raise TerraformArtifactError(
+            "CONFIGURATION_ARTIFACT_READ_FAILED"
+        ) from exc
+
+    actual_sha256 = hashlib.sha256(
+        configuration_bytes
+    ).hexdigest()
+
+    if not secrets.compare_digest(
+        actual_sha256,
+        expected_sha256.lower(),
+    ):
+        raise TerraformArtifactError(
+            "CONFIGURATION_ARTIFACT_CHECKSUM_MISMATCH"
+        )
+
+    try:
+        return configuration_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise TerraformArtifactError(
+            "CONFIGURATION_ARTIFACT_ENCODING_INVALID"
+        ) from exc
+
+
+def delete_configuration_artifact(
+    artifact_path: str,
+) -> bool:
+    """Delete a configuration artifact from the private directory."""
+
+    if not artifact_path:
+        return False
+
+    path = _resolve_artifact_path(artifact_path)
+
+    if path.suffix != ".tf":
+        raise TerraformArtifactError(
+            "CONFIGURATION_ARTIFACT_PATH_INVALID"
+        )
+
+    try:
+        path.unlink()
+    except OSError as exc:
+        raise TerraformArtifactError(
+            "CONFIGURATION_ARTIFACT_DELETE_FAILED"
+        ) from exc
+
+    return True
+
+
 def delete_provider_lock_artifact(artifact_path: str) -> bool:
     """Delete a provider lock artifact only if it belongs to the private directory."""
     if not artifact_path:

@@ -15,9 +15,13 @@ import subprocess
 
 from backend.app.services.terraform.artifacts import (
     load_plan_artifact,
+    save_plan_artifact,
     save_provider_lock_artifact,
     load_provider_lock_artifact,
     TerraformArtifactError,
+    save_configuration_artifact,
+    load_configuration_artifact,
+    delete_configuration_artifact,
 )
 from backend.app.schemas.infrastructure import (
     ValidatedInfrastructureSpecification,
@@ -25,6 +29,9 @@ from backend.app.schemas.infrastructure import (
 from backend.app.services.terraform.execution import (
     TerraformExecutionError,
     execute_terraform_plan,
+    reconstructed_terraform_workspace,
+    initialize_terraform_apply_workspace,
+    build_terraform_environment,
 )
 
 
@@ -711,3 +718,277 @@ def test_terminate_process_group_kills_child_after_parent_exits(tmp_path):
             os.killpg(parent.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+
+
+def test_configuration_artifact_save_and_load():
+    configuration = """
+terraform {
+  required_version = ">= 1.10.0"
+}
+"""
+
+    path, checksum = save_configuration_artifact(configuration)
+
+    loaded = load_configuration_artifact(path, checksum)
+
+    assert loaded == configuration
+    assert len(checksum) == 64
+
+    delete_configuration_artifact(path)
+
+
+def test_configuration_artifact_rejects_checksum_mismatch():
+    configuration = 'resource "test_resource" "example" {}'
+
+    path, checksum = save_configuration_artifact(configuration)
+
+    with pytest.raises(TerraformArtifactError) as exc:
+        load_configuration_artifact(path, "0" * 64)
+
+    assert str(exc.value) == "CONFIGURATION_ARTIFACT_CHECKSUM_MISMATCH"
+
+    delete_configuration_artifact(path)
+
+
+def test_configuration_artifact_rejects_invalid_extension():
+    configuration = 'resource "test_resource" "example" {}'
+
+    path, checksum = save_configuration_artifact(configuration)
+
+    invalid_path = str(Path(path).with_suffix(".txt"))
+    Path(path).rename(invalid_path)
+
+    with pytest.raises(TerraformArtifactError) as exc:
+        load_configuration_artifact(invalid_path, checksum)
+
+    assert str(exc.value) == "CONFIGURATION_ARTIFACT_PATH_INVALID"
+
+    Path(invalid_path).unlink()
+
+def test_reconstructed_workspace_contains_verified_artifacts(tmp_path):
+    configuration = """
+terraform {
+  required_version = ">= 1.10.0"
+}
+"""
+    provider_lock = b'# Test provider lock file\n'
+    plan_bytes = b'valid-test-terraform-plan'
+
+    configuration_path, configuration_checksum = (
+        save_configuration_artifact(configuration)
+    )
+    lock_path, lock_checksum = save_provider_lock_artifact(
+        provider_lock
+    )
+    plan_path, plan_checksum = save_plan_artifact(plan_bytes)
+
+    workspace_root = tmp_path / "workspaces"
+    workspace_root.mkdir()
+
+    with reconstructed_terraform_workspace(
+        configuration_artifact_path=configuration_path,
+        configuration_artifact_sha256=configuration_checksum,
+        provider_lock_path=lock_path,
+        provider_lock_sha256=lock_checksum,
+        plan_artifact_path=plan_path,
+        plan_artifact_sha256=plan_checksum,
+        temp_root=workspace_root,
+    ) as workspace:
+        assert (workspace / "main.tf").read_text() == configuration
+        assert (workspace / ".terraform.lock.hcl").read_bytes() == provider_lock
+        assert (workspace / "tfplan").read_bytes() == plan_bytes
+
+        assert (workspace / "main.tf").stat().st_mode & 0o777 == 0o600
+        assert (workspace / "tfplan").stat().st_mode & 0o777 == 0o600
+
+        workspace_path = workspace
+
+    assert not workspace_path.exists()
+
+
+def test_reconstructed_workspace_rejects_invalid_checksum(tmp_path):
+    configuration_path, configuration_checksum = (
+        save_configuration_artifact(
+            'terraform { required_version = ">= 1.10.0" }'
+        )
+    )
+    lock_path, lock_checksum = save_provider_lock_artifact(
+        b'# Test provider lock file\n'
+    )
+    plan_path, plan_checksum = save_plan_artifact(
+        b'valid-test-terraform-plan'
+    )
+
+    workspace_root = tmp_path / "workspaces"
+    workspace_root.mkdir()
+
+    with pytest.raises(TerraformExecutionError) as exc:
+        with reconstructed_terraform_workspace(
+            configuration_artifact_path=configuration_path,
+            configuration_artifact_sha256="0" * 64,
+            provider_lock_path=lock_path,
+            provider_lock_sha256=lock_checksum,
+            plan_artifact_path=plan_path,
+            plan_artifact_sha256=plan_checksum,
+            temp_root=workspace_root,
+        ):
+            pass
+
+    assert exc.value.code == "WORKSPACE_ARTIFACT_VALIDATION_FAILED"
+    assert list(workspace_root.iterdir()) == []
+
+
+def test_reconstructed_workspace_cleans_up_after_exception(tmp_path):
+    configuration_path, configuration_checksum = (
+        save_configuration_artifact(
+            'terraform { required_version = ">= 1.10.0" }'
+        )
+    )
+    lock_path, lock_checksum = save_provider_lock_artifact(
+        b'# Test provider lock file\n'
+    )
+    plan_path, plan_checksum = save_plan_artifact(
+        b'valid-test-terraform-plan'
+    )
+
+    workspace_root = tmp_path / "workspaces"
+    workspace_root.mkdir()
+
+    workspace_path = None
+
+    with pytest.raises(RuntimeError, match="simulated failure"):
+        with reconstructed_terraform_workspace(
+            configuration_artifact_path=configuration_path,
+            configuration_artifact_sha256=configuration_checksum,
+            provider_lock_path=lock_path,
+            provider_lock_sha256=lock_checksum,
+            plan_artifact_path=plan_path,
+            plan_artifact_sha256=plan_checksum,
+            temp_root=workspace_root,
+        ) as workspace:
+            workspace_path = workspace
+            raise RuntimeError("simulated failure")
+
+    assert workspace_path is not None
+    assert not workspace_path.exists()
+    assert list(workspace_root.iterdir()) == []
+
+
+def test_initialize_apply_workspace_uses_readonly_lockfile(
+    tmp_path,
+    monkeypatch,
+):
+    from backend.app.services.terraform import execution
+
+    captured = {}
+
+    def fake_run_controlled_process(command, **kwargs):
+        captured["command"] = command
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(
+            args=command,
+            returncode=0,
+            stdout="Terraform initialized",
+            stderr="",
+        )
+
+    monkeypatch.setattr(
+        execution,
+        "_run_controlled_process",
+        fake_run_controlled_process,
+    )
+
+    callback = lambda: True
+    env = {"PATH": "/usr/bin"}
+
+    result = initialize_terraform_apply_workspace(
+        tmp_path,
+        timeout_seconds=120,
+        env=env,
+        lease_renewal_callback=callback,
+    )
+
+    assert result.returncode == 0
+    assert captured["command"] == [
+        "terraform",
+        "init",
+        "-input=false",
+        "-no-color",
+        "-lockfile=readonly",
+    ]
+    assert captured["cwd"] == tmp_path
+    assert captured["timeout_seconds"] == 120
+    assert captured["env"] == env
+    assert captured["lease_renewal_callback"] is callback
+
+
+def test_initialize_apply_workspace_propagates_execution_error(
+    tmp_path,
+    monkeypatch,
+):
+    from backend.app.services.terraform import execution
+
+    def fake_run_controlled_process(command, **kwargs):
+        raise TerraformExecutionError("PROCESS_TIMEOUT")
+
+    monkeypatch.setattr(
+        execution,
+        "_run_controlled_process",
+        fake_run_controlled_process,
+    )
+
+    with pytest.raises(TerraformExecutionError) as exc:
+        initialize_terraform_apply_workspace(
+            tmp_path,
+            timeout_seconds=120,
+            env={"PATH": "/usr/bin"},
+            lease_renewal_callback=lambda: True,
+        )
+
+    assert exc.value.code == "PROCESS_TIMEOUT"
+
+
+def test_build_terraform_environment_uses_restricted_allowlist(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("AWS_PROFILE", "aiops-training")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test-secret")
+    monkeypatch.setenv("UNRELATED_SECRET", "must-not-be-included")
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+
+    env, temp_root = build_terraform_environment()
+
+    assert env["PATH"] == "/usr/bin"
+    assert env["AWS_PROFILE"] == "aiops-training"
+    assert env["AWS_SECRET_ACCESS_KEY"] == "test-secret"
+    assert "UNRELATED_SECRET" not in env
+
+    assert env["TF_IN_AUTOMATION"] == "1"
+    assert env["TF_INPUT"] == "0"
+
+    assert temp_root == tmp_path
+    assert env["TMPDIR"] == str(tmp_path)
+    assert env["TEMP"] == str(tmp_path)
+    assert env["TMP"] == str(tmp_path)
+
+
+def test_build_terraform_environment_uses_default_temp_directory(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.delenv("TMPDIR", raising=False)
+    monkeypatch.setattr(
+        "backend.app.services.terraform.execution.tempfile.gettempdir",
+        lambda: str(tmp_path),
+    )
+
+    env, temp_root = build_terraform_environment()
+
+    assert temp_root == tmp_path
+    assert env["TMPDIR"] == str(tmp_path)
+    assert env["TF_INPUT"] == "0"
+
+
