@@ -4,9 +4,21 @@ import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+import sys
 import backend.app.services.terraform.execution as execution_module
 import pytest
-from backend.app.services.terraform.artifacts import load_plan_artifact
+import os
+import signal
+import sys
+import time
+import subprocess
+
+from backend.app.services.terraform.artifacts import (
+    load_plan_artifact,
+    save_provider_lock_artifact,
+    load_provider_lock_artifact,
+    TerraformArtifactError,
+)
 from backend.app.schemas.infrastructure import (
     ValidatedInfrastructureSpecification,
 )
@@ -14,6 +26,7 @@ from backend.app.services.terraform.execution import (
     TerraformExecutionError,
     execute_terraform_plan,
 )
+
 
 @pytest.fixture(autouse=True)
 def isolate_terraform_artifacts(tmp_path, monkeypatch):
@@ -74,6 +87,7 @@ def test_rejects_invalid_timeout(specification):
             timeout_seconds=0,
         )
 
+
 @pytest.mark.parametrize(
     "invalid_timeout",
     [
@@ -114,6 +128,7 @@ def test_rejects_missing_terraform_backend_injection_target(
         )
 
     assert exc.value.code == "BACKEND_BLOCK_INJECTION_FAILED"
+
 
 def test_inject_s3_backend_adds_verified_configuration():
     configuration = 'terraform {\n  required_version = ">= 1.10.0"\n}\n'
@@ -207,6 +222,12 @@ def test_runs_plan_without_apply(specification):
             assert "use_lockfile = true" in terraform_config
             assert "-backend=false" not in command
 
+            # Simulate the provider lock file created by terraform init.
+            (Path(cwd) / ".terraform.lock.hcl").write_text(
+                '# Test provider lock file\n',
+                encoding="utf-8",
+            )
+
             return completed_process()
 
         if command[1] == "plan":
@@ -239,6 +260,7 @@ def test_runs_plan_without_apply(specification):
                     }
                 ],
             }
+
             return completed_process(
                 stdout=json.dumps(plan_json)
             )
@@ -269,8 +291,19 @@ def test_runs_plan_without_apply(specification):
     assert result["is_real_terraform_plan"] is True
     assert result["source_verified"] is False
     assert result["deployment_enabled"] is False
+
     assert result["artifact_path"]
     assert result["artifact_sha256"] == result["plan_fingerprint"]
+
+    assert result["provider_lock_path"]
+    assert len(result["provider_lock_sha256"]) == 64
+
+    saved_lock = load_provider_lock_artifact(
+        result["provider_lock_path"],
+        result["provider_lock_sha256"],
+    )
+
+    assert saved_lock == b'# Test provider lock file\n'
 
     saved_plan = load_plan_artifact(
         result["artifact_path"],
@@ -319,9 +352,9 @@ def test_command_failure_does_not_expose_raw_output(
     ):
         with pytest.raises(TerraformExecutionError) as exc:
             execute_terraform_plan(
-            specification,
-            infrastructure_request_id=123,
-        )
+                specification,
+                infrastructure_request_id=123,
+            )
 
     assert exc.value.code == "INIT_FAILED_GENERAL"
     assert "sensitive-diagnostic" not in str(exc.value)
@@ -351,11 +384,12 @@ def test_timeout_is_reported_safely(specification):
     ):
         with pytest.raises(TerraformExecutionError) as exc:
             execute_terraform_plan(
-            specification,
-            infrastructure_request_id=123,
-        )
+                specification,
+                infrastructure_request_id=123,
+            )
 
     assert exc.value.code == "INIT_TIMEOUT"
+
 
 def test_plan_includes_unavailable_cost_estimate(specification):
     commands = []
@@ -374,8 +408,18 @@ def test_plan_includes_unavailable_cost_estimate(specification):
     ):
         commands.append(command)
 
+        if command[1] == "init":
+            # Simulate terraform init generating its provider lock file.
+            (Path(cwd) / ".terraform.lock.hcl").write_text(
+                '# Test provider lock file\n',
+                encoding="utf-8",
+            )
+            return completed_process()
+
         if command[1] == "plan":
-            (Path(cwd) / "tfplan").write_bytes(b"mock-binary-plan")
+            (Path(cwd) / "tfplan").write_bytes(
+                b"mock-binary-plan"
+            )
             return completed_process()
 
         if command[1] == "show":
@@ -391,13 +435,18 @@ def test_plan_includes_unavailable_cost_estimate(specification):
                         "change": {
                             "actions": ["create"],
                             "before": None,
-                            "after": {"instance_type": "t3.small"},
+                            "after": {
+                                "instance_type": "t3.small"
+                            },
                             "after_sensitive": {},
                         },
                     }
                 ],
             }
-            return completed_process(stdout=json.dumps(plan_json))
+
+            return completed_process(
+                stdout=json.dumps(plan_json)
+            )
 
         return completed_process()
 
@@ -406,7 +455,11 @@ def test_plan_includes_unavailable_cost_estimate(specification):
             "backend.app.services.terraform.execution.subprocess.run",
             side_effect=fake_run,
         ),
-        patch.object(execution_module, "PRICING_CATALOG", {}),
+        patch.object(
+            execution_module,
+            "PRICING_CATALOG",
+            {},
+        ),
         patch.object(
             execution_module,
             "BUDGET_THRESHOLD_USD",
@@ -444,8 +497,18 @@ def test_plan_includes_verified_cost_estimate(specification):
     ):
         commands.append(command)
 
+        if command[1] == "init":
+            # Simulate terraform init generating its provider lock file.
+            (Path(cwd) / ".terraform.lock.hcl").write_text(
+                '# Test provider lock file\n',
+                encoding="utf-8",
+            )
+            return completed_process()
+
         if command[1] == "plan":
-            (Path(cwd) / "tfplan").write_bytes(b"mock-binary-plan")
+            (Path(cwd) / "tfplan").write_bytes(
+                b"mock-binary-plan"
+            )
             return completed_process()
 
         if command[1] == "show":
@@ -461,13 +524,18 @@ def test_plan_includes_verified_cost_estimate(specification):
                         "change": {
                             "actions": ["create"],
                             "before": None,
-                            "after": {"instance_type": "t3.small"},
+                            "after": {
+                                "instance_type": "t3.small"
+                            },
                             "after_sensitive": {},
                         },
                     }
                 ],
             }
-            return completed_process(stdout=json.dumps(plan_json))
+
+            return completed_process(
+                stdout=json.dumps(plan_json)
+            )
 
         return completed_process()
 
@@ -510,3 +578,136 @@ def test_plan_includes_verified_cost_estimate(specification):
     assert estimate["pricing_source"] == "Test fixture only"
     assert estimate["pricing_verified_on"] == "2026-10-30"
     assert estimate["assumptions"]["includes"] == ["EC2 compute only"]
+
+
+def test_provider_lock_artifact_save_and_load():
+    lock_content = b"""
+provider "registry.terraform.io/hashicorp/aws" {
+  version = "5.100.0"
+}
+"""
+
+    path, checksum = save_provider_lock_artifact(lock_content)
+
+    loaded = load_provider_lock_artifact(path, checksum)
+
+    assert loaded == lock_content
+    assert len(checksum) == 64
+
+
+def test_provider_lock_artifact_rejects_checksum_mismatch():
+    lock_content = b"provider lock content"
+
+    path, checksum = save_provider_lock_artifact(lock_content)
+
+    with pytest.raises(TerraformArtifactError) as exc:
+        load_provider_lock_artifact(path, "0" * 64)
+
+    assert str(exc.value) == "LOCK_ARTIFACT_CHECKSUM_MISMATCH"
+
+
+def test_provider_lock_artifact_rejects_invalid_extension():
+    plan_content = b"not a provider lock file"
+    path, checksum = save_provider_lock_artifact(plan_content)
+
+    # Rename the artifact to a different extension for this test.
+    invalid_path = str(Path(path).with_suffix(".tfplan"))
+    Path(path).rename(invalid_path)
+
+    with pytest.raises(TerraformArtifactError) as exc:
+        load_provider_lock_artifact(invalid_path, checksum)
+
+    assert str(exc.value) == "LOCK_ARTIFACT_PATH_INVALID"
+
+
+def test_controlled_process_captures_output():
+    result = execution_module._run_controlled_process(
+        [sys.executable, "-c", "print('controlled-success')"],
+        cwd=Path.cwd(),
+        timeout_seconds=5,
+        env=dict(__import__("os").environ),
+        lease_renewal_callback=lambda: True,
+        lease_renewal_interval_seconds=1,
+    )
+
+    assert result.returncode == 0
+    assert "controlled-success" in result.stdout
+
+
+def test_controlled_process_terminates_on_timeout():
+    with pytest.raises(TerraformExecutionError) as exc:
+        execution_module._run_controlled_process(
+            [
+                sys.executable,
+                "-c",
+                "import time; time.sleep(10)",
+            ],
+            cwd=Path.cwd(),
+            timeout_seconds=1,
+            env=dict(__import__("os").environ),
+            lease_renewal_callback=lambda: True,
+            lease_renewal_interval_seconds=0.1,
+        )
+
+    assert exc.value.code == "PROCESS_TIMEOUT"
+
+
+def test_controlled_process_terminates_when_lease_is_lost():
+    with pytest.raises(TerraformExecutionError) as exc:
+        execution_module._run_controlled_process(
+            [
+                sys.executable,
+                "-c",
+                "import time; time.sleep(10)",
+            ],
+            cwd=Path.cwd(),
+            timeout_seconds=5,
+            env=dict(__import__("os").environ),
+            lease_renewal_callback=lambda: False,
+            lease_renewal_interval_seconds=0.1,
+        )
+
+    assert exc.value.code == "WORKER_LEASE_LOST"
+
+def test_terminate_process_group_kills_child_after_parent_exits(tmp_path):
+    marker_file = tmp_path / "child_survived.txt"
+
+    child_code = (
+        "import time; "
+        "from pathlib import Path; "
+        "time.sleep(1); "
+        f"Path({str(marker_file)!r}).write_text('child survived')"
+    )
+
+    parent_code = (
+        "import subprocess, sys; "
+        f"subprocess.Popen([sys.executable, '-c', {child_code!r}])"
+    )
+
+    parent = subprocess.Popen(
+        [sys.executable, "-c", parent_code],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+
+    try:
+        parent.wait(timeout=5)
+
+        assert parent.poll() is not None
+
+        execution_module._terminate_process_group(
+            parent,
+            grace_seconds=0.2,
+        )
+
+        time.sleep(1.2)
+
+        assert not marker_file.exists()
+
+    finally:
+        try:
+            os.killpg(parent.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass

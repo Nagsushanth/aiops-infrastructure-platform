@@ -65,6 +65,18 @@ class TerraformPlanRecord(Base):
         nullable=True,
     )
 
+        # Private filesystem reference for the Terraform provider lock file.
+    provider_lock_path: Mapped[str | None] = mapped_column(
+        String(1024),
+        nullable=True,
+    )
+
+    # SHA-256 of the preserved Terraform provider lock file.
+    provider_lock_sha256: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+    )
+
     # Only a sanitized summary belongs here, never raw plan JSON or secrets.
     plan_summary: Mapped[dict[str, Any]] = mapped_column(
         JSON,

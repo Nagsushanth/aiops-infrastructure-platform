@@ -7,12 +7,20 @@ import os
 import subprocess
 import tempfile
 from pathlib import Path
+from typing import Any
+import signal
+import time
 
 from dotenv import load_dotenv
-from typing import Any
-from backend.app.services.terraform.artifacts import save_plan_artifact
-from backend.app.services.terraform.backend_config import build_s3_backend_config
 
+from backend.app.services.terraform.artifacts import (
+    save_plan_artifact,
+    save_provider_lock_artifact,
+    TerraformArtifactError,
+)
+from backend.app.services.terraform.backend_config import (
+    build_s3_backend_config,
+)
 from backend.app.schemas.infrastructure import (
     ValidatedInfrastructureSpecification,
 )
@@ -23,18 +31,15 @@ from backend.app.services.terraform.plan_parser import (
 from backend.app.services.terraform.security_policy import (
     evaluate_terraform_security,
 )
-
 from backend.app.core.terraform_pricing import (
     BUDGET_THRESHOLD_USD,
     PRICING_CATALOG,
 )
-
 from backend.app.services.terraform.generator import (
     INSTANCE_CATALOG,
     TerraformGenerationError,
     generate_terraform,
 )
-
 from backend.app.services.terraform.cost_estimator import (
     estimate_ec2_monthly_cost,
 )
@@ -66,6 +71,7 @@ def _canonical_specification(
         separators=(",", ":"),
         ensure_ascii=False,
     ).encode("utf-8")
+
 
 def _inject_s3_backend(
     configuration: str,
@@ -107,6 +113,7 @@ def _inject_s3_backend(
         )
 
     return configured
+
 
 def _failure_category(diagnostic: str) -> str:
     """Classify Terraform output without exposing its raw contents."""
@@ -205,7 +212,11 @@ def _safe_diagnostic_marker(diagnostic: str) -> str:
         "configuration for provider",
     )
 
-    matched = [marker for marker in markers if marker in diagnostic]
+    matched = [
+        marker for marker in markers
+        if marker in diagnostic
+    ]
+
     return ", ".join(matched) if matched else "none matched"
 
 
@@ -231,9 +242,13 @@ def _run(
             shell=False,
         )
     except subprocess.TimeoutExpired as exc:
-        raise TerraformExecutionError(f"{stage}_TIMEOUT") from exc
+        raise TerraformExecutionError(
+            f"{stage}_TIMEOUT"
+        ) from exc
     except OSError as exc:
-        raise TerraformExecutionError(f"{stage}_START_FAILED") from exc
+        raise TerraformExecutionError(
+            f"{stage}_START_FAILED"
+        ) from exc
 
     if result.returncode != 0:
         stdout = getattr(result, "stdout", "") or ""
@@ -249,9 +264,187 @@ def _run(
             f"category={category}; diagnostic_marker={marker}"
         )
 
-        raise TerraformExecutionError(f"{stage}_FAILED_{category}")
+        raise TerraformExecutionError(
+            f"{stage}_FAILED_{category}"
+        )
 
     return result
+
+def _terminate_process_group(
+    process: subprocess.Popen,
+    *,
+    grace_seconds: float = 5.0,
+) -> None:
+    """Terminate the process group, including surviving descendants."""
+
+    if os.name == "posix":
+        try:
+            # The process group can outlive its original parent.
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        except OSError:
+            pass
+    else:
+        if process.poll() is None:
+            try:
+                process.terminate()
+            except OSError:
+                pass
+
+    try:
+        process.wait(timeout=grace_seconds)
+    except subprocess.TimeoutExpired:
+        pass
+
+    if os.name == "posix":
+        try:
+            # Escalate to SIGKILL if any process remains in the group.
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            pass
+    elif process.poll() is None:
+        try:
+            process.kill()
+        except OSError:
+            pass
+
+    try:
+        process.wait(timeout=grace_seconds)
+    except subprocess.TimeoutExpired:
+        pass
+
+def _run_controlled_process(
+    command: list[str],
+    *,
+    cwd: Path,
+    timeout_seconds: int,
+    env: dict[str, str],
+    lease_renewal_callback,
+    lease_renewal_interval_seconds: float = 60.0,
+) -> subprocess.CompletedProcess[str]:
+    """Run a subprocess while monitoring timeout and worker ownership."""
+
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, int)
+        or timeout_seconds < 1
+    ):
+        raise ValueError("timeout_seconds must be a positive integer.")
+
+    if (
+        isinstance(lease_renewal_interval_seconds, bool)
+        or not isinstance(lease_renewal_interval_seconds, (int, float))
+        or lease_renewal_interval_seconds <= 0
+    ):
+        raise ValueError("Lease renewal interval must be positive.")
+
+    if not callable(lease_renewal_callback):
+        raise ValueError("A lease renewal callback is required.")
+
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            shell=False,
+            start_new_session=(os.name == "posix"),
+        )
+    except OSError as exc:
+        raise TerraformExecutionError(
+            "PROCESS_START_FAILED"
+        ) from exc
+
+    deadline = time.monotonic() + timeout_seconds
+    next_renewal = (
+        time.monotonic() + lease_renewal_interval_seconds
+    )
+
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+
+            if remaining <= 0:
+                _terminate_process_group(process)
+                process.communicate()
+                raise TerraformExecutionError("PROCESS_TIMEOUT")
+
+            wait_seconds = min(
+                remaining,
+                max(0.01, next_renewal - time.monotonic()),
+            )
+
+            try:
+                stdout, stderr = process.communicate(
+                    timeout=wait_seconds
+                )
+                break
+            except subprocess.TimeoutExpired:
+                pass
+
+            now = time.monotonic()
+
+            if now >= deadline:
+                _terminate_process_group(process)
+                process.communicate()
+                raise TerraformExecutionError("PROCESS_TIMEOUT")
+
+            if now >= next_renewal:
+                try:
+                    ownership_valid = lease_renewal_callback()
+                except Exception as exc:
+                    _terminate_process_group(process)
+                    process.communicate()
+                    raise TerraformExecutionError(
+                        "WORKER_LEASE_RENEWAL_FAILED"
+                    ) from exc
+
+                if ownership_valid is not True:
+                    _terminate_process_group(process)
+                    process.communicate()
+                    raise TerraformExecutionError(
+                        "WORKER_LEASE_LOST"
+                    )
+
+                next_renewal = (
+                    time.monotonic()
+                    + lease_renewal_interval_seconds
+                )
+
+    except BaseException:
+        if process.poll() is None:
+            _terminate_process_group(process)
+            process.communicate()
+        raise
+
+    result = subprocess.CompletedProcess(
+        args=command,
+        returncode=process.returncode,
+        stdout=stdout or "",
+        stderr=stderr or "",
+    )
+
+    if result.returncode != 0:
+        diagnostic = f"{result.stdout}\n{result.stderr}"
+        category = _failure_category(diagnostic)
+        marker = _safe_diagnostic_marker(diagnostic)
+
+        print(
+            "Controlled process failed: "
+            f"category={category}; diagnostic_marker={marker}"
+        )
+
+        raise TerraformExecutionError(
+            f"PROCESS_FAILED_{category}"
+        )
+
+    return result
+
 
 
 def execute_terraform_plan(
@@ -288,7 +481,9 @@ def execute_terraform_plan(
 
     bucket = os.getenv("TF_STATE_BUCKET", "").strip()
     if not bucket:
-        raise TerraformExecutionError("STATE_BACKEND_NOT_CONFIGURED")
+        raise TerraformExecutionError(
+            "STATE_BACKEND_NOT_CONFIGURED"
+        )
 
     try:
         backend_config = build_s3_backend_config(
@@ -298,7 +493,9 @@ def execute_terraform_plan(
             prefix=os.getenv("TF_STATE_PREFIX", "training/requests"),
         )
     except ValueError as exc:
-        raise TerraformExecutionError("INVALID_STATE_BACKEND_CONFIG") from exc
+        raise TerraformExecutionError(
+            "INVALID_STATE_BACKEND_CONFIG"
+        ) from exc
 
     allowed_env_vars = (
         "PATH",
@@ -380,6 +577,25 @@ def execute_terraform_plan(
             env=env,
         )
 
+        # Preserve the exact provider selections made during terraform init.
+        lock_file = workspace / ".terraform.lock.hcl"
+
+        if not lock_file.is_file():
+            raise TerraformExecutionError(
+                "PROVIDER_LOCK_FILE_MISSING"
+            )
+
+        try:
+            provider_lock_path, provider_lock_sha256 = (
+                save_provider_lock_artifact(
+                    lock_file.read_bytes()
+                )
+            )
+        except (OSError, TerraformArtifactError) as exc:
+            raise TerraformExecutionError(
+                "PROVIDER_LOCK_FILE_SAVE_FAILED"
+            ) from exc
+
         _run(
             [
                 "terraform",
@@ -395,7 +611,9 @@ def execute_terraform_plan(
 
         plan_file = workspace / "tfplan"
         if not plan_file.is_file():
-            raise TerraformExecutionError("PLAN_ARTIFACT_MISSING")
+            raise TerraformExecutionError(
+                "PLAN_ARTIFACT_MISSING"
+            )
 
         plan_bytes = plan_file.read_bytes()
         plan_fingerprint = _sha256(plan_bytes)
@@ -416,7 +634,9 @@ def execute_terraform_plan(
             TerraformPlanParsingError,
             ValueError,
         ) as exc:
-            raise TerraformExecutionError("PLAN_PARSE_FAILED") from exc
+            raise TerraformExecutionError(
+                "PLAN_PARSE_FAILED"
+            ) from exc
 
         resources = [
             {
@@ -466,4 +686,6 @@ def execute_terraform_plan(
             "plan_summary": summary,
             "artifact_path": artifact_path,
             "artifact_sha256": artifact_sha256,
+            "provider_lock_path": provider_lock_path,
+            "provider_lock_sha256": provider_lock_sha256,
         }

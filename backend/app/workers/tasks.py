@@ -5,7 +5,8 @@ import hashlib
 import json
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
-
+import subprocess
+from pathlib import Path
 from sqlalchemy import select, update
 
 from backend.app.core.database import SessionLocal
@@ -30,8 +31,12 @@ from backend.app.schemas.infrastructure import (
 from backend.app.services.terraform.artifacts import (
     TerraformArtifactError,
     load_plan_artifact,
+    load_provider_lock_artifact,
 )
 from backend.app.workers.celery_app import celery_app
+from backend.app.services.terraform.execution import (
+    _run_controlled_process,
+)
 
 
 WORKER_LEASE_MINUTES = 15
@@ -80,10 +85,12 @@ def _renew_operation_lease(
                 InfrastructureOperation.id == operation_id,
                 InfrastructureOperation.status == "running",
                 InfrastructureOperation.execution_token == execution_token,
+                InfrastructureOperation.lease_expires_at > now,
             )
             .values(
                 lease_expires_at=now + timedelta(minutes=lease_minutes),
             )
+            .execution_options(synchronize_session=False)
         )
 
         if result.rowcount != 1:
@@ -99,6 +106,30 @@ def _renew_operation_lease(
 
     finally:
         db.close()
+
+def _run_owned_operation_process(
+    command: list[str],
+    *,
+    operation_id: int,
+    execution_token: str,
+    cwd: Path,
+    timeout_seconds: int,
+    env: dict[str, str],
+    lease_renewal_interval_seconds: float = 60.0,
+) -> subprocess.CompletedProcess[str]:
+    """Run a process while renewing the owning infrastructure operation."""
+
+    return _run_controlled_process(
+        command,
+        cwd=cwd,
+        timeout_seconds=timeout_seconds,
+        env=env,
+        lease_renewal_callback=lambda: _renew_operation_lease(
+            operation_id,
+            execution_token,
+        ),
+        lease_renewal_interval_seconds=lease_renewal_interval_seconds,
+    )
 
 
 def _finish_operation(
@@ -120,6 +151,7 @@ def _finish_operation(
             InfrastructureOperation.id == operation_id,
             InfrastructureOperation.status == "running",
             InfrastructureOperation.execution_token == execution_token,
+            InfrastructureOperation.lease_expires_at > now,
         )
         .values(
             status=status,
@@ -133,6 +165,7 @@ def _finish_operation(
                 "terraform_apply_enabled": False,
             },
         )
+        .execution_options(synchronize_session=False)
     )
 
     if result.rowcount != 1:
@@ -427,7 +460,7 @@ def execute_provision_operation(operation_id: int) -> dict:
                 "PLAN_ARTIFACT_MISSING",
                 "The Terraform plan artifact is unavailable.",
             )
-        
+
         if plan.plan_fingerprint != plan.artifact_sha256:
             return _owned_operation_result(
                 db,
@@ -455,6 +488,33 @@ def execute_provision_operation(operation_id: int) -> dict:
                 "PLAN_ARTIFACT_INVALID",
                 "Terraform plan artifact integrity verification failed.",
             )
+
+
+        if not plan.provider_lock_path or not plan.provider_lock_sha256:
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "PROVIDER_LOCK_ARTIFACT_MISSING",
+                "The Terraform provider lock artifact is unavailable.",
+            )
+
+        try:
+            load_provider_lock_artifact(
+                plan.provider_lock_path,
+                plan.provider_lock_sha256,
+            )
+        except TerraformArtifactError:
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "PROVIDER_LOCK_ARTIFACT_INVALID",
+                "Terraform provider lock artifact integrity verification failed.",
+            )
+
 
         # Deliberate safety boundary:
         # Terraform apply remains disabled.

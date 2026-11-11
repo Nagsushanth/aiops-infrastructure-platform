@@ -3,12 +3,21 @@ import pytest
 import hashlib
 import json
 from sqlalchemy import select
+import os
+import sys
+import time
+from pathlib import Path
+from backend.app.services.terraform.execution import (
+    TerraformExecutionError,
+)
 from backend.app.schemas.infrastructure import (
     ValidatedInfrastructureSpecification,
 )
 from backend.app.services.terraform.artifacts import (
     save_plan_artifact,
     delete_plan_artifact,
+    save_provider_lock_artifact,
+    delete_provider_lock_artifact,
 )
 
 from sqlalchemy import create_engine
@@ -148,12 +157,18 @@ def test_worker_ignores_operation_that_is_not_queued(worker_db):
 
 
 @pytest.mark.parametrize(
-    "fingerprint_matches_artifact",
-    [True, False],
+    "fingerprint_matches_artifact,lock_artifact_mode",
+    [
+        (True, "valid"),
+        (True, "missing"),
+        (True, "corrupted"),
+        (False, "valid"),
+    ],
 )
 def test_worker_validates_plan_artifact_fingerprint(
     worker_db,
     fingerprint_matches_artifact,
+    lock_artifact_mode,
 ):
     requirements = {
         "cloud_provider": "aws",
@@ -183,6 +198,18 @@ def test_worker_validates_plan_artifact_fingerprint(
     artifact_path, artifact_checksum = save_plan_artifact(
         b"valid-test-terraform-plan"
     )
+
+    provider_lock_path, provider_lock_checksum = (
+        save_provider_lock_artifact(
+            b'# Test provider lock file\n'
+        )
+    )
+
+    if lock_artifact_mode == "missing":
+        provider_lock_path = None
+        provider_lock_checksum = None
+    elif lock_artifact_mode == "corrupted":
+        provider_lock_checksum = "a" * 64
 
     plan_fingerprint = (
         artifact_checksum
@@ -227,6 +254,8 @@ def test_worker_validates_plan_artifact_fingerprint(
             plan_summary={},
             artifact_path=artifact_path,
             artifact_sha256=artifact_checksum,
+            provider_lock_path=provider_lock_path,
+            provider_lock_sha256=provider_lock_checksum,
         )
         db.add(plan)
         db.flush()
@@ -271,20 +300,24 @@ def test_worker_validates_plan_artifact_fingerprint(
         # First execution: worker claims the queued operation.
         result = tasks.execute_provision_operation.run(operation_id)
 
-        assert result["status"] == "blocked"
+        assert result["status"] == "blocked", result
         assert result["operation_id"] == operation_id
         assert result["terraform_apply_enabled"] is False
 
-        if fingerprint_matches_artifact:
-            assert result["preflight_passed"] is True
-            expected_error_code = "TERRAFORM_APPLY_DISABLED"
-        else:
-            assert result["error_code"] == (
-                "PLAN_ARTIFACT_FINGERPRINT_MISMATCH"
-            )
+        if not fingerprint_matches_artifact:
             expected_error_code = (
                 "PLAN_ARTIFACT_FINGERPRINT_MISMATCH"
             )
+        elif lock_artifact_mode == "missing":
+            expected_error_code = "PROVIDER_LOCK_ARTIFACT_MISSING"
+        elif lock_artifact_mode == "corrupted":
+            expected_error_code = "PROVIDER_LOCK_ARTIFACT_INVALID"
+        else:
+            assert result["preflight_passed"] is True
+            expected_error_code = "TERRAFORM_APPLY_DISABLED"
+
+        if expected_error_code != "TERRAFORM_APPLY_DISABLED":
+            assert result["error_code"] == expected_error_code
 
         # Second execution: duplicate task delivery must not claim it again.
         duplicate_result = tasks.execute_provision_operation.run(
@@ -310,7 +343,7 @@ def test_worker_validates_plan_artifact_fingerprint(
                 is False
             )
 
-            if fingerprint_matches_artifact:
+            if expected_error_code == "TERRAFORM_APPLY_DISABLED":
                 assert (
                     saved_operation.result_summary["preflight_passed"]
                     is True
@@ -326,6 +359,7 @@ def test_worker_validates_plan_artifact_fingerprint(
 
     finally:
         delete_plan_artifact(artifact_path)
+        delete_provider_lock_artifact(provider_lock_path)
 
 
 def test_worker_marks_unexpected_preflight_exception_failed(
@@ -489,7 +523,6 @@ def test_worker_marks_unexpected_preflight_exception_failed(
 
     finally:
         delete_plan_artifact(artifact_path)
-
 
 def create_recovery_test_operation(
     db,
@@ -841,3 +874,179 @@ def test_lease_renewal_rejects_invalid_duration():
 
     with pytest.raises(ValueError):
         tasks._renew_operation_lease(1, "test-token", True)
+
+def test_lease_renewal_rejects_expired_lease(worker_db):
+    db = worker_db()
+
+    try:
+        operation_id = create_recovery_test_operation(
+            db,
+            "expired-lease@example.com",
+            "running",
+            datetime.now(timezone.utc) - timedelta(minutes=5),
+        )
+    finally:
+        db.close()
+
+    renewed = tasks._renew_operation_lease(
+        operation_id,
+        "test-execution-token",
+    )
+
+    assert renewed is False
+
+
+def test_worker_lease_callback_renews_current_operation(worker_db):
+    db = worker_db()
+
+    try:
+        operation_id = create_recovery_test_operation(
+            db,
+            "heartbeat@example.com",
+            "running",
+            datetime.now(timezone.utc) + timedelta(minutes=5),
+        )
+    finally:
+        db.close()
+
+    renewed = tasks._renew_operation_lease(
+        operation_id,
+        "test-execution-token",
+    )
+
+    assert renewed is True
+
+    db = worker_db()
+    try:
+        operation = db.get(
+            InfrastructureOperation,
+            operation_id,
+        )
+
+        assert operation.status == "running"
+        assert operation.execution_token == "test-execution-token"
+
+        lease_expires_at = operation.lease_expires_at
+
+        if lease_expires_at.tzinfo is None:
+            lease_expires_at = lease_expires_at.replace(tzinfo=timezone.utc)
+
+        assert lease_expires_at > (
+            datetime.now(timezone.utc) + timedelta(minutes=10)
+        )
+    finally:
+        db.close()
+
+def test_worker_process_integration_renews_lease(worker_db):
+    db = worker_db()
+
+    try:
+        operation_id = create_recovery_test_operation(
+            db,
+            "process-integration@example.com",
+            "running",
+            datetime.now(timezone.utc) + timedelta(minutes=5),
+        )
+    finally:
+        db.close()
+
+    result = tasks._run_owned_operation_process(
+        [
+            sys.executable,
+            "-c",
+            "import time; time.sleep(0.4)",
+        ],
+        operation_id=operation_id,
+        execution_token="test-execution-token",
+        cwd=Path.cwd(),
+        timeout_seconds=5,
+        env=os.environ.copy(),
+        lease_renewal_interval_seconds=0.1,
+    )
+
+    assert result.returncode == 0
+
+    db = worker_db()
+
+    try:
+        operation = db.get(
+            InfrastructureOperation,
+            operation_id,
+        )
+
+        assert operation.status == "running"
+        assert operation.execution_token == "test-execution-token"
+
+        lease_expires_at = operation.lease_expires_at
+
+        if lease_expires_at.tzinfo is None:
+            lease_expires_at = lease_expires_at.replace(
+                tzinfo=timezone.utc
+            )
+
+        assert lease_expires_at > (
+            datetime.now(timezone.utc) + timedelta(minutes=10)
+        )
+
+    finally:
+        db.close()
+
+def test_worker_process_terminates_when_lease_is_lost(
+    worker_db,
+    tmp_path,
+):
+    marker_file = tmp_path / "process_survived.txt"
+
+    db = worker_db()
+
+    try:
+        operation_id = create_recovery_test_operation(
+            db,
+            "lease-loss@example.com",
+            "running",
+            datetime.now(timezone.utc) + timedelta(minutes=5),
+        )
+    finally:
+        db.close()
+
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "import time; "
+            "from pathlib import Path; "
+            "time.sleep(1); "
+            f"Path({str(marker_file)!r}).write_text('survived')"
+        ),
+    ]
+
+    with pytest.raises(TerraformExecutionError) as exc_info:
+        tasks._run_owned_operation_process(
+            command,
+            operation_id=operation_id,
+            execution_token="incorrect-token",
+            cwd=Path.cwd(),
+            timeout_seconds=5,
+            env=os.environ.copy(),
+            lease_renewal_interval_seconds=0.1,
+        )
+
+    assert exc_info.value.code == "WORKER_LEASE_LOST"
+
+    time.sleep(1.2)
+
+    assert not marker_file.exists()
+
+    db = worker_db()
+
+    try:
+        operation = db.get(
+            InfrastructureOperation,
+            operation_id,
+        )
+
+        assert operation.status == "running"
+        assert operation.execution_token == "test-execution-token"
+
+    finally:
+        db.close()

@@ -158,3 +158,107 @@ def delete_plan_artifact(artifact_path: str) -> bool:
         ) from exc
 
     return True
+
+
+def delete_provider_lock_artifact(artifact_path: str) -> bool:
+    """Delete a provider lock artifact only if it belongs to the private directory."""
+    if not artifact_path:
+        return False
+
+    path = _resolve_artifact_path(artifact_path)
+
+    if path.suffixes[-2:] != [".lock", ".hcl"]:
+        raise TerraformArtifactError("LOCK_ARTIFACT_PATH_INVALID")
+
+    try:
+        path.unlink()
+    except OSError as exc:
+        raise TerraformArtifactError(
+            "LOCK_ARTIFACT_DELETE_FAILED"
+        ) from exc
+
+    return True
+
+
+
+def save_provider_lock_artifact(lock_bytes: bytes) -> tuple[str, str]:
+    """Save a Terraform provider lock file securely and return path and SHA-256."""
+
+    if not isinstance(lock_bytes, bytes) or not lock_bytes:
+        raise TerraformArtifactError("LOCK_ARTIFACT_CONTENT_INVALID")
+
+    directory = _artifact_directory()
+    artifact_path = directory / f"{secrets.token_hex(24)}.lock.hcl"
+
+    file_descriptor = None
+
+    try:
+        file_descriptor = os.open(
+            artifact_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+
+        with os.fdopen(file_descriptor, "wb") as artifact_file:
+            file_descriptor = None
+            artifact_file.write(lock_bytes)
+            artifact_file.flush()
+            os.fsync(artifact_file.fileno())
+
+    except OSError as exc:
+        if file_descriptor is not None:
+            os.close(file_descriptor)
+
+        try:
+            artifact_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+        raise TerraformArtifactError(
+            "LOCK_ARTIFACT_SAVE_FAILED"
+        ) from exc
+
+    checksum = hashlib.sha256(lock_bytes).hexdigest()
+
+    return str(artifact_path), checksum
+
+
+def load_provider_lock_artifact(
+    artifact_path: str,
+    expected_sha256: str,
+) -> bytes:
+    """Load a provider lock file only after verifying its SHA-256."""
+
+    if (
+        not isinstance(expected_sha256, str)
+        or len(expected_sha256) != 64
+        or any(
+            character not in "0123456789abcdefABCDEF"
+            for character in expected_sha256
+        )
+    ):
+        raise TerraformArtifactError("LOCK_ARTIFACT_CHECKSUM_INVALID")
+
+    path = _resolve_artifact_path(artifact_path)
+
+    if path.suffixes[-2:] != [".lock", ".hcl"]:
+        raise TerraformArtifactError("LOCK_ARTIFACT_PATH_INVALID")
+
+    try:
+        lock_bytes = path.read_bytes()
+    except OSError as exc:
+        raise TerraformArtifactError(
+            "LOCK_ARTIFACT_READ_FAILED"
+        ) from exc
+
+    actual_sha256 = hashlib.sha256(lock_bytes).hexdigest()
+
+    if not secrets.compare_digest(
+        actual_sha256,
+        expected_sha256.lower(),
+    ):
+        raise TerraformArtifactError(
+            "LOCK_ARTIFACT_CHECKSUM_MISMATCH"
+        )
+
+    return lock_bytes

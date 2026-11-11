@@ -1,6 +1,10 @@
 
 """Authenticated API for trusted Terraform plan generation."""
+
+import hashlib
+import json
 import os
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -13,16 +17,16 @@ from backend.app.models.terraform_plan import TerraformPlanRecord
 from backend.app.schemas.infrastructure import (
     ValidatedInfrastructureSpecification,
 )
+from backend.app.services.terraform.artifacts import (
+    delete_plan_artifact,
+    delete_provider_lock_artifact,
+)
+from backend.app.services.terraform.backend_config import (
+    build_s3_backend_config,
+)
 from backend.app.services.terraform.execution import (
     TerraformExecutionError,
     execute_terraform_plan,
-)
-from backend.app.services.terraform.artifacts import (
-    delete_plan_artifact,
-)
-
-from backend.app.services.terraform.backend_config import (
-    build_s3_backend_config,
 )
 from backend.app.services.terraform.state_manager import (
     TerraformStateError,
@@ -224,21 +228,24 @@ def create_trusted_terraform_plan(
         specification_fingerprint=result["specification_fingerprint"],
         artifact_path=result.get("artifact_path"),
         artifact_sha256=result.get("artifact_sha256"),
+        provider_lock_path=result.get("provider_lock_path"),
+        provider_lock_sha256=result.get("provider_lock_sha256"),
         plan_summary=result["plan_summary"],
     )
 
     db.add(record)
 
+    # Commit and refresh are deliberately separate operations.
+    # A refresh failure must not delete artifacts for a committed record.
     try:
         db.commit()
-        db.refresh(record)
-
     except Exception as exc:
         db.rollback()
 
-        # Remove the saved artifact if its database record cannot
-        # be persisted. Do not expose filesystem details to the client.
+        # Remove both saved artifacts if database persistence fails.
+        # Do not expose filesystem details to the client.
         artifact_path = result.get("artifact_path")
+        provider_lock_path = result.get("provider_lock_path")
 
         if artifact_path:
             try:
@@ -246,9 +253,26 @@ def create_trusted_terraform_plan(
             except Exception:
                 pass
 
+        if provider_lock_path:
+            try:
+                delete_provider_lock_artifact(provider_lock_path)
+            except Exception:
+                pass
+
         raise HTTPException(
             status_code=500,
             detail="Terraform plan record could not be saved.",
+        ) from exc
+
+    # The database record is already committed at this point.
+    try:
+        db.refresh(record)
+    except Exception as exc:
+        db.rollback()
+
+        raise HTTPException(
+            status_code=500,
+            detail="Terraform plan was saved but could not be refreshed.",
         ) from exc
 
     return {
@@ -267,8 +291,6 @@ def _fingerprint_specification(
     specification: ValidatedInfrastructureSpecification,
 ) -> str:
     """Use the same canonical representation as the execution service."""
-    import hashlib
-    import json
 
     payload = specification.model_dump(mode="json")
     canonical = json.dumps(
