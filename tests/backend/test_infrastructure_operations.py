@@ -474,6 +474,112 @@ def test_sync_rejects_archived_state(
         "Archived Terraform state cannot be synchronized."
     )
 
+def test_provision_rejects_deprovision_plan(
+    client,
+    setup_data,
+    monkeypatch,
+):
+    request_id = setup_data["request_id"]
+    requester_id = setup_data["requester_id"]
+
+    requirements = {
+        "cloud_provider": "aws",
+        "resource_type": "ec2",
+        "environment": "development",
+        "region": "ap-south-1",
+        "vcpus": 2,
+        "memory_gb": 4,
+        "public_access": False,
+        "operating_system": "Amazon Linux 2023",
+    }
+
+    specification = (
+        operations_api.ValidatedInfrastructureSpecification
+        .model_validate(requirements)
+    )
+
+    plan_checksum = "a" * 64
+
+    db = TestingSessionLocal()
+
+    try:
+        infrastructure_request = db.get(
+            InfrastructureRequest,
+            request_id,
+        )
+        infrastructure_request.requirements = requirements
+
+        plan = TerraformPlanRecord(
+            infrastructure_request_id=request_id,
+            requester_id=requester_id,
+            operation="deprovision",
+            status="succeeded",
+            plan_fingerprint=plan_checksum,
+            specification_fingerprint=(
+                operations_api.fingerprint_specification(specification)
+            ),
+            artifact_path="test-destroy-plan.tfplan",
+            artifact_sha256=plan_checksum,
+            plan_summary={},
+        )
+
+        db.add(plan)
+        db.flush()
+
+        approval = ApprovalRequest(
+            infrastructure_request_id=request_id,
+            terraform_plan_record_id=plan.id,
+            requester_id=requester_id,
+            status="approved",
+            plan_summary={},
+            plan_fingerprint=plan_checksum,
+        )
+
+        db.add(approval)
+        db.flush()
+
+        for stage in ("technical", "cost", "security"):
+            db.add(
+                ApprovalStageReview(
+                    approval_request_id=approval.id,
+                    stage=stage,
+                    status="approved",
+                )
+            )
+
+        approval_id = approval.id
+        db.commit()
+
+    finally:
+        db.close()
+
+    # The test focuses on lifecycle validation, not filesystem access.
+    monkeypatch.setattr(
+        operations_api,
+        "load_plan_artifact",
+        lambda *args, **kwargs: b"test-plan",
+    )
+
+    response = client.post(
+        "/infrastructure-operations/provision",
+        headers=setup_data["requester_headers"],
+        json={
+            "approval_request_id": approval_id,
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "Only provisioning plans can be provisioned."
+    )
+
+    # Confirm that no infrastructure operation was created.
+    db = TestingSessionLocal()
+    try:
+        operations = db.query(InfrastructureOperation).all()
+        assert operations == []
+    finally:
+        db.close()
 
 def test_provision_returns_409_for_database_uniqueness_conflict(
     client, setup_data, monkeypatch
@@ -857,7 +963,8 @@ def test_owner_can_sync_infrastructure_inventory(
         read_calls.append((client, bucket, key))
         return {
             "content": b"mock-terraform-state",
-            "sha256": "test-checksum",
+            "version_id": "test-version-1",
+            "sha256": "a" * 64,
         }
 
     resources = [
@@ -939,6 +1046,14 @@ def test_owner_can_sync_infrastructure_inventory(
         assert inventory.resource_id == "i-test123"
         assert inventory.state_serial == 1
         assert inventory.is_present is True
+        state_record = db.query(TerraformStateRecord).filter_by(
+            infrastructure_request_id=request_id
+        ).one()
+
+        assert state_record.state_version_id == "test-version-1"
+        assert state_record.state_serial == 1
+        assert state_record.state_lineage == "test-lineage"
+        assert state_record.state_sha256 == "a" * 64
     finally:
         db.close()
 
@@ -1120,7 +1235,13 @@ def test_empty_inventory_state_serial_is_persisted_and_protected(
 
         # Synchronize an empty state with serial 5.
         result = operations_api.sync_infrastructure_inventory(
-            db, request_id, 5, []
+            db,
+            request_id,
+            5,
+            [],
+            state_version_id="empty-state-version",
+            state_lineage="test-empty-lineage",
+            state_sha256="b" * 64,
         )
 
         assert result["total_resources"] == 0
@@ -1129,18 +1250,30 @@ def test_empty_inventory_state_serial_is_persisted_and_protected(
 
         db.refresh(state_record)
         assert state_record.state_serial == 5
+        assert state_record.state_version_id == "empty-state-version"
+        assert state_record.state_lineage == "test-empty-lineage"
+        assert state_record.state_sha256 == "b" * 64
 
-        # An older empty state must not overwrite serial 5.
+        # An older state must not overwrite the latest state metadata.
         with pytest.raises(
             operations_api.InfrastructureInventoryError,
             match="INVENTORY_STATE_SERIAL_STALE",
         ):
             operations_api.sync_infrastructure_inventory(
-                db, request_id, 4, []
+                db,
+                request_id,
+                4,
+                [],
+                state_version_id="older-version",
+                state_lineage="older-lineage",
+                state_sha256="c" * 64,
             )
 
         db.refresh(state_record)
         assert state_record.state_serial == 5
+        assert state_record.state_version_id == "empty-state-version"
+        assert state_record.state_lineage == "test-empty-lineage"
+        assert state_record.state_sha256 == "b" * 64
 
     finally:
         db.close()

@@ -586,6 +586,56 @@ def test_approval_uses_trusted_plan_record(
 
 
 
+def test_approval_rejects_duplicate_for_same_plan(
+    client, setup_data, valid_plan
+):
+    plan_record_id = create_trusted_plan_record(setup_data, valid_plan)
+
+    payload = {
+        "infrastructure_request_id": setup_data["infra_request_id"],
+        "terraform_plan_record_id": plan_record_id,
+    }
+
+    first_response = client.post(
+        "/approvals",
+        headers=setup_data["requester_headers"],
+        json=payload,
+    )
+    assert first_response.status_code == 201, first_response.text
+
+    second_response = client.post(
+        "/approvals",
+        headers=setup_data["requester_headers"],
+        json=payload,
+    )
+
+    assert second_response.status_code == 409
+    assert "already exists" in second_response.json()["detail"]
+
+
+def test_approval_allows_separate_plans_for_same_request(
+    client, setup_data, valid_plan
+):
+    first_plan_id = create_trusted_plan_record(setup_data, valid_plan)
+    second_plan_id = create_trusted_plan_record(setup_data, valid_plan)
+
+    response_ids = []
+
+    for plan_id in (first_plan_id, second_plan_id):
+        response = client.post(
+            "/approvals",
+            headers=setup_data["requester_headers"],
+            json={
+                "infrastructure_request_id": setup_data["infra_request_id"],
+                "terraform_plan_record_id": plan_id,
+            },
+        )
+
+        assert response.status_code == 201, response.text
+        response_ids.append(response.json()["id"])
+
+    assert response_ids[0] != response_ids[1]
+
 @pytest.mark.parametrize(
     "artifact_change,expected_detail",
     [
@@ -594,6 +644,7 @@ def test_approval_uses_trusted_plan_record(
         ("fingerprint_mismatch", "does not match its artifact"),
     ],
 )
+
 def test_approval_rejects_invalid_artifact_metadata(
     client,
     setup_data,

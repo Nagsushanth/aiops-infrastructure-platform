@@ -6,6 +6,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
+    Integer,
     JSON,
     String,
     Text,
@@ -35,6 +36,14 @@ class TerraformPlanRecord(Base):
         index=True,
     )
 
+    operation: Mapped[str] = mapped_column(
+        String(30),
+        nullable=False,
+        default="provision",
+        server_default="provision",
+        index=True,
+    )
+
     status: Mapped[str] = mapped_column(
         String(30),
         nullable=False,
@@ -51,6 +60,28 @@ class TerraformPlanRecord(Base):
     specification_fingerprint: Mapped[str] = mapped_column(
         String(64),
         nullable=False,
+    )
+
+    # Exact Terraform state snapshot used to generate a lifecycle plan.
+    # Nullable for compatibility with existing provisioning plan records.
+    state_version_id: Mapped[str | None] = mapped_column(
+        String(1024),
+        nullable=True,
+    )
+
+    state_serial: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+    )
+
+    state_lineage: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+    )
+
+    state_sha256: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
     )
 
     # Private filesystem reference; never return this through the API.

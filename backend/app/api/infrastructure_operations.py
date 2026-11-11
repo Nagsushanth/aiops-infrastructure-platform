@@ -200,6 +200,12 @@ def validate_approved_plan(
             detail="Trusted Terraform plan not found.",
         )
 
+    if plan.operation != "provision":
+        raise HTTPException(
+            status_code=409,
+            detail="Only provisioning plans can be provisioned.",
+        )
+
     if plan.status != "succeeded":
         raise HTTPException(
             status_code=409,
@@ -743,6 +749,9 @@ def synchronize_infrastructure_inventory(
             infrastructure_request_id,
             metadata["serial"],
             metadata["resources"],
+            state_version_id=state.get("version_id"),
+            state_lineage=metadata["lineage"],
+            state_sha256=state.get("sha256"),
         )
 
     except S3StateStorageError as exc:

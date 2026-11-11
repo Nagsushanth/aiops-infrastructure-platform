@@ -29,9 +29,11 @@ from backend.app.schemas.infrastructure import (
 from backend.app.services.terraform.execution import (
     TerraformExecutionError,
     execute_terraform_plan,
+    reconstructed_terraform_configuration_workspace,
     reconstructed_terraform_workspace,
     initialize_terraform_apply_workspace,
     build_terraform_environment,
+    execute_terraform_destroy_plan,
 )
 
 
@@ -806,6 +808,50 @@ terraform {
     assert not workspace_path.exists()
 
 
+def test_reconstructed_configuration_workspace_excludes_old_plan(
+    tmp_path,
+):
+    configuration = (
+        'terraform { required_version = ">= 1.10.0" }'
+    )
+    provider_lock = b"# Test provider lock file\n"
+
+    configuration_path, configuration_checksum = (
+        save_configuration_artifact(configuration)
+    )
+    lock_path, lock_checksum = save_provider_lock_artifact(
+        provider_lock
+    )
+
+    workspace_root = tmp_path / "workspaces"
+    workspace_root.mkdir()
+
+    with reconstructed_terraform_configuration_workspace(
+        configuration_artifact_path=configuration_path,
+        configuration_artifact_sha256=configuration_checksum,
+        provider_lock_path=lock_path,
+        provider_lock_sha256=lock_checksum,
+        temp_root=workspace_root,
+    ) as workspace:
+        assert (workspace / "main.tf").read_text() == configuration
+        assert (
+            workspace / ".terraform.lock.hcl"
+        ).read_bytes() == provider_lock
+
+        assert not (workspace / "tfplan").exists()
+
+        assert (
+            (workspace / "main.tf").stat().st_mode & 0o777
+        ) == 0o600
+
+        assert (
+            (workspace / ".terraform.lock.hcl").stat().st_mode & 0o777
+        ) == 0o600
+
+        workspace_path = workspace
+
+    assert not workspace_path.exists()
+
 def test_reconstructed_workspace_rejects_invalid_checksum(tmp_path):
     configuration_path, configuration_checksum = (
         save_configuration_artifact(
@@ -991,4 +1037,364 @@ def test_build_terraform_environment_uses_default_temp_directory(
     assert env["TMPDIR"] == str(tmp_path)
     assert env["TF_INPUT"] == "0"
 
+
+def test_generates_destroy_plan_without_executing_destroy(
+    monkeypatch,
+):
+    configuration = (
+        'terraform { required_version = ">= 1.10.0" }'
+    )
+    provider_lock = b"# Test provider lock file\n"
+
+    configuration_path, configuration_checksum = (
+        save_configuration_artifact(configuration)
+    )
+    lock_path, lock_checksum = save_provider_lock_artifact(
+        provider_lock
+    )
+
+    commands = []
+
+    def fake_run(
+        command,
+        *,
+        cwd,
+        timeout=None,
+        capture_output=False,
+        text=False,
+        check=False,
+        shell=False,
+        env=None,
+        **kwargs,
+    ):
+        commands.append(command)
+
+        if command[1] == "plan":
+            assert "-destroy" in command
+            (Path(cwd) / "tfplan").write_bytes(
+                b"mock-destroy-plan"
+            )
+
+        if command[1] == "show":
+            return completed_process(
+                stdout=json.dumps({"resource_changes": []})
+            )
+
+        return completed_process()
+
+    parsed_plan = {
+        "resources": [
+            {
+                "address": "aws_instance.this",
+                "mode": "managed",
+                "type": "aws_instance",
+                "name": "this",
+                "actions": ["delete"],
+            }
+        ],
+        "resource_summary": {"delete": 1},
+        "review_summary": {},
+        "dependency_analysis": {},
+        "terraform_version": "1.15.6",
+        "format_version": "1.2",
+    }
+
+    monkeypatch.setattr(
+        execution_module.subprocess,
+        "run",
+        fake_run,
+    )
+    monkeypatch.setattr(
+        execution_module,
+        "parse_terraform_plan",
+        lambda raw_plan: parsed_plan,
+    )
+    monkeypatch.setattr(
+        execution_module,
+        "evaluate_terraform_security",
+        lambda raw_plan: {"passed": True, "findings": []},
+    )
+
+    result = execute_terraform_destroy_plan(
+        configuration_artifact_path=configuration_path,
+        configuration_artifact_sha256=configuration_checksum,
+        provider_lock_path=lock_path,
+        provider_lock_sha256=lock_checksum,
+    )
+
+    assert [command[1] for command in commands] == [
+        "init",
+        "plan",
+        "show",
+    ]
+
+    assert result["status"] == "succeeded"
+    assert result["operation"] == "deprovision"
+    assert result["deployment_enabled"] is False
+    assert result["source_verified"] is False
+
+    saved_plan = load_plan_artifact(
+        result["artifact_path"],
+        result["artifact_sha256"],
+    )
+
+    assert saved_plan == b"mock-destroy-plan"
+    assert len(result["plan_fingerprint"]) == 64
+
+    assert not any(
+        command[1] in ("apply", "destroy")
+        for command in commands
+    )
+
+
+@pytest.mark.parametrize(
+    "unexpected_actions",
+    [
+        ["create"],
+        ["update"],
+        ["delete", "create"],
+        ["create", "delete"],
+    ],
+)
+def test_destroy_plan_rejects_unexpected_managed_actions(
+    monkeypatch,
+    unexpected_actions,
+):
+    configuration_path, configuration_checksum = (
+        save_configuration_artifact(
+            'terraform { required_version = ">= 1.10.0" }'
+        )
+    )
+    lock_path, lock_checksum = save_provider_lock_artifact(
+        b"# Test provider lock file\n"
+    )
+
+    def fake_run(command, *, cwd, **kwargs):
+        if command[1] == "plan":
+            (Path(cwd) / "tfplan").write_bytes(b"mock-plan")
+
+        if command[1] == "show":
+            return completed_process(
+                stdout=json.dumps({"resource_changes": []})
+            )
+
+        return completed_process()
+
+    parsed_plan = {
+        "resources": [
+            {
+                "address": "aws_instance.this",
+                "mode": "managed",
+                "type": "aws_instance",
+                "name": "this",
+                "actions": unexpected_actions,
+            }
+        ],
+        "resource_summary": {},
+        "review_summary": {},
+        "dependency_analysis": {},
+        "terraform_version": "1.15.6",
+        "format_version": "1.2",
+    }
+
+    monkeypatch.setattr(
+        execution_module.subprocess,
+        "run",
+        fake_run,
+    )
+    monkeypatch.setattr(
+        execution_module,
+        "parse_terraform_plan",
+        lambda raw_plan: parsed_plan,
+    )
+    monkeypatch.setattr(
+        execution_module,
+        "evaluate_terraform_security",
+        lambda raw_plan: {"passed": True, "findings": []},
+    )
+
+    with pytest.raises(TerraformExecutionError) as exc:
+        execute_terraform_destroy_plan(
+            configuration_artifact_path=configuration_path,
+            configuration_artifact_sha256=configuration_checksum,
+            provider_lock_path=lock_path,
+            provider_lock_sha256=lock_checksum,
+        )
+
+    assert exc.value.code == "DESTROY_PLAN_UNEXPECTED_ACTION"
+
+
+def test_destroy_plan_rejects_empty_managed_deletions(
+    monkeypatch,
+):
+    configuration_path, configuration_checksum = (
+        save_configuration_artifact(
+            'terraform { required_version = ">= 1.10.0" }'
+        )
+    )
+    lock_path, lock_checksum = save_provider_lock_artifact(
+        b"# Test provider lock file\n"
+    )
+
+    def fake_run(command, *, cwd, **kwargs):
+        if command[1] == "plan":
+            (Path(cwd) / "tfplan").write_bytes(b"mock-plan")
+
+        if command[1] == "show":
+            return completed_process(
+                stdout=json.dumps({"resource_changes": []})
+            )
+
+        return completed_process()
+
+    parsed_plan = {
+        "resources": [
+            {
+                "address": "aws_instance.this",
+                "mode": "managed",
+                "type": "aws_instance",
+                "name": "this",
+                "actions": ["no-op"],
+            }
+        ],
+        "resource_summary": {},
+        "review_summary": {},
+        "dependency_analysis": {},
+        "terraform_version": "1.15.6",
+        "format_version": "1.2",
+    }
+
+    monkeypatch.setattr(
+        execution_module.subprocess,
+        "run",
+        fake_run,
+    )
+    monkeypatch.setattr(
+        execution_module,
+        "parse_terraform_plan",
+        lambda raw_plan: parsed_plan,
+    )
+    monkeypatch.setattr(
+        execution_module,
+        "evaluate_terraform_security",
+        lambda raw_plan: {"passed": True, "findings": []},
+    )
+
+    with pytest.raises(TerraformExecutionError) as exc:
+        execute_terraform_destroy_plan(
+            configuration_artifact_path=configuration_path,
+            configuration_artifact_sha256=configuration_checksum,
+            provider_lock_path=lock_path,
+            provider_lock_sha256=lock_checksum,
+        )
+
+    assert exc.value.code == "DESTROY_PLAN_NO_RESOURCES"
+
+
+def test_destroy_plan_allows_data_source_reads(
+    monkeypatch,
+):
+    configuration_path, configuration_checksum = (
+        save_configuration_artifact(
+            'terraform { required_version = ">= 1.10.0" }'
+        )
+    )
+    lock_path, lock_checksum = save_provider_lock_artifact(
+        b"# Test provider lock file\n"
+    )
+
+    captured_security_plan = {}
+
+    def fake_run(command, *, cwd, **kwargs):
+        if command[1] == "plan":
+            (Path(cwd) / "tfplan").write_bytes(b"mock-plan")
+
+        if command[1] == "show":
+            return completed_process(
+                stdout=json.dumps(
+                    {
+                        "resource_changes": [
+                            {
+                                "address": "aws_instance.this",
+                                "mode": "managed",
+                                "type": "aws_instance",
+                                "name": "this",
+                                "change": {
+                                    "actions": ["delete"],
+                                },
+                            },
+                            {
+                                "address": "data.aws_ami.example",
+                                "mode": "data",
+                                "type": "aws_ami",
+                                "name": "example",
+                                "change": {
+                                    "actions": ["read"],
+                                },
+                            },
+                        ]
+                    }
+                )
+            )
+
+        return completed_process()
+
+    parsed_plan = {
+        "resources": [
+            {
+                "address": "aws_instance.this",
+                "mode": "managed",
+                "type": "aws_instance",
+                "name": "this",
+                "actions": ["delete"],
+            },
+            {
+                "address": "data.aws_ami.example",
+                "mode": "data",
+                "type": "aws_ami",
+                "name": "example",
+                "actions": ["read"],
+            },
+        ],
+        "resource_summary": {"delete": 1},
+        "review_summary": {},
+        "dependency_analysis": {},
+        "terraform_version": "1.15.6",
+        "format_version": "1.2",
+    }
+
+    monkeypatch.setattr(
+        execution_module.subprocess,
+        "run",
+        fake_run,
+    )
+    monkeypatch.setattr(
+        execution_module,
+        "parse_terraform_plan",
+        lambda raw_plan: parsed_plan,
+    )
+
+    def fake_security_evaluation(raw_plan):
+        captured_security_plan.update(raw_plan)
+        return {"passed": True, "findings": []}
+
+    monkeypatch.setattr(
+        execution_module,
+        "evaluate_terraform_security",
+        fake_security_evaluation,
+    )
+
+    result = execute_terraform_destroy_plan(
+        configuration_artifact_path=configuration_path,
+        configuration_artifact_sha256=configuration_checksum,
+        provider_lock_path=lock_path,
+        provider_lock_sha256=lock_checksum,
+    )
+
+    assert result["status"] == "succeeded"
+    assert len(captured_security_plan["resource_changes"]) == 1
+    assert (
+        captured_security_plan["resource_changes"][0]["mode"]
+        == "managed"
+    )
 

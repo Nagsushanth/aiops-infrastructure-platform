@@ -17,6 +17,8 @@ from dotenv import load_dotenv
 from backend.app.services.terraform.artifacts import (
     TerraformArtifactError,
     delete_configuration_artifact,
+    delete_plan_artifact,
+    delete_provider_lock_artifact,
     load_configuration_artifact,
     load_plan_artifact,
     load_provider_lock_artifact,
@@ -49,9 +51,6 @@ from backend.app.services.terraform.generator import (
 from backend.app.services.terraform.cost_estimator import (
     estimate_ec2_monthly_cost,
 )
-from contextlib import contextmanager
-from collections.abc import Iterator
-
 
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
 load_dotenv(PROJECT_ROOT / ".env")
@@ -525,6 +524,68 @@ def reconstructed_terraform_workspace(
         yield workspace
 
 
+@contextmanager
+def reconstructed_terraform_configuration_workspace(
+    *,
+    configuration_artifact_path: str,
+    configuration_artifact_sha256: str,
+    provider_lock_path: str,
+    provider_lock_sha256: str,
+    temp_root: Path | None = None,
+) -> Iterator[Path]:
+    """Reconstruct a workspace without reusing an existing binary plan."""
+
+    try:
+        configuration = load_configuration_artifact(
+            configuration_artifact_path,
+            configuration_artifact_sha256,
+        )
+        provider_lock = load_provider_lock_artifact(
+            provider_lock_path,
+            provider_lock_sha256,
+        )
+    except TerraformArtifactError as exc:
+        raise TerraformExecutionError(
+            "WORKSPACE_ARTIFACT_VALIDATION_FAILED"
+        ) from exc
+
+    if not configuration.strip() or not provider_lock:
+        raise TerraformExecutionError(
+            "WORKSPACE_ARTIFACT_CONTENT_INVALID"
+        )
+
+    with tempfile.TemporaryDirectory(
+        prefix="aiops-terraform-destroy-",
+        dir=temp_root,
+    ) as temp:
+        workspace = Path(temp)
+
+        files = {
+            "main.tf": configuration.encode("utf-8"),
+            ".terraform.lock.hcl": provider_lock,
+        }
+
+        try:
+            for filename, content in files.items():
+                file_path = workspace / filename
+                file_descriptor = os.open(
+                    file_path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+
+                with os.fdopen(file_descriptor, "wb") as file:
+                    file.write(content)
+                    file.flush()
+                    os.fsync(file.fileno())
+
+        except OSError as exc:
+            raise TerraformExecutionError(
+                "WORKSPACE_RECONSTRUCTION_FAILED"
+            ) from exc
+
+        yield workspace
+
 def initialize_terraform_apply_workspace(
     workspace: Path,
     *,
@@ -820,3 +881,197 @@ def execute_terraform_plan(
             "configuration_artifact_path": configuration_artifact_path,
             "configuration_artifact_sha256": configuration_artifact_sha256,
         }
+
+
+def execute_terraform_destroy_plan(
+    *,
+    configuration_artifact_path: str,
+    configuration_artifact_sha256: str,
+    provider_lock_path: str,
+    provider_lock_sha256: str,
+    timeout_seconds: int = 180,
+) -> dict[str, Any]:
+    """Generate and persist a Terraform destroy plan without executing it."""
+
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, int)
+        or not 1 <= timeout_seconds <= 600
+    ):
+        raise ValueError(
+            "timeout_seconds must be an integer between 1 and 600."
+        )
+
+    env, temp_root = build_terraform_environment()
+
+    try:
+        with reconstructed_terraform_configuration_workspace(
+            configuration_artifact_path=configuration_artifact_path,
+            configuration_artifact_sha256=configuration_artifact_sha256,
+            provider_lock_path=provider_lock_path,
+            provider_lock_sha256=provider_lock_sha256,
+            temp_root=temp_root,
+        ) as workspace:
+
+            # Initialize using the exact saved provider lock.
+            _run(
+                [
+                    "terraform",
+                    "init",
+                    "-input=false",
+                    "-no-color",
+                    "-lockfile=readonly",
+                ],
+                cwd=workspace,
+                timeout_seconds=timeout_seconds,
+                env=env,
+            )
+
+            # Generate a destroy plan only. Never execute it.
+            _run(
+                [
+                    "terraform",
+                    "plan",
+                    "-destroy",
+                    "-input=false",
+                    "-no-color",
+                    "-out=tfplan",
+                ],
+                cwd=workspace,
+                timeout_seconds=timeout_seconds,
+                env=env,
+            )
+
+            plan_file = workspace / "tfplan"
+
+            if not plan_file.is_file():
+                raise TerraformExecutionError(
+                    "DESTROY_PLAN_ARTIFACT_MISSING"
+                )
+
+            plan_bytes = plan_file.read_bytes()
+
+            if not plan_bytes:
+                raise TerraformExecutionError(
+                    "DESTROY_PLAN_ARTIFACT_EMPTY"
+                )
+
+            plan_fingerprint = _sha256(plan_bytes)
+
+            shown = _run(
+                ["terraform", "show", "-json", "tfplan"],
+                cwd=workspace,
+                timeout_seconds=timeout_seconds,
+                env=env,
+            )
+
+            try:
+                raw_plan = json.loads(shown.stdout)
+                parsed = parse_terraform_plan(raw_plan)
+                # Evaluate managed resources only. Data-source reads are not
+                # infrastructure resources being destroyed.
+                destroy_security_plan = {
+                    **raw_plan,
+                    "resource_changes": [
+                        resource
+                        for resource in raw_plan.get("resource_changes", [])
+                        if isinstance(resource, dict)
+                        and resource.get("mode", "managed") == "managed"
+                    ],
+                }
+
+                security_analysis = evaluate_terraform_security(
+                    destroy_security_plan
+                )
+            except (
+                json.JSONDecodeError,
+                TerraformPlanParsingError,
+                ValueError,
+            ) as exc:
+                raise TerraformExecutionError(
+                    "DESTROY_PLAN_PARSE_FAILED"
+                ) from exc
+
+            resources = parsed["resources"]
+
+            # Only pure managed-resource deletions are allowed.
+            # Data-source reads and no-op entries are harmless.
+            for resource in resources:
+                actions = resource.get("actions")
+                mode = resource.get("mode")
+
+                if mode == "managed":
+                    if actions not in (["delete"], ["no-op"]):
+                        raise TerraformExecutionError(
+                            "DESTROY_PLAN_UNEXPECTED_ACTION"
+                        )
+                elif mode == "data":
+                    if actions not in (["read"], ["no-op"]):
+                        raise TerraformExecutionError(
+                            "DESTROY_PLAN_UNEXPECTED_DATA_ACTION"
+                        )
+                else:
+                    raise TerraformExecutionError(
+                        "DESTROY_PLAN_RESOURCE_MODE_INVALID"
+                    )
+
+            managed_deletions = [
+                resource
+                for resource in resources
+                if resource.get("mode") == "managed"
+                and resource.get("actions") == ["delete"]
+            ]
+
+            if not managed_deletions:
+                raise TerraformExecutionError(
+                    "DESTROY_PLAN_NO_RESOURCES"
+                )
+
+            summary = {
+                "operation": "deprovision",
+                "resource_summary": parsed["resource_summary"],
+                "resources": [
+                    {
+                        "address": resource.get("address"),
+                        "mode": resource.get("mode"),
+                        "type": resource.get("type"),
+                        "name": resource.get("name"),
+                        "actions": resource.get("actions"),
+                    }
+                    for resource in resources
+                ],
+                "review_summary": parsed["review_summary"],
+                "dependency_analysis": parsed["dependency_analysis"],
+                "security_analysis": security_analysis,
+                "terraform_version": parsed.get("terraform_version"),
+                "format_version": parsed.get("format_version"),
+                "deployment_enabled": False,
+            }
+
+            try:
+                artifact_path, artifact_sha256 = save_plan_artifact(
+                    plan_bytes
+                )
+            except (OSError, TerraformArtifactError) as exc:
+                raise TerraformExecutionError(
+                    "DESTROY_PLAN_ARTIFACT_SAVE_FAILED"
+                ) from exc
+
+            return {
+                "status": "succeeded",
+                "operation": "deprovision",
+                "is_real_terraform_plan": True,
+                "source_verified": False,
+                "deployment_enabled": False,
+                "plan_fingerprint": plan_fingerprint,
+                "plan_summary": summary,
+                "artifact_path": artifact_path,
+                "artifact_sha256": artifact_sha256,
+            }
+
+    except TerraformExecutionError:
+        raise
+    except (OSError, TerraformArtifactError) as exc:
+        raise TerraformExecutionError(
+            "DESTROY_PLAN_ARTIFACT_VALIDATION_FAILED"
+        ) from exc

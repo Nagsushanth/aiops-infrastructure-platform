@@ -19,6 +19,9 @@ def sync_infrastructure_inventory(
     infrastructure_request_id: int,
     state_serial: int,
     resources: list[dict],
+    state_version_id: str | None = None,
+    state_lineage: str | None = None,
+    state_sha256: str | None = None,
 ) -> dict[str, int]:
     """Synchronize resources from a validated Terraform state."""
 
@@ -38,6 +41,27 @@ def sync_infrastructure_inventory(
 
     if not isinstance(resources, list):
         raise InfrastructureInventoryError("INVENTORY_RESOURCES_INVALID")
+
+    if state_version_id is not None and (
+        not isinstance(state_version_id, str)
+        or not state_version_id.strip()
+        or len(state_version_id) > 1024
+    ):
+        raise InfrastructureInventoryError("STATE_VERSION_ID_INVALID")
+
+    if state_lineage is not None and (
+        not isinstance(state_lineage, str)
+        or not state_lineage.strip()
+        or len(state_lineage) > 64
+    ):
+        raise InfrastructureInventoryError("STATE_LINEAGE_INVALID")
+
+    if state_sha256 is not None and (
+        not isinstance(state_sha256, str)
+        or len(state_sha256) != 64
+        or any(char not in "0123456789abcdef" for char in state_sha256.lower())
+    ):
+        raise InfrastructureInventoryError("STATE_SHA256_INVALID")
 
     # Validate the complete input before modifying inventory rows.
     required_fields = {
@@ -220,7 +244,10 @@ def sync_infrastructure_inventory(
                 marked_absent += 1
 
         # Persist the serial even when the state contains zero resources.
+        state_record.state_version_id = state_version_id
         state_record.state_serial = state_serial
+        state_record.state_lineage = state_lineage
+        state_record.state_sha256 = state_sha256
 
         db.commit()
 

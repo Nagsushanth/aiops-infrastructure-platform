@@ -1,10 +1,9 @@
-
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
-
+import os
 from backend.app.main import app
 from backend.app.core.dependencies import get_db
 from backend.app.core.security import create_access_token
@@ -514,5 +513,943 @@ def test_backend_initialization_failure_preserves_active_state(
         ).one()
 
         assert state_record.status == "active"
+    finally:
+        db.close()
+
+def test_destroy_plan_requires_successful_provisioning_plan(
+    client,
+    setup_data,
+    monkeypatch,
+):
+    def must_not_run(**kwargs):
+        pytest.fail(
+            "Destroy planning must not run without a successful "
+            "provisioning plan"
+        )
+
+    monkeypatch.setattr(
+        terraform_plans_api,
+        "execute_terraform_destroy_plan",
+        must_not_run,
+    )
+
+    response = client.post(
+        (
+            f"/terraform/requests/"
+            f"{setup_data['request_id']}/destroy-plan"
+        ),
+        headers=setup_data["requester_headers"],
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "No successful provisioning plan is available."
+    )
+
+def test_another_user_cannot_generate_destroy_plan(
+    client,
+    setup_data,
+    monkeypatch,
+):
+    def must_not_run(**kwargs):
+        pytest.fail(
+            "Destroy planning must not run for another user"
+        )
+
+    monkeypatch.setattr(
+        terraform_plans_api,
+        "execute_terraform_destroy_plan",
+        must_not_run,
+    )
+
+    response = client.post(
+        (
+            f"/terraform/requests/"
+            f"{setup_data['request_id']}/destroy-plan"
+        ),
+        headers=setup_data["other_user_headers"],
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == (
+        "Infrastructure request not found."
+    )
+
+def test_destroy_plan_requires_state_record(
+    client,
+    setup_data,
+    monkeypatch,
+):
+    db = TestingSessionLocal()
+
+    try:
+        source_plan = TerraformPlanRecord(
+            infrastructure_request_id=setup_data["request_id"],
+            requester_id=setup_data["requester_id"],
+            operation="provision",
+            status="succeeded",
+            plan_fingerprint="b" * 64,
+            specification_fingerprint="a" * 64,
+            artifact_path="/tmp/source.tfplan",
+            artifact_sha256="c" * 64,
+            configuration_artifact_path="/tmp/source-config.tar",
+            configuration_artifact_sha256="d" * 64,
+            provider_lock_path="/tmp/source-lock.hcl",
+            provider_lock_sha256="e" * 64,
+            plan_summary={},
+        )
+
+        db.add(source_plan)
+        db.commit()
+    finally:
+        db.close()
+
+    def must_not_run(**kwargs):
+        pytest.fail("Terraform must not run without a state record")
+
+    monkeypatch.setattr(
+        terraform_plans_api,
+        "execute_terraform_destroy_plan",
+        must_not_run,
+    )
+
+    response = client.post(
+        (
+            f"/terraform/requests/"
+            f"{setup_data['request_id']}/destroy-plan"
+        ),
+        headers=setup_data["requester_headers"],
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "Terraform state record not found."
+    )
+
+def test_destroy_plan_rejects_inactive_state(
+    client,
+    setup_data,
+    monkeypatch,
+):
+    db = TestingSessionLocal()
+
+    try:
+        source_plan = TerraformPlanRecord(
+            infrastructure_request_id=setup_data["request_id"],
+            requester_id=setup_data["requester_id"],
+            operation="provision",
+            status="succeeded",
+            plan_fingerprint="b" * 64,
+            specification_fingerprint="a" * 64,
+            artifact_path="/tmp/source.tfplan",
+            artifact_sha256="c" * 64,
+            configuration_artifact_path="/tmp/source-config.tar",
+            configuration_artifact_sha256="d" * 64,
+            provider_lock_path="/tmp/source-lock.hcl",
+            provider_lock_sha256="e" * 64,
+            plan_summary={},
+        )
+
+        state_record = TerraformStateRecord(
+            infrastructure_request_id=setup_data["request_id"],
+            backend_type="s3",
+            state_bucket=os.getenv("TF_STATE_BUCKET"),
+            state_key=(
+                f"{os.getenv('TF_STATE_PREFIX').rstrip('/')}/"
+                f"{setup_data['request_id']}/terraform.tfstate"
+            ),
+            state_region=os.getenv("TF_STATE_REGION"),
+            status="initializing",
+        )
+
+        db.add_all([source_plan, state_record])
+        db.commit()
+    finally:
+        db.close()
+
+    def must_not_run(**kwargs):
+        pytest.fail(
+            "Terraform destroy planning must not run "
+            "with inactive state"
+        )
+
+    monkeypatch.setattr(
+        terraform_plans_api,
+        "execute_terraform_destroy_plan",
+        must_not_run,
+    )
+
+    response = client.post(
+        (
+            f"/terraform/requests/"
+            f"{setup_data['request_id']}/destroy-plan"
+        ),
+        headers=setup_data["requester_headers"],
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "Terraform state is not active."
+    )
+
+def test_destroy_plan_rejects_incomplete_state_snapshot(
+    client,
+    setup_data,
+    monkeypatch,
+):
+    db = TestingSessionLocal()
+
+    try:
+        source_plan = TerraformPlanRecord(
+            infrastructure_request_id=setup_data["request_id"],
+            requester_id=setup_data["requester_id"],
+            operation="provision",
+            status="succeeded",
+            plan_fingerprint="b" * 64,
+            specification_fingerprint="a" * 64,
+            artifact_path="/tmp/source.tfplan",
+            artifact_sha256="c" * 64,
+            configuration_artifact_path="/tmp/source-config.tar",
+            configuration_artifact_sha256="d" * 64,
+            provider_lock_path="/tmp/source-lock.hcl",
+            provider_lock_sha256="e" * 64,
+            plan_summary={},
+        )
+
+        state_record = TerraformStateRecord(
+            infrastructure_request_id=setup_data["request_id"],
+            backend_type="s3",
+            state_bucket=os.getenv("TF_STATE_BUCKET"),
+            state_key=(
+                f"{os.getenv('TF_STATE_PREFIX').rstrip('/')}/"
+                f"{setup_data['request_id']}/terraform.tfstate"
+            ),
+            state_region=os.getenv("TF_STATE_REGION"),
+            status="active",
+        )
+
+        db.add_all([source_plan, state_record])
+        db.commit()
+    finally:
+        db.close()
+
+    def must_not_run(*args, **kwargs):
+        pytest.fail(
+            "AWS or Terraform must not run with an incomplete state snapshot"
+        )
+
+    monkeypatch.setattr(
+        terraform_plans_api,
+        "create_s3_client",
+        lambda region: object(),
+    )
+
+    monkeypatch.setattr(
+        terraform_plans_api,
+        "read_state_object",
+        must_not_run,
+    )
+
+    monkeypatch.setattr(
+        terraform_plans_api,
+        "execute_terraform_destroy_plan",
+        must_not_run,
+    )
+
+    response = client.post(
+        (
+            f"/terraform/requests/"
+            f"{setup_data['request_id']}/destroy-plan"
+        ),
+        headers=setup_data["requester_headers"],
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "Terraform state snapshot is incomplete."
+    )
+
+def test_destroy_plan_rejects_stale_state_snapshot(
+    client,
+    setup_data,
+    monkeypatch,
+):
+    db = TestingSessionLocal()
+
+    try:
+        source_plan = TerraformPlanRecord(
+            infrastructure_request_id=setup_data["request_id"],
+            requester_id=setup_data["requester_id"],
+            operation="provision",
+            status="succeeded",
+            plan_fingerprint="b" * 64,
+            specification_fingerprint="a" * 64,
+            artifact_path="/tmp/source.tfplan",
+            artifact_sha256="c" * 64,
+            configuration_artifact_path="/tmp/source-config.tar",
+            configuration_artifact_sha256="d" * 64,
+            provider_lock_path="/tmp/source-lock.hcl",
+            provider_lock_sha256="e" * 64,
+            plan_summary={},
+        )
+
+        state_record = TerraformStateRecord(
+            infrastructure_request_id=setup_data["request_id"],
+            backend_type="s3",
+            state_bucket=os.getenv("TF_STATE_BUCKET"),
+            state_key=(
+                f"{os.getenv('TF_STATE_PREFIX').rstrip('/')}/"
+                f"{setup_data['request_id']}/terraform.tfstate"
+            ),
+            state_region=os.getenv("TF_STATE_REGION"),
+            status="active",
+            state_version_id="old-version",
+            state_serial=5,
+            state_lineage="12345678-1234-4234-8234-123456789abc",
+            state_sha256="a" * 64,
+        )
+
+        db.add_all([source_plan, state_record])
+        db.commit()
+    finally:
+        db.close()
+
+    monkeypatch.setattr(
+        terraform_plans_api,
+        "create_s3_client",
+        lambda region: object(),
+    )
+
+    monkeypatch.setattr(
+        terraform_plans_api,
+        "read_state_object",
+        lambda *args, **kwargs: {
+            "content": b'{"version":4,"serial":6,"lineage":"12345678-1234-4234-8234-123456789abc","resources":[]}',
+            "version_id": "new-version",
+            "sha256": "b" * 64,
+        },
+    )
+
+    monkeypatch.setattr(
+        terraform_plans_api,
+        "execute_terraform_destroy_plan",
+        lambda **kwargs: pytest.fail(
+            "Terraform must not run when the state snapshot is stale"
+        ),
+    )
+
+    response = client.post(
+        (
+            f"/terraform/requests/"
+            f"{setup_data['request_id']}/destroy-plan"
+        ),
+        headers=setup_data["requester_headers"],
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "Terraform state has changed. Synchronize inventory before continuing."
+    )
+
+def test_destroy_plan_handles_s3_state_read_failure(
+    client,
+    setup_data,
+    monkeypatch,
+):
+    from backend.app.services.terraform.s3_state_storage import (
+        S3StateStorageError,
+    )
+
+    db = TestingSessionLocal()
+
+    try:
+        source_plan = TerraformPlanRecord(
+            infrastructure_request_id=setup_data["request_id"],
+            requester_id=setup_data["requester_id"],
+            operation="provision",
+            status="succeeded",
+            plan_fingerprint="b" * 64,
+            specification_fingerprint="a" * 64,
+            artifact_path="/tmp/source.tfplan",
+            artifact_sha256="c" * 64,
+            configuration_artifact_path="/tmp/source-config.tar",
+            configuration_artifact_sha256="d" * 64,
+            provider_lock_path="/tmp/source-lock.hcl",
+            provider_lock_sha256="e" * 64,
+            plan_summary={},
+        )
+
+        state_record = TerraformStateRecord(
+            infrastructure_request_id=setup_data["request_id"],
+            backend_type="s3",
+            state_bucket=os.getenv("TF_STATE_BUCKET"),
+            state_key=(
+                f"{os.getenv('TF_STATE_PREFIX').rstrip('/')}/"
+                f"{setup_data['request_id']}/terraform.tfstate"
+            ),
+            state_region=os.getenv("TF_STATE_REGION"),
+            status="active",
+            state_version_id="version-1",
+            state_serial=5,
+            state_lineage="12345678-1234-4234-8234-123456789abc",
+            state_sha256="a" * 64,
+        )
+
+        db.add_all([source_plan, state_record])
+        db.commit()
+    finally:
+        db.close()
+
+    monkeypatch.setattr(
+        terraform_plans_api,
+        "create_s3_client",
+        lambda region: object(),
+    )
+
+    def fail_state_read(*args, **kwargs):
+        raise S3StateStorageError("S3_STATE_READ_FAILED")
+
+    monkeypatch.setattr(
+        terraform_plans_api,
+        "read_state_object",
+        fail_state_read,
+    )
+
+    monkeypatch.setattr(
+        terraform_plans_api,
+        "execute_terraform_destroy_plan",
+        lambda **kwargs: pytest.fail(
+            "Terraform must not run when S3 state reading fails"
+        ),
+    )
+
+    response = client.post(
+        (
+            f"/terraform/requests/"
+            f"{setup_data['request_id']}/destroy-plan"
+        ),
+        headers=setup_data["requester_headers"],
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == (
+        "Terraform state could not be verified."
+    )
+
+def test_destroy_plan_handles_terraform_execution_failure(
+    client,
+    setup_data,
+    monkeypatch,
+):
+    from backend.app.services.terraform.execution import (
+        TerraformExecutionError,
+    )
+
+    db = TestingSessionLocal()
+    try:
+        source_plan = TerraformPlanRecord(
+            infrastructure_request_id=setup_data["request_id"],
+            requester_id=setup_data["requester_id"],
+            operation="provision",
+            status="succeeded",
+            plan_fingerprint="b" * 64,
+            specification_fingerprint="a" * 64,
+            artifact_path="/tmp/source.tfplan",
+            artifact_sha256="c" * 64,
+            configuration_artifact_path="/tmp/source-config.tar",
+            configuration_artifact_sha256="d" * 64,
+            provider_lock_path="/tmp/source-lock.hcl",
+            provider_lock_sha256="e" * 64,
+            plan_summary={},
+        )
+
+        state_record = TerraformStateRecord(
+            infrastructure_request_id=setup_data["request_id"],
+            backend_type="s3",
+            state_bucket=os.getenv("TF_STATE_BUCKET"),
+            state_key=(
+                f"{os.getenv('TF_STATE_PREFIX').rstrip('/')}/"
+                f"{setup_data['request_id']}/terraform.tfstate"
+            ),
+            state_region=os.getenv("TF_STATE_REGION"),
+            status="active",
+            state_version_id="version-1",
+            state_serial=5,
+            state_lineage="12345678-1234-4234-8234-123456789abc",
+            state_sha256="a" * 64,
+        )
+
+        db.add_all([source_plan, state_record])
+        db.commit()
+    finally:
+        db.close()
+
+    monkeypatch.setattr(
+        terraform_plans_api,
+        "create_s3_client",
+        lambda region: object(),
+    )
+
+    monkeypatch.setattr(
+        terraform_plans_api,
+        "read_state_object",
+        lambda *args, **kwargs: {
+            "content": (
+                b'{"version":4,"serial":5,'
+                b'"lineage":"12345678-1234-4234-8234-123456789abc",'
+                b'"resources":[]}'
+            ),
+            "version_id": "version-1",
+            "sha256": "a" * 64,
+        },
+    )
+
+    def fail_destroy_plan(**kwargs):
+        raise TerraformExecutionError(
+            "DESTROY_PLAN_FAILED"
+        )
+
+    monkeypatch.setattr(
+        terraform_plans_api,
+        "execute_terraform_destroy_plan",
+        fail_destroy_plan,
+    )
+
+    response = client.post(
+        (
+            f"/terraform/requests/"
+            f"{setup_data['request_id']}/destroy-plan"
+        ),
+        headers=setup_data["requester_headers"],
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == {
+        "message": "Terraform destroy-plan generation failed.",
+        "error_code": "DESTROY_PLAN_FAILED",
+    }
+
+    db = TestingSessionLocal()
+    try:
+        destroy_plans = db.scalars(
+            select(TerraformPlanRecord).where(
+                TerraformPlanRecord.infrastructure_request_id
+                == setup_data["request_id"],
+                TerraformPlanRecord.operation == "deprovision",
+            )
+        ).all()
+
+        assert destroy_plans == []
+    finally:
+        db.close()
+
+
+def test_destroy_plan_rejects_state_change_during_generation(
+    client,
+    setup_data,
+    monkeypatch,
+):
+    db = TestingSessionLocal()
+    try:
+        source_plan = TerraformPlanRecord(
+            infrastructure_request_id=setup_data["request_id"],
+            requester_id=setup_data["requester_id"],
+            operation="provision",
+            status="succeeded",
+            plan_fingerprint="b" * 64,
+            specification_fingerprint="a" * 64,
+            artifact_path="/tmp/source.tfplan",
+            artifact_sha256="c" * 64,
+            configuration_artifact_path="/tmp/source-config.tar",
+            configuration_artifact_sha256="d" * 64,
+            provider_lock_path="/tmp/source-lock.hcl",
+            provider_lock_sha256="e" * 64,
+            plan_summary={},
+        )
+
+        state_record = TerraformStateRecord(
+            infrastructure_request_id=setup_data["request_id"],
+            backend_type="s3",
+            state_bucket=os.getenv("TF_STATE_BUCKET"),
+            state_key=(
+                f"{os.getenv('TF_STATE_PREFIX').rstrip('/')}/"
+                f"{setup_data['request_id']}/terraform.tfstate"
+            ),
+            state_region=os.getenv("TF_STATE_REGION"),
+            status="active",
+            state_version_id="version-1",
+            state_serial=5,
+            state_lineage="12345678-1234-4234-8234-123456789abc",
+            state_sha256="a" * 64,
+        )
+
+        db.add_all([source_plan, state_record])
+        db.commit()
+    finally:
+        db.close()
+
+    monkeypatch.setattr(
+        terraform_plans_api,
+        "create_s3_client",
+        lambda region: object(),
+    )
+
+    state_reads = {"count": 0}
+
+    def read_changing_state(*args, **kwargs):
+        state_reads["count"] += 1
+
+        if state_reads["count"] == 1:
+            return {
+                "content": (
+                    b'{"version":4,"serial":5,'
+                    b'"lineage":"12345678-1234-4234-8234-123456789abc",'
+                    b'"resources":[]}'
+                ),
+                "version_id": "version-1",
+                "sha256": "a" * 64,
+            }
+
+        return {
+            "content": (
+                b'{"version":4,"serial":6,'
+                b'"lineage":"12345678-1234-4234-8234-123456789abc",'
+                b'"resources":[]}'
+            ),
+            "version_id": "version-2",
+            "sha256": "f" * 64,
+        }
+
+    monkeypatch.setattr(
+        terraform_plans_api,
+        "read_state_object",
+        read_changing_state,
+    )
+
+    artifact_path = "/tmp/generated-destroy.tfplan"
+
+    monkeypatch.setattr(
+        terraform_plans_api,
+        "execute_terraform_destroy_plan",
+        lambda **kwargs: {
+            "plan_fingerprint": "f" * 64,
+            "plan_summary": {},
+            "artifact_path": artifact_path,
+            "artifact_sha256": "e" * 64,
+        },
+    )
+
+    deleted_artifacts = []
+
+    monkeypatch.setattr(
+        terraform_plans_api,
+        "delete_plan_artifact",
+        lambda path: deleted_artifacts.append(path),
+    )
+
+    response = client.post(
+        (
+            f"/terraform/requests/"
+            f"{setup_data['request_id']}/destroy-plan"
+        ),
+        headers=setup_data["requester_headers"],
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "Terraform state has changed. Synchronize inventory before continuing."
+    )
+
+    assert state_reads["count"] == 2
+    assert deleted_artifacts == [artifact_path]
+
+    db = TestingSessionLocal()
+    try:
+        destroy_plans = db.scalars(
+            select(TerraformPlanRecord).where(
+                TerraformPlanRecord.infrastructure_request_id
+                == setup_data["request_id"],
+                TerraformPlanRecord.operation == "deprovision",
+            )
+        ).all()
+
+        assert destroy_plans == []
+    finally:
+        db.close()
+
+
+def test_destroy_plan_successfully_persists_deprovision_record(
+    client,
+    setup_data,
+    monkeypatch,
+):
+    db = TestingSessionLocal()
+    try:
+        source_plan = TerraformPlanRecord(
+            infrastructure_request_id=setup_data["request_id"],
+            requester_id=setup_data["requester_id"],
+            operation="provision",
+            status="succeeded",
+            plan_fingerprint="b" * 64,
+            specification_fingerprint="a" * 64,
+            artifact_path="/tmp/source.tfplan",
+            artifact_sha256="c" * 64,
+            configuration_artifact_path="/tmp/source-config.tar",
+            configuration_artifact_sha256="d" * 64,
+            provider_lock_path="/tmp/source-lock.hcl",
+            provider_lock_sha256="e" * 64,
+            plan_summary={},
+        )
+
+        state_record = TerraformStateRecord(
+            infrastructure_request_id=setup_data["request_id"],
+            backend_type="s3",
+            state_bucket=os.getenv("TF_STATE_BUCKET"),
+            state_key=(
+                f"{os.getenv('TF_STATE_PREFIX').rstrip('/')}/"
+                f"{setup_data['request_id']}/terraform.tfstate"
+            ),
+            state_region=os.getenv("TF_STATE_REGION"),
+            status="active",
+            state_version_id="version-1",
+            state_serial=5,
+            state_lineage="12345678-1234-4234-8234-123456789abc",
+            state_sha256="a" * 64,
+        )
+
+        db.add_all([source_plan, state_record])
+        db.commit()
+    finally:
+        db.close()
+
+    monkeypatch.setattr(
+        terraform_plans_api,
+        "create_s3_client",
+        lambda region: object(),
+    )
+
+    monkeypatch.setattr(
+        terraform_plans_api,
+        "read_state_object",
+        lambda *args, **kwargs: {
+            "content": (
+                b'{"version":4,"serial":5,'
+                b'"lineage":"12345678-1234-4234-8234-123456789abc",'
+                b'"resources":[]}'
+            ),
+            "version_id": "version-1",
+            "sha256": "a" * 64,
+        },
+    )
+
+    generated_artifact = "/tmp/generated-destroy.tfplan"
+
+    monkeypatch.setattr(
+        terraform_plans_api,
+        "execute_terraform_destroy_plan",
+        lambda **kwargs: {
+            "status": "succeeded",
+            "operation": "deprovision",
+            "plan_fingerprint": "f" * 64,
+            "plan_summary": {
+                "resources": [],
+                "deployment_enabled": False,
+            },
+            "artifact_path": generated_artifact,
+            "artifact_sha256": "9" * 64,
+        },
+    )
+
+    response = client.post(
+        (
+            f"/terraform/requests/"
+            f"{setup_data['request_id']}/destroy-plan"
+        ),
+        headers=setup_data["requester_headers"],
+    )
+
+    assert response.status_code == 201
+
+    response_data = response.json()
+
+    assert response_data["operation"] == "deprovision"
+    assert response_data["status"] == "succeeded"
+    assert response_data["deployment_enabled"] is False
+    assert response_data["plan_fingerprint"] == "f" * 64
+
+    db = TestingSessionLocal()
+    try:
+        destroy_plan = db.scalar(
+            select(TerraformPlanRecord).where(
+                TerraformPlanRecord.infrastructure_request_id
+                == setup_data["request_id"],
+                TerraformPlanRecord.operation == "deprovision",
+            )
+        )
+
+        assert destroy_plan is not None
+        assert destroy_plan.status == "succeeded"
+        assert destroy_plan.artifact_path == generated_artifact
+        assert destroy_plan.artifact_sha256 == "9" * 64
+        assert destroy_plan.state_version_id == "version-1"
+        assert destroy_plan.state_serial == 5
+        assert destroy_plan.state_lineage == (
+            "12345678-1234-4234-8234-123456789abc"
+        )
+        assert destroy_plan.state_sha256 == "a" * 64
+        assert destroy_plan.configuration_artifact_path == (
+            "/tmp/source-config.tar"
+        )
+        assert destroy_plan.provider_lock_path == (
+            "/tmp/source-lock.hcl"
+        )
+    finally:
+        db.close()
+
+
+def test_destroy_plan_commit_failure_deletes_artifact(
+    client,
+    setup_data,
+    monkeypatch,
+):
+    db = TestingSessionLocal()
+    try:
+        source_plan = TerraformPlanRecord(
+            infrastructure_request_id=setup_data["request_id"],
+            requester_id=setup_data["requester_id"],
+            operation="provision",
+            status="succeeded",
+            plan_fingerprint="b" * 64,
+            specification_fingerprint="a" * 64,
+            artifact_path="/tmp/source.tfplan",
+            artifact_sha256="c" * 64,
+            configuration_artifact_path="/tmp/source-config.tar",
+            configuration_artifact_sha256="d" * 64,
+            provider_lock_path="/tmp/source-lock.hcl",
+            provider_lock_sha256="e" * 64,
+            plan_summary={},
+        )
+
+        state_record = TerraformStateRecord(
+            infrastructure_request_id=setup_data["request_id"],
+            backend_type="s3",
+            state_bucket=os.getenv("TF_STATE_BUCKET"),
+            state_key=(
+                f"{os.getenv('TF_STATE_PREFIX').rstrip('/')}/"
+                f"{setup_data['request_id']}/terraform.tfstate"
+            ),
+            state_region=os.getenv("TF_STATE_REGION"),
+            status="active",
+            state_version_id="version-1",
+            state_serial=5,
+            state_lineage="12345678-1234-4234-8234-123456789abc",
+            state_sha256="a" * 64,
+        )
+
+        db.add_all([source_plan, state_record])
+        db.commit()
+    finally:
+        db.close()
+
+    monkeypatch.setattr(
+        terraform_plans_api,
+        "create_s3_client",
+        lambda region: object(),
+    )
+
+    monkeypatch.setattr(
+        terraform_plans_api,
+        "read_state_object",
+        lambda *args, **kwargs: {
+            "content": (
+                b'{"version":4,"serial":5,'
+                b'"lineage":"12345678-1234-4234-8234-123456789abc",'
+                b'"resources":[]}'
+            ),
+            "version_id": "version-1",
+            "sha256": "a" * 64,
+        },
+    )
+
+    artifact_path = "/tmp/generated-destroy.tfplan"
+
+    monkeypatch.setattr(
+        terraform_plans_api,
+        "execute_terraform_destroy_plan",
+        lambda **kwargs: {
+            "plan_fingerprint": "f" * 64,
+            "plan_summary": {},
+            "artifact_path": artifact_path,
+            "artifact_sha256": "9" * 64,
+        },
+    )
+
+    deleted_artifacts = []
+
+    monkeypatch.setattr(
+        terraform_plans_api,
+        "delete_plan_artifact",
+        lambda path: deleted_artifacts.append(path),
+    )
+
+    def override_get_db_with_commit_failure():
+        session = TestingSessionLocal()
+
+        class CommitFailingSession:
+            def __init__(self, session):
+                self.session = session
+
+            def __getattr__(self, name):
+                return getattr(self.session, name)
+
+            def commit(self):
+                raise RuntimeError(
+                    "Simulated database commit failure"
+                )
+
+            def rollback(self):
+                self.session.rollback()
+
+            def close(self):
+                self.session.close()
+
+        failing_session = CommitFailingSession(session)
+
+        try:
+            yield failing_session
+        finally:
+            failing_session.close()
+
+
+    app.dependency_overrides[get_db] = (
+        override_get_db_with_commit_failure
+    )
+
+    response = client.post(
+        (
+            f"/terraform/requests/"
+            f"{setup_data['request_id']}/destroy-plan"
+        ),
+        headers=setup_data["requester_headers"],
+    )
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == (
+        "Terraform destroy-plan record could not be saved."
+    )
+
+    assert deleted_artifacts == [artifact_path]
+
+    db = TestingSessionLocal()
+    try:
+        destroy_plans = db.scalars(
+            select(TerraformPlanRecord).where(
+                TerraformPlanRecord.infrastructure_request_id
+                == setup_data["request_id"],
+                TerraformPlanRecord.operation == "deprovision",
+            )
+        ).all()
+
+        assert destroy_plans == []
     finally:
         db.close()

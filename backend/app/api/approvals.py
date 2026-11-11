@@ -192,22 +192,6 @@ def create_approval(
             ),
         )
 
-    existing = db.scalar(
-        select(ApprovalRequest).where(
-            ApprovalRequest.infrastructure_request_id
-            == infrastructure_request.id
-        )
-    )
-
-    if existing is not None:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=(
-                "An approval request already exists for this "
-                "infrastructure request."
-            ),
-        )
-
     plan_record = db.get(
         TerraformPlanRecord,
         payload.terraform_plan_record_id,
@@ -223,6 +207,23 @@ def create_approval(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Trusted Terraform plan record not found.",
         )
+
+    # Allow only one approval per Terraform plan.
+    # Separate plans for the same infrastructure request can be approved.
+    existing = db.scalar(
+        select(ApprovalRequest).where(
+            ApprovalRequest.terraform_plan_record_id == plan_record.id
+        )
+    )
+
+    if existing is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "An approval request already exists for this Terraform plan."
+            ),
+        )
+
 
     if plan_record.status != "succeeded":
         raise HTTPException(

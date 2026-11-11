@@ -4,11 +4,9 @@
 import hashlib
 import json
 import os
-
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
-
 from backend.app.core.auth_dependencies import CurrentUser
 from backend.app.core.dependencies import get_db
 from backend.app.models.conversation import Conversation
@@ -28,6 +26,7 @@ from backend.app.services.terraform.backend_config import (
 from backend.app.services.terraform.execution import (
     TerraformExecutionError,
     execute_terraform_plan,
+    execute_terraform_destroy_plan,
 )
 from backend.app.services.terraform.state_manager import (
     TerraformStateError,
@@ -35,9 +34,315 @@ from backend.app.services.terraform.state_manager import (
     get_state_record,
     update_state_metadata,
 )
+from backend.app.services.terraform.s3_state_storage import (
+    S3StateStorageError,
+    create_s3_client,
+    parse_terraform_state,
+    read_state_object,
+)
 
 router = APIRouter(prefix="/terraform", tags=["Terraform Plans"])
 
+
+def _read_verified_state_snapshot(
+    client,
+    state_record,
+) -> dict:
+    """Read and validate the current S3 state against its DB snapshot."""
+
+    if state_record.status != "active":
+        raise HTTPException(
+            status_code=409,
+            detail="Terraform state is not active.",
+        )
+
+    if not all(
+        (
+            state_record.state_version_id,
+            state_record.state_lineage,
+            state_record.state_sha256,
+        )
+    ) or state_record.state_serial is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Terraform state snapshot is incomplete.",
+        )
+
+    state = read_state_object(
+        client,
+        state_record.state_bucket,
+        state_record.state_key,
+    )
+
+    metadata = parse_terraform_state(state["content"])
+
+    snapshot = {
+        "version_id": state["version_id"],
+        "serial": metadata["serial"],
+        "lineage": metadata["lineage"],
+        "sha256": state["sha256"],
+    }
+
+    if (
+        snapshot["version_id"] != state_record.state_version_id
+        or snapshot["serial"] != state_record.state_serial
+        or snapshot["lineage"] != state_record.state_lineage
+        or snapshot["sha256"] != state_record.state_sha256
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Terraform state has changed. Synchronize inventory before continuing.",
+        )
+
+    return snapshot
+
+@router.post(
+    "/requests/{infrastructure_request_id}/destroy-plan",
+    status_code=201,
+)
+def create_trusted_terraform_destroy_plan(
+    infrastructure_request_id: int,
+    current_user: CurrentUser,
+    db: Session = Depends(get_db),
+):
+    """Generate a destroy plan from the latest successful provisioning plan."""
+
+    # 1. Verify that the infrastructure request exists.
+    infrastructure_request = db.scalar(
+        select(InfrastructureRequest).where(
+            InfrastructureRequest.id == infrastructure_request_id
+        )
+    )
+
+    if infrastructure_request is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Infrastructure request not found.",
+        )
+
+    # 2. Verify request ownership.
+    conversation = db.scalar(
+        select(Conversation).where(
+            Conversation.id == infrastructure_request.conversation_id
+        )
+    )
+
+    if conversation is None or conversation.user_id != current_user.id:
+        raise HTTPException(
+            status_code=404,
+            detail="Infrastructure request not found.",
+        )
+
+    # 3. Find the latest successful provisioning plan.
+    source_plan = db.scalar(
+        select(TerraformPlanRecord)
+        .where(
+            TerraformPlanRecord.infrastructure_request_id
+            == infrastructure_request.id,
+            TerraformPlanRecord.operation == "provision",
+            TerraformPlanRecord.status == "succeeded",
+        )
+        .order_by(
+            desc(TerraformPlanRecord.created_at),
+            desc(TerraformPlanRecord.id),
+        )
+        .limit(1)
+    )
+
+    if source_plan is None:
+        raise HTTPException(
+            status_code=409,
+            detail="No successful provisioning plan is available.",
+        )
+
+    # 4. Verify that the original Terraform configuration and provider
+    # lock artifacts are available.
+    if not all(
+        (
+            source_plan.configuration_artifact_path,
+            source_plan.configuration_artifact_sha256,
+            source_plan.provider_lock_path,
+            source_plan.provider_lock_sha256,
+        )
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="The provisioning plan is missing required Terraform artifacts.",
+        )
+
+    # 5. Retrieve and verify the existing state record.
+    state_record = get_state_record(
+        db,
+        infrastructure_request.id,
+    )
+
+    if state_record is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Terraform state record not found.",
+        )
+
+    bucket = os.getenv("TF_STATE_BUCKET", "").strip()
+
+    if not bucket:
+        raise HTTPException(
+            status_code=503,
+            detail="Terraform state backend is not configured.",
+        )
+
+    try:
+        backend_config = build_s3_backend_config(
+            infrastructure_request_id=infrastructure_request.id,
+            bucket=bucket,
+            region=os.getenv("TF_STATE_REGION", "ap-south-1"),
+            prefix=os.getenv("TF_STATE_PREFIX", "training/requests"),
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Terraform state backend configuration is invalid.",
+        ) from exc
+
+    if (
+        state_record.backend_type != "s3"
+        or state_record.state_bucket != backend_config["bucket"]
+        or state_record.state_key != backend_config["key"]
+        or state_record.state_region != backend_config["region"]
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Terraform state backend does not match the existing record.",
+        )
+
+    # 6. Verify the actual S3 state against the database snapshot.
+    try:
+        s3_client = create_s3_client(state_record.state_region)
+
+        initial_snapshot = _read_verified_state_snapshot(
+            s3_client,
+            state_record,
+        )
+    except HTTPException:
+        raise
+    except S3StateStorageError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Terraform state could not be verified.",
+        ) from exc
+
+    # 7. Generate a destroy plan. This does not execute destruction.
+    try:
+        result = execute_terraform_destroy_plan(
+            configuration_artifact_path=(
+                source_plan.configuration_artifact_path
+            ),
+            configuration_artifact_sha256=(
+                source_plan.configuration_artifact_sha256
+            ),
+            provider_lock_path=source_plan.provider_lock_path,
+            provider_lock_sha256=source_plan.provider_lock_sha256,
+        )
+    except TerraformExecutionError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "Terraform destroy-plan generation failed.",
+                "error_code": exc.code,
+            },
+        ) from exc
+
+    artifact_path = result.get("artifact_path")
+
+    # 8. Verify that the state did not change while planning.
+    try:
+        final_snapshot = _read_verified_state_snapshot(
+            s3_client,
+            state_record,
+        )
+    except (HTTPException, S3StateStorageError) as exc:
+        if artifact_path:
+            try:
+                delete_plan_artifact(artifact_path)
+            except Exception:
+                pass
+
+        if isinstance(exc, HTTPException):
+            raise
+
+        raise HTTPException(
+            status_code=503,
+            detail="Terraform state could not be reverified after planning.",
+        ) from exc
+
+    if final_snapshot != initial_snapshot:
+        if artifact_path:
+            try:
+                delete_plan_artifact(artifact_path)
+            except Exception:
+                pass
+
+        raise HTTPException(
+            status_code=409,
+            detail="Terraform state changed during destroy-plan generation.",
+        )
+
+    # 9. Save a separate deprovision plan record.
+    record = TerraformPlanRecord(
+        infrastructure_request_id=infrastructure_request.id,
+        requester_id=current_user.id,
+        operation="deprovision",
+        status="succeeded",
+        plan_fingerprint=result["plan_fingerprint"],
+        specification_fingerprint=(
+            source_plan.specification_fingerprint
+        ),
+        artifact_path=artifact_path,
+        artifact_sha256=result.get("artifact_sha256"),
+        configuration_artifact_path=(
+            source_plan.configuration_artifact_path
+        ),
+        configuration_artifact_sha256=(
+            source_plan.configuration_artifact_sha256
+        ),
+        provider_lock_path=source_plan.provider_lock_path,
+        provider_lock_sha256=source_plan.provider_lock_sha256,
+        state_version_id=initial_snapshot["version_id"],
+        state_serial=initial_snapshot["serial"],
+        state_lineage=initial_snapshot["lineage"],
+        state_sha256=initial_snapshot["sha256"],
+        plan_summary=result["plan_summary"],
+    )
+
+    db.add(record)
+
+    try:
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+
+        if artifact_path:
+            try:
+                delete_plan_artifact(artifact_path)
+            except Exception:
+                pass
+
+        raise HTTPException(
+            status_code=500,
+            detail="Terraform destroy-plan record could not be saved.",
+        ) from exc
+
+    db.refresh(record)
+
+    return {
+        "id": record.id,
+        "infrastructure_request_id": record.infrastructure_request_id,
+        "operation": record.operation,
+        "status": record.status,
+        "plan_fingerprint": record.plan_fingerprint,
+        "plan_summary": record.plan_summary,
+        "deployment_enabled": False,
+        "created_at": record.created_at,
+    }
 
 @router.post("/requests/{infrastructure_request_id}/plan", status_code=201)
 def create_trusted_terraform_plan(
