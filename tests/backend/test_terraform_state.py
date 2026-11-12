@@ -11,13 +11,17 @@ from backend.app.models.conversation import Conversation
 from backend.app.models.infrastructure_request import InfrastructureRequest
 from backend.app.models.terraform_state import TerraformStateRecord
 from backend.app.models.user import User
-
+import json
+from backend.app.services.terraform.s3_state_storage import (
+    S3StateStorageError,
+)
 from backend.app.services.terraform.state_manager import (
     TerraformStateError,
     calculate_state_sha256,
     create_state_record,
     get_state_record,
     update_state_metadata,
+    verify_active_state_snapshot,
 )
 
 
@@ -426,3 +430,169 @@ def test_invalid_persisted_state_status_is_handled(db):
         )
 
     assert exc.value.args[0] == "STATE_STATUS_INVALID"
+
+
+def _create_active_state_snapshot(db):
+    session, request_id = db
+
+    record = create_state_record(
+        session,
+        request_id,
+        "aiops-test-state-bucket",
+        f"requests/{request_id}/terraform.tfstate",
+        "ap-south-1",
+    )
+
+    content = json.dumps({
+        "version": 4,
+        "serial": 3,
+        "lineage": "12345678-1234-1234-1234-123456789012",
+        "resources": [],
+    }).encode("utf-8")
+
+    checksum = hashlib.sha256(content).hexdigest()
+
+    update_state_metadata(
+        session,
+        request_id,
+        status="initializing",
+    )
+
+    update_state_metadata(
+        session,
+        request_id,
+        state_version_id="version-001",
+        state_serial=3,
+        state_lineage="12345678-1234-1234-1234-123456789012",
+        state_sha256=checksum,
+        status="active",
+    )
+
+    return record, content, checksum
+
+
+def test_verify_active_state_snapshot_success(db, monkeypatch):
+    record, content, checksum = _create_active_state_snapshot(db)
+
+    monkeypatch.setattr(
+        "backend.app.services.terraform.state_manager.read_state_object",
+        lambda *args, **kwargs: {
+            "content": content,
+            "version_id": "version-001",
+            "sha256": checksum,
+        },
+    )
+
+    snapshot = verify_active_state_snapshot(
+        object(),
+        record,
+    )
+
+    assert snapshot == {
+        "version_id": "version-001",
+        "serial": 3,
+        "lineage": "12345678-1234-1234-1234-123456789012",
+        "sha256": checksum,
+    }
+
+
+def test_verify_inactive_state_snapshot_is_rejected(db):
+    session, request_id = db
+
+    record = create_state_record(
+        session,
+        request_id,
+        "aiops-test-state-bucket",
+        f"requests/{request_id}/terraform.tfstate",
+        "ap-south-1",
+    )
+
+    with pytest.raises(TerraformStateError) as exc:
+        verify_active_state_snapshot(object(), record)
+
+    assert exc.value.args[0] == "STATE_NOT_ACTIVE"
+
+
+def test_verify_incomplete_state_snapshot_is_rejected(db):
+    session, request_id = db
+
+    record = create_state_record(
+        session,
+        request_id,
+        "aiops-test-state-bucket",
+        f"requests/{request_id}/terraform.tfstate",
+        "ap-south-1",
+    )
+
+    update_state_metadata(
+        session,
+        request_id,
+        status="initializing",
+    )
+
+    update_state_metadata(
+        session,
+        request_id,
+        status="active",
+    )
+
+    with pytest.raises(TerraformStateError) as exc:
+        verify_active_state_snapshot(object(), record)
+
+    assert exc.value.args[0] == "STATE_SNAPSHOT_INCOMPLETE"
+
+
+def test_verify_s3_state_read_failure_is_rejected(db, monkeypatch):
+    record, _, _ = _create_active_state_snapshot(db)
+
+    def fail_read(*args, **kwargs):
+        raise S3StateStorageError("S3_STATE_READ_FAILED")
+
+    monkeypatch.setattr(
+        "backend.app.services.terraform.state_manager.read_state_object",
+        fail_read,
+    )
+
+    with pytest.raises(TerraformStateError) as exc:
+        verify_active_state_snapshot(object(), record)
+
+    assert exc.value.args[0] == "STATE_SNAPSHOT_READ_FAILED"
+
+
+@pytest.mark.parametrize(
+    ("field", "changed_value"),
+    [
+        ("state_version_id", "version-002"),
+        ("state_serial", 4),
+        (
+            "state_lineage",
+            "87654321-4321-4321-4321-210987654321",
+        ),
+        ("state_sha256", "b" * 64),
+    ],
+)
+def test_verify_changed_state_snapshot_is_rejected(
+    db,
+    monkeypatch,
+    field,
+    changed_value,
+):
+    session, _ = db
+    record, content, checksum = _create_active_state_snapshot(db)
+
+    setattr(record, field, changed_value)
+    session.commit()
+
+    monkeypatch.setattr(
+        "backend.app.services.terraform.state_manager.read_state_object",
+        lambda *args, **kwargs: {
+            "content": content,
+            "version_id": "version-001",
+            "sha256": checksum,
+        },
+    )
+
+    with pytest.raises(TerraformStateError) as exc:
+        verify_active_state_snapshot(object(), record)
+
+    assert exc.value.args[0] == "STATE_SNAPSHOT_CHANGED"

@@ -1,4 +1,4 @@
-
+from types import SimpleNamespace
 import pytest
 import hashlib
 import json
@@ -616,6 +616,7 @@ def create_recovery_test_operation(
     email: str,
     status: str,
     lease_expires_at=None,
+    operation_type="provision",
 ):
     """Create a minimal operation for recovery tests."""
 
@@ -671,7 +672,7 @@ def create_recovery_test_operation(
         terraform_plan_record_id=plan.id,
         approval_request_id=approval.id,
         requester_id=user.id,
-        operation="provision",
+        operation=operation_type,
         status=status,
         execution_token=(
             "test-execution-token"
@@ -1134,6 +1135,1325 @@ def test_worker_process_terminates_when_lease_is_lost(
 
         assert operation.status == "running"
         assert operation.execution_token == "test-execution-token"
+
+    finally:
+        db.close()
+
+
+def create_deprovision_test_operation(db):
+    """Create a fully approved deprovision operation for worker tests."""
+
+    requirements = {
+        "cloud_provider": "aws",
+        "resource_type": "EC2",
+        "environment": "development",
+        "region": "ap-south-1",
+        "vcpus": 2,
+        "memory_gb": 4,
+        "public_access": False,
+    }
+
+    specification = ValidatedInfrastructureSpecification.model_validate(
+        requirements
+    )
+
+    specification_fingerprint = tasks._fingerprint_specification(
+        specification
+    )
+
+    artifact_path, artifact_checksum = save_plan_artifact(
+        b"valid-test-destroy-plan"
+    )
+
+    provider_lock_path, provider_lock_checksum = (
+        save_provider_lock_artifact(
+            b'# Test provider lock file\n'
+        )
+    )
+
+    configuration_path, configuration_checksum = (
+        save_configuration_artifact(
+            'terraform {\n  required_version = ">= 1.10.0"\n}\n'
+        )
+    )
+
+    user = User(
+        email="deprovision-worker@example.com",
+        password_hash="test-hash",
+        role="user",
+        is_active=True,
+    )
+    db.add(user)
+    db.flush()
+
+    conversation = Conversation(
+        user_id=user.id,
+        session_id="deprovision-worker-session",
+        title="Deprovision worker test",
+    )
+    db.add(conversation)
+    db.flush()
+
+    request = InfrastructureRequest(
+        conversation_id=conversation.id,
+        status="complete",
+        requirements=requirements,
+    )
+    db.add(request)
+    db.flush()
+
+    state_snapshot = {
+        "version_id": "test-state-version-001",
+        "serial": 3,
+        "lineage": "12345678-1234-4234-8234-123456789abc",
+        "sha256": "c" * 64,
+    }
+
+    plan = TerraformPlanRecord(
+        infrastructure_request_id=request.id,
+        requester_id=user.id,
+        operation="deprovision",
+        status="succeeded",
+        plan_fingerprint=artifact_checksum,
+        specification_fingerprint=specification_fingerprint,
+        plan_summary={},
+        artifact_path=artifact_path,
+        artifact_sha256=artifact_checksum,
+        provider_lock_path=provider_lock_path,
+        provider_lock_sha256=provider_lock_checksum,
+        configuration_artifact_path=configuration_path,
+        configuration_artifact_sha256=configuration_checksum,
+        state_version_id=state_snapshot["version_id"],
+        state_serial=state_snapshot["serial"],
+        state_lineage=state_snapshot["lineage"],
+        state_sha256=state_snapshot["sha256"],
+    )
+    db.add(plan)
+    db.flush()
+
+    approval = ApprovalRequest(
+        infrastructure_request_id=request.id,
+        terraform_plan_record_id=plan.id,
+        requester_id=user.id,
+        status="approved",
+        plan_summary={},
+        plan_fingerprint=artifact_checksum,
+    )
+    db.add(approval)
+    db.flush()
+
+    for stage in ("technical", "cost", "security"):
+        db.add(
+            ApprovalStageReview(
+                approval_request_id=approval.id,
+                stage=stage,
+                status="approved",
+            )
+        )
+
+    operation = InfrastructureOperation(
+        infrastructure_request_id=request.id,
+        terraform_plan_record_id=plan.id,
+        approval_request_id=approval.id,
+        requester_id=user.id,
+        operation="deprovision",
+        status="queued",
+        result_summary={
+            "destroy_confirmed": True,
+            "terraform_destroy_enabled": False,
+        },
+    )
+    db.add(operation)
+    db.commit()
+
+    return (
+        operation.id,
+        state_snapshot,
+        artifact_path,
+        provider_lock_path,
+        configuration_path,
+    )
+
+def test_provision_worker_does_not_claim_deprovision_operation(
+    worker_db,
+):
+    db = worker_db()
+
+    try:
+        (
+            operation_id,
+            _,
+            _,
+            _,
+            _,
+        ) = create_deprovision_test_operation(db)
+
+    finally:
+        db.close()
+
+    result = tasks.execute_provision_operation.run(operation_id)
+
+    assert result["status"] == "queued"
+    assert result["message"] == "Operation is not queued."
+
+    db = worker_db()
+
+    try:
+        operation = db.get(
+            InfrastructureOperation,
+            operation_id,
+        )
+
+        assert operation is not None
+        assert operation.operation == "deprovision"
+        assert operation.status == "queued"
+        assert operation.execution_token is None
+        assert operation.lease_expires_at is None
+
+    finally:
+        db.close()
+
+def test_deprovision_worker_completes_preflight_without_destroy(
+    worker_db,
+    monkeypatch,
+    tmp_path,
+):
+    db = worker_db()
+
+    try:
+        (
+            operation_id,
+            state_snapshot,
+            artifact_path,
+            provider_lock_path,
+            configuration_path,
+        ) = create_deprovision_test_operation(db)
+    finally:
+        db.close()
+
+    initialization_calls = {}
+
+    fake_state_record = SimpleNamespace(
+        state_region="ap-south-1",
+    )
+
+    monkeypatch.setattr(
+        tasks,
+        "get_state_record",
+        lambda db, request_id: fake_state_record,
+    )
+
+    monkeypatch.setattr(
+        tasks,
+        "create_s3_client",
+        lambda region: object(),
+    )
+
+    monkeypatch.setattr(
+        tasks,
+        "verify_active_state_snapshot",
+        lambda client, state_record: state_snapshot,
+    )
+
+    def fake_build_environment():
+        return {
+            "PATH": os.environ.get("PATH", ""),
+            "TF_INPUT": "0",
+            "TF_IN_AUTOMATION": "1",
+        }, tmp_path
+
+    @contextmanager
+    def fake_reconstructed_workspace(**kwargs):
+        initialization_calls["workspace_artifacts"] = kwargs
+        yield tmp_path / "fake-destroy-workspace"
+
+    def fake_initialize_workspace(
+        workspace,
+        *,
+        timeout_seconds,
+        env,
+        lease_renewal_callback,
+    ):
+        initialization_calls["initialization"] = {
+            "workspace": workspace,
+            "timeout_seconds": timeout_seconds,
+            "env": env,
+        }
+        initialization_calls["lease_renewed"] = (
+            lease_renewal_callback()
+        )
+
+    monkeypatch.setattr(
+        tasks,
+        "build_terraform_environment",
+        fake_build_environment,
+    )
+
+    monkeypatch.setattr(
+        tasks,
+        "reconstructed_terraform_workspace",
+        fake_reconstructed_workspace,
+    )
+
+    monkeypatch.setattr(
+        tasks,
+        "initialize_terraform_apply_workspace",
+        fake_initialize_workspace,
+    )
+
+    try:
+        result = tasks.execute_deprovision_operation.run(
+            operation_id
+        )
+
+        assert result["status"] == "blocked"
+        assert result["operation_id"] == operation_id
+        assert result["error_code"] == "TERRAFORM_DESTROY_DISABLED"
+        assert result["preflight_passed"] is True
+        assert result["terraform_apply_enabled"] is False
+
+        assert "workspace_artifacts" in initialization_calls
+        assert "initialization" in initialization_calls
+        assert initialization_calls["lease_renewed"] is True
+
+        reconstructed = initialization_calls["workspace_artifacts"]
+
+        assert reconstructed["plan_artifact_path"] == artifact_path
+        assert reconstructed["provider_lock_path"] == provider_lock_path
+        assert reconstructed["configuration_artifact_path"] == (
+            configuration_path
+        )
+        assert reconstructed["temp_root"] == tmp_path
+
+        db = worker_db()
+        try:
+            saved_operation = db.get(
+                InfrastructureOperation,
+                operation_id,
+            )
+
+            assert saved_operation.status == "blocked"
+            assert saved_operation.error_code == (
+                "TERRAFORM_DESTROY_DISABLED"
+            )
+            assert saved_operation.result_summary["destroy_confirmed"] is True
+            assert saved_operation.result_summary[
+                "terraform_destroy_enabled"
+            ] is False
+            assert saved_operation.result_summary[
+                "state_snapshot_verified"
+            ] is True
+            assert saved_operation.result_summary[
+                "terraform_initialization_completed"
+            ] is True
+
+        finally:
+            db.close()
+
+    finally:
+        delete_plan_artifact(artifact_path)
+        delete_provider_lock_artifact(provider_lock_path)
+        delete_configuration_artifact(configuration_path)
+
+
+def test_deprovision_worker_blocks_when_destroy_confirmation_is_missing(
+    worker_db,
+    monkeypatch,
+):
+    with worker_db() as db:
+        (
+            operation_id,
+            _,
+            artifact_path,
+            provider_lock_path,
+            configuration_path,
+        ) = create_deprovision_test_operation(db)
+
+        operation = db.get(InfrastructureOperation, operation_id)
+        operation.result_summary = {
+            "destroy_confirmed": False,
+            "terraform_destroy_enabled": False,
+        }
+        db.commit()
+
+    def unexpected_call(*args, **kwargs):
+        pytest.fail(
+            "Terraform preflight must not run without destroy confirmation."
+        )
+
+    monkeypatch.setattr(tasks, "get_state_record", unexpected_call)
+    monkeypatch.setattr(tasks, "create_s3_client", unexpected_call)
+
+    try:
+        result = tasks.execute_deprovision_operation.run(operation_id)
+
+        assert result["status"] == "blocked"
+        assert result["error_code"] == "DESTROY_CONFIRMATION_MISSING"
+
+    finally:
+        delete_plan_artifact(artifact_path)
+        delete_provider_lock_artifact(provider_lock_path)
+        delete_configuration_artifact(configuration_path)
+
+
+def test_deprovision_worker_blocks_when_state_record_is_missing(
+    worker_db,
+    monkeypatch,
+):
+    with worker_db() as db:
+        (
+            operation_id,
+            _,
+            artifact_path,
+            provider_lock_path,
+            configuration_path,
+        ) = create_deprovision_test_operation(db)
+
+    def missing_state_record(db, request_id):
+        return None
+
+    def unexpected_call(*args, **kwargs):
+        pytest.fail(
+            "S3 verification or Terraform initialization must not run "
+            "when the state record is missing."
+        )
+
+    monkeypatch.setattr(
+        tasks,
+        "get_state_record",
+        missing_state_record,
+    )
+    monkeypatch.setattr(
+        tasks,
+        "create_s3_client",
+        unexpected_call,
+    )
+    monkeypatch.setattr(
+        tasks,
+        "verify_active_state_snapshot",
+        unexpected_call,
+    )
+    monkeypatch.setattr(
+        tasks,
+        "initialize_terraform_apply_workspace",
+        unexpected_call,
+    )
+
+    try:
+        result = tasks.execute_deprovision_operation.run(
+            operation_id
+        )
+
+        assert result["status"] == "blocked"
+        assert result["operation_id"] == operation_id
+        assert result["error_code"] == "STATE_RECORD_MISSING"
+
+        db = worker_db()
+        try:
+            operation = db.get(
+                InfrastructureOperation,
+                operation_id,
+            )
+
+            assert operation.status == "blocked"
+            assert operation.error_code == "STATE_RECORD_MISSING"
+            assert operation.result_summary["destroy_confirmed"] is True
+            assert operation.result_summary[
+                "terraform_destroy_enabled"
+            ] is False
+            assert operation.result_summary[
+                "state_snapshot_verified"
+            ] is False
+
+        finally:
+            db.close()
+
+    finally:
+        delete_plan_artifact(artifact_path)
+        delete_provider_lock_artifact(provider_lock_path)
+        delete_configuration_artifact(configuration_path)
+
+
+def test_deprovision_worker_blocks_when_state_snapshot_verification_fails(
+    worker_db,
+    monkeypatch,
+):
+    with worker_db() as db:
+        (
+            operation_id,
+            _,
+            artifact_path,
+            provider_lock_path,
+            configuration_path,
+        ) = create_deprovision_test_operation(db)
+
+    fake_state_record = SimpleNamespace(
+        state_region="ap-south-1",
+    )
+
+    s3_calls = {}
+
+    monkeypatch.setattr(
+        tasks,
+        "get_state_record",
+        lambda db, request_id: fake_state_record,
+    )
+
+    def fake_create_s3_client(region):
+        s3_calls["region"] = region
+        return object()
+
+    monkeypatch.setattr(
+        tasks,
+        "create_s3_client",
+        fake_create_s3_client,
+    )
+
+    def fail_state_verification(client, state_record):
+        s3_calls["verification_called"] = True
+        raise tasks.TerraformStateError(
+            "Unable to verify active Terraform state."
+        )
+
+    monkeypatch.setattr(
+        tasks,
+        "verify_active_state_snapshot",
+        fail_state_verification,
+    )
+
+    def unexpected_initialization(*args, **kwargs):
+        pytest.fail(
+            "Terraform initialization must not run when "
+            "state snapshot verification fails."
+        )
+
+    monkeypatch.setattr(
+        tasks,
+        "initialize_terraform_apply_workspace",
+        unexpected_initialization,
+    )
+
+    try:
+        result = tasks.execute_deprovision_operation.run(
+            operation_id
+        )
+
+        assert result["status"] == "blocked"
+        assert result["operation_id"] == operation_id
+        assert result["error_code"] == (
+            "STATE_SNAPSHOT_VERIFICATION_FAILED"
+        )
+
+        assert s3_calls["region"] == "ap-south-1"
+        assert s3_calls["verification_called"] is True
+
+        db = worker_db()
+        try:
+            operation = db.get(
+                InfrastructureOperation,
+                operation_id,
+            )
+
+            assert operation.status == "blocked"
+            assert operation.error_code == (
+                "STATE_SNAPSHOT_VERIFICATION_FAILED"
+            )
+            assert operation.result_summary["destroy_confirmed"] is True
+            assert operation.result_summary[
+                "terraform_destroy_enabled"
+            ] is False
+            assert operation.result_summary[
+                "state_snapshot_verified"
+            ] is False
+
+        finally:
+            db.close()
+
+    finally:
+        delete_plan_artifact(artifact_path)
+        delete_provider_lock_artifact(provider_lock_path)
+        delete_configuration_artifact(configuration_path)
+
+
+@pytest.mark.parametrize(
+    "field,mismatched_value",
+    [
+        ("version_id", "different-state-version"),
+        ("serial", 999),
+        ("lineage", "different-lineage"),
+        ("sha256", "d" * 64),
+    ],
+)
+def test_deprovision_worker_blocks_when_state_snapshot_mismatches_destroy_plan(
+    worker_db,
+    monkeypatch,
+    field,
+    mismatched_value,
+):
+    with worker_db() as db:
+        (
+            operation_id,
+            state_snapshot,
+            artifact_path,
+            provider_lock_path,
+            configuration_path,
+        ) = create_deprovision_test_operation(db)
+
+    current_snapshot = dict(state_snapshot)
+    current_snapshot[field] = mismatched_value
+
+    fake_state_record = SimpleNamespace(
+        state_region="ap-south-1",
+    )
+
+    monkeypatch.setattr(
+        tasks,
+        "get_state_record",
+        lambda db, request_id: fake_state_record,
+    )
+
+    monkeypatch.setattr(
+        tasks,
+        "create_s3_client",
+        lambda region: object(),
+    )
+
+    monkeypatch.setattr(
+        tasks,
+        "verify_active_state_snapshot",
+        lambda client, state_record: current_snapshot,
+    )
+
+    def unexpected_call(*args, **kwargs):
+        pytest.fail(
+            "Terraform workspace reconstruction or initialization "
+            "must not run when the destroy plan state snapshot mismatches."
+        )
+
+    monkeypatch.setattr(
+        tasks,
+        "reconstructed_terraform_workspace",
+        unexpected_call,
+    )
+
+    monkeypatch.setattr(
+        tasks,
+        "initialize_terraform_apply_workspace",
+        unexpected_call,
+    )
+
+    try:
+        result = tasks.execute_deprovision_operation.run(
+            operation_id
+        )
+
+        assert result["status"] == "blocked"
+        assert result["operation_id"] == operation_id
+        assert result["error_code"] == (
+            "DESTROY_PLAN_STATE_SNAPSHOT_MISMATCH"
+        )
+
+        db = worker_db()
+        try:
+            operation = db.get(
+                InfrastructureOperation,
+                operation_id,
+            )
+
+            assert operation.status == "blocked"
+            assert operation.error_code == (
+                "DESTROY_PLAN_STATE_SNAPSHOT_MISMATCH"
+            )
+            assert operation.result_summary["destroy_confirmed"] is True
+            assert operation.result_summary[
+                "terraform_destroy_enabled"
+            ] is False
+            assert operation.result_summary[
+                "state_snapshot_verified"
+            ] is False
+
+        finally:
+            db.close()
+
+    finally:
+        delete_plan_artifact(artifact_path)
+        delete_provider_lock_artifact(provider_lock_path)
+        delete_configuration_artifact(configuration_path)
+
+
+@pytest.mark.parametrize(
+    "artifact_failure,expected_error",
+    [
+        (
+            "missing",
+            "PLAN_ARTIFACT_MISSING",
+        ),
+        (
+            "fingerprint_mismatch",
+            "PLAN_ARTIFACT_FINGERPRINT_MISMATCH",
+        ),
+        (
+            "corrupted",
+            "PLAN_ARTIFACT_INVALID",
+        ),
+    ],
+)
+def test_deprovision_worker_blocks_when_destroy_plan_artifact_is_invalid(
+    worker_db,
+    monkeypatch,
+    artifact_failure,
+    expected_error,
+):
+    with worker_db() as db:
+        (
+            operation_id,
+            state_snapshot,
+            artifact_path,
+            provider_lock_path,
+            configuration_path,
+        ) = create_deprovision_test_operation(db)
+
+        plan = db.scalar(
+            select(TerraformPlanRecord).where(
+                TerraformPlanRecord.operation == "deprovision"
+            )
+        )
+
+        operation = db.get(
+            InfrastructureOperation,
+            operation_id,
+        )
+
+        approval = db.get(
+            ApprovalRequest,
+            operation.approval_request_id,
+        )
+
+        if artifact_failure == "missing":
+            plan.artifact_path = None
+            plan.artifact_sha256 = None
+
+        elif artifact_failure == "fingerprint_mismatch":
+            plan.plan_fingerprint = "a" * 64
+            approval.plan_fingerprint = "a" * 64
+
+        db.commit()
+
+    fake_state_record = SimpleNamespace(
+        state_region="ap-south-1",
+    )
+
+    monkeypatch.setattr(
+        tasks,
+        "get_state_record",
+        lambda db, request_id: fake_state_record,
+    )
+
+    monkeypatch.setattr(
+        tasks,
+        "create_s3_client",
+        lambda region: object(),
+    )
+
+    monkeypatch.setattr(
+        tasks,
+        "verify_active_state_snapshot",
+        lambda client, state_record: state_snapshot,
+    )
+
+    if artifact_failure == "corrupted":
+        def corrupted_plan_loader(*args, **kwargs):
+            raise tasks.TerraformArtifactError(
+                "Destroy plan artifact integrity verification failed."
+            )
+
+        monkeypatch.setattr(
+            tasks,
+            "load_plan_artifact",
+            corrupted_plan_loader,
+        )
+
+    def unexpected_call(*args, **kwargs):
+        pytest.fail(
+            "Terraform workspace reconstruction or initialization "
+            "must not run when the destroy plan artifact is invalid."
+        )
+
+    monkeypatch.setattr(
+        tasks,
+        "reconstructed_terraform_workspace",
+        unexpected_call,
+    )
+
+    monkeypatch.setattr(
+        tasks,
+        "initialize_terraform_apply_workspace",
+        unexpected_call,
+    )
+
+    try:
+        result = tasks.execute_deprovision_operation.run(
+            operation_id
+        )
+
+        assert result["status"] == "blocked", result
+        assert result["operation_id"] == operation_id
+        assert result["error_code"] == expected_error
+
+        db = worker_db()
+        try:
+            operation = db.get(
+                InfrastructureOperation,
+                operation_id,
+            )
+
+            assert operation.status == "blocked"
+            assert operation.error_code == expected_error
+            assert operation.result_summary["destroy_confirmed"] is True
+            assert operation.result_summary[
+                "terraform_destroy_enabled"
+            ] is False
+            assert operation.result_summary[
+                "state_snapshot_verified"
+            ] is True
+
+        finally:
+            db.close()
+
+    finally:
+        delete_plan_artifact(artifact_path)
+        delete_provider_lock_artifact(provider_lock_path)
+        delete_configuration_artifact(configuration_path)
+
+
+@pytest.mark.parametrize(
+    "lock_failure,expected_error",
+    [
+        (
+            "missing",
+            "PROVIDER_LOCK_ARTIFACT_MISSING",
+        ),
+        (
+            "corrupted",
+            "PROVIDER_LOCK_ARTIFACT_INVALID",
+        ),
+    ],
+)
+def test_deprovision_worker_blocks_when_provider_lock_artifact_is_invalid(
+    worker_db,
+    monkeypatch,
+    lock_failure,
+    expected_error,
+):
+    with worker_db() as db:
+        (
+            operation_id,
+            state_snapshot,
+            artifact_path,
+            provider_lock_path,
+            configuration_path,
+        ) = create_deprovision_test_operation(db)
+
+        operation = db.get(
+            InfrastructureOperation,
+            operation_id,
+        )
+        plan = db.get(
+            TerraformPlanRecord,
+            operation.terraform_plan_record_id,
+        )
+
+        if lock_failure == "missing":
+            plan.provider_lock_path = None
+            plan.provider_lock_sha256 = None
+
+        db.commit()
+
+    fake_state_record = SimpleNamespace(
+        state_region="ap-south-1",
+    )
+
+    monkeypatch.setattr(
+        tasks,
+        "get_state_record",
+        lambda db, request_id: fake_state_record,
+    )
+
+    monkeypatch.setattr(
+        tasks,
+        "create_s3_client",
+        lambda region: object(),
+    )
+
+    monkeypatch.setattr(
+        tasks,
+        "verify_active_state_snapshot",
+        lambda client, state_record: state_snapshot,
+    )
+
+    if lock_failure == "corrupted":
+        def corrupted_lock_loader(*args, **kwargs):
+            raise tasks.TerraformArtifactError(
+                "Provider lock artifact integrity verification failed."
+            )
+
+        monkeypatch.setattr(
+            tasks,
+            "load_provider_lock_artifact",
+            corrupted_lock_loader,
+        )
+
+    def unexpected_call(*args, **kwargs):
+        pytest.fail(
+            "Terraform workspace reconstruction or initialization "
+            "must not run when the provider lock artifact is invalid."
+        )
+
+    monkeypatch.setattr(
+        tasks,
+        "reconstructed_terraform_workspace",
+        unexpected_call,
+    )
+
+    monkeypatch.setattr(
+        tasks,
+        "initialize_terraform_apply_workspace",
+        unexpected_call,
+    )
+
+    try:
+        result = tasks.execute_deprovision_operation.run(
+            operation_id
+        )
+
+        assert result["status"] == "blocked", result
+        assert result["operation_id"] == operation_id
+        assert result["error_code"] == expected_error
+
+        db = worker_db()
+        try:
+            operation = db.get(
+                InfrastructureOperation,
+                operation_id,
+            )
+
+            assert operation.status == "blocked"
+            assert operation.error_code == expected_error
+            assert operation.result_summary["destroy_confirmed"] is True
+            assert operation.result_summary[
+                "terraform_destroy_enabled"
+            ] is False
+            assert operation.result_summary[
+                "state_snapshot_verified"
+            ] is True
+
+        finally:
+            db.close()
+
+    finally:
+        delete_plan_artifact(artifact_path)
+        delete_provider_lock_artifact(provider_lock_path)
+        delete_configuration_artifact(configuration_path)
+
+
+@pytest.mark.parametrize(
+    "configuration_failure,expected_error",
+    [
+        (
+            "missing",
+            "CONFIGURATION_ARTIFACT_MISSING",
+        ),
+        (
+            "corrupted",
+            "CONFIGURATION_ARTIFACT_INVALID",
+        ),
+    ],
+)
+def test_deprovision_worker_blocks_when_configuration_artifact_is_invalid(
+    worker_db,
+    monkeypatch,
+    configuration_failure,
+    expected_error,
+):
+    with worker_db() as db:
+        (
+            operation_id,
+            state_snapshot,
+            artifact_path,
+            provider_lock_path,
+            configuration_path,
+        ) = create_deprovision_test_operation(db)
+
+        operation = db.get(
+            InfrastructureOperation,
+            operation_id,
+        )
+        plan = db.get(
+            TerraformPlanRecord,
+            operation.terraform_plan_record_id,
+        )
+
+        if configuration_failure == "missing":
+            plan.configuration_artifact_path = None
+            plan.configuration_artifact_sha256 = None
+
+        db.commit()
+
+    fake_state_record = SimpleNamespace(
+        state_region="ap-south-1",
+    )
+
+    monkeypatch.setattr(
+        tasks,
+        "get_state_record",
+        lambda db, request_id: fake_state_record,
+    )
+
+    monkeypatch.setattr(
+        tasks,
+        "create_s3_client",
+        lambda region: object(),
+    )
+
+    monkeypatch.setattr(
+        tasks,
+        "verify_active_state_snapshot",
+        lambda client, state_record: state_snapshot,
+    )
+
+    if configuration_failure == "corrupted":
+        def corrupted_configuration_loader(*args, **kwargs):
+            raise tasks.TerraformArtifactError(
+                "Configuration artifact integrity verification failed."
+            )
+
+        monkeypatch.setattr(
+            tasks,
+            "load_configuration_artifact",
+            corrupted_configuration_loader,
+        )
+
+    def unexpected_call(*args, **kwargs):
+        pytest.fail(
+            "Terraform workspace reconstruction or initialization "
+            "must not run when the configuration artifact is invalid."
+        )
+
+    monkeypatch.setattr(
+        tasks,
+        "reconstructed_terraform_workspace",
+        unexpected_call,
+    )
+
+    monkeypatch.setattr(
+        tasks,
+        "initialize_terraform_apply_workspace",
+        unexpected_call,
+    )
+
+    try:
+        result = tasks.execute_deprovision_operation.run(
+            operation_id
+        )
+
+        assert result["status"] == "blocked", result
+        assert result["operation_id"] == operation_id
+        assert result["error_code"] == expected_error
+
+        db = worker_db()
+        try:
+            operation = db.get(
+                InfrastructureOperation,
+                operation_id,
+            )
+
+            assert operation.status == "blocked"
+            assert operation.error_code == expected_error
+            assert operation.result_summary["destroy_confirmed"] is True
+            assert operation.result_summary[
+                "terraform_destroy_enabled"
+            ] is False
+            assert operation.result_summary[
+                "state_snapshot_verified"
+            ] is True
+
+        finally:
+            db.close()
+
+    finally:
+        delete_plan_artifact(artifact_path)
+        delete_provider_lock_artifact(provider_lock_path)
+        delete_configuration_artifact(configuration_path)
+
+
+def test_deprovision_worker_fails_when_terraform_initialization_fails(
+    worker_db,
+    monkeypatch,
+    tmp_path,
+):
+    with worker_db() as db:
+        (
+            operation_id,
+            state_snapshot,
+            artifact_path,
+            provider_lock_path,
+            configuration_path,
+        ) = create_deprovision_test_operation(db)
+
+    initialization_calls = {}
+
+    fake_state_record = SimpleNamespace(
+        state_region="ap-south-1",
+    )
+
+    monkeypatch.setattr(
+        tasks,
+        "get_state_record",
+        lambda db, request_id: fake_state_record,
+    )
+
+    monkeypatch.setattr(
+        tasks,
+        "create_s3_client",
+        lambda region: object(),
+    )
+
+    monkeypatch.setattr(
+        tasks,
+        "verify_active_state_snapshot",
+        lambda client, state_record: state_snapshot,
+    )
+
+    def fake_build_environment():
+        return {
+            "PATH": os.environ.get("PATH", ""),
+            "TF_INPUT": "0",
+            "TF_IN_AUTOMATION": "1",
+        }, tmp_path
+
+    @contextmanager
+    def fake_reconstructed_workspace(**kwargs):
+        initialization_calls["workspace_reconstructed"] = True
+        initialization_calls["workspace_artifacts"] = kwargs
+        yield tmp_path / "fake-destroy-workspace"
+
+    def fail_initialization(
+        workspace,
+        *,
+        timeout_seconds,
+        env,
+        lease_renewal_callback,
+    ):
+        initialization_calls["initialization_called"] = True
+        initialization_calls["timeout_seconds"] = timeout_seconds
+
+        raise TerraformExecutionError(
+            "TEST_TERRAFORM_INIT_FAILURE"
+        )
+
+    monkeypatch.setattr(
+        tasks,
+        "build_terraform_environment",
+        fake_build_environment,
+    )
+
+    monkeypatch.setattr(
+        tasks,
+        "reconstructed_terraform_workspace",
+        fake_reconstructed_workspace,
+    )
+
+    monkeypatch.setattr(
+        tasks,
+        "initialize_terraform_apply_workspace",
+        fail_initialization,
+    )
+
+    try:
+        result = tasks.execute_deprovision_operation.run(
+            operation_id
+        )
+
+        assert result["status"] == "failed", result
+        assert result["operation_id"] == operation_id
+        assert result["error_code"] == (
+            "TERRAFORM_INITIALIZATION_FAILED"
+        )
+
+        assert initialization_calls["workspace_reconstructed"] is True
+        assert initialization_calls["initialization_called"] is True
+        assert initialization_calls["timeout_seconds"] == 180
+
+        reconstructed = initialization_calls["workspace_artifacts"]
+
+        assert reconstructed["plan_artifact_path"] == artifact_path
+        assert reconstructed["provider_lock_path"] == provider_lock_path
+        assert reconstructed["configuration_artifact_path"] == (
+            configuration_path
+        )
+        assert reconstructed["temp_root"] == tmp_path
+
+        db = worker_db()
+        try:
+            operation = db.get(
+                InfrastructureOperation,
+                operation_id,
+            )
+
+            assert operation.status == "failed"
+            assert operation.error_code == (
+                "TERRAFORM_INITIALIZATION_FAILED"
+            )
+            assert operation.result_summary["destroy_confirmed"] is True
+            assert operation.result_summary[
+                "terraform_destroy_enabled"
+            ] is False
+            assert operation.result_summary[
+                "state_snapshot_verified"
+            ] is True
+            assert operation.result_summary[
+                "terraform_initialization_completed"
+            ] is False
+
+        finally:
+            db.close()
+
+    finally:
+        delete_plan_artifact(artifact_path)
+        delete_provider_lock_artifact(provider_lock_path)
+        delete_configuration_artifact(configuration_path)
+
+
+def test_deprovision_worker_handles_unexpected_preflight_exception(
+    worker_db,
+    monkeypatch,
+):
+    with worker_db() as db:
+        (
+            operation_id,
+            state_snapshot,
+            artifact_path,
+            provider_lock_path,
+            configuration_path,
+        ) = create_deprovision_test_operation(db)
+
+    fake_state_record = SimpleNamespace(
+        state_region="ap-south-1",
+    )
+
+    monkeypatch.setattr(
+        tasks,
+        "get_state_record",
+        lambda db, request_id: fake_state_record,
+    )
+
+    monkeypatch.setattr(
+        tasks,
+        "create_s3_client",
+        lambda region: object(),
+    )
+
+    monkeypatch.setattr(
+        tasks,
+        "verify_active_state_snapshot",
+        lambda client, state_record: state_snapshot,
+    )
+
+    def unexpected_environment_failure():
+        raise RuntimeError(
+            "Unexpected environment initialization failure."
+        )
+
+    monkeypatch.setattr(
+        tasks,
+        "build_terraform_environment",
+        unexpected_environment_failure,
+    )
+
+    try:
+        result = tasks.execute_deprovision_operation.run(
+            operation_id
+        )
+
+        assert result["status"] == "failed", result
+        assert result["operation_id"] == operation_id
+        assert result["error_code"] == "DEPROVISION_WORKER_FAILED"
+
+        db = worker_db()
+        try:
+            operation = db.get(
+                InfrastructureOperation,
+                operation_id,
+            )
+
+            assert operation.status == "failed"
+            assert operation.error_code == (
+                "DEPROVISION_WORKER_FAILED"
+            )
+            assert operation.result_summary[
+                "terraform_destroy_enabled"
+            ] is False
+
+        finally:
+            db.close()
+
+    finally:
+        delete_plan_artifact(artifact_path)
+        delete_provider_lock_artifact(provider_lock_path)
+        delete_configuration_artifact(configuration_path)
+
+
+def test_recovery_disables_destroy_for_stale_deprovision_operation(
+    worker_db,
+):
+    db = worker_db()
+
+    try:
+        operation_id = create_recovery_test_operation(
+            db,
+            "stale-deprovision@example.com",
+            "running",
+            datetime.now(timezone.utc) - timedelta(minutes=10),
+            operation_type="deprovision",
+        )
+    finally:
+        db.close()
+
+    result = tasks.recover_stale_infrastructure_operations.run()
+
+    assert result["status"] == "completed"
+    assert result["recovered_count"] == 1
+    assert operation_id in result["recovered_operation_ids"]
+    assert result["automatic_retry"] is False
+
+    db = worker_db()
+
+    try:
+        operation = db.get(
+            InfrastructureOperation,
+            operation_id,
+        )
+
+        assert operation.operation == "deprovision"
+        assert operation.status == "failed"
+        assert operation.error_code == "WORKER_STALE_OPERATION"
+
+        assert operation.execution_token is None
+        assert operation.lease_expires_at is None
+
+        assert operation.result_summary["manual_review_required"] is True
+        assert operation.result_summary["terraform_apply_enabled"] is False
+        assert operation.result_summary["terraform_destroy_enabled"] is False
+
+        event = db.scalar(
+            select(InfrastructureOperationEvent).where(
+                InfrastructureOperationEvent.operation_id == operation_id
+            )
+        )
+
+        assert event is not None
+        assert event.event_type == "worker_lease_expired"
+        assert event.event_metadata["automatic_retry"] is False
 
     finally:
         db.close()

@@ -423,6 +423,17 @@ def _run_controlled_process(
                     + lease_renewal_interval_seconds
                 )
 
+        # Verify ownership once more after the process exits.
+        try:
+            ownership_valid = lease_renewal_callback()
+        except Exception as exc:
+            raise TerraformExecutionError(
+                "WORKER_LEASE_RENEWAL_FAILED"
+            ) from exc
+
+        if ownership_valid is not True:
+            raise TerraformExecutionError("WORKER_LEASE_LOST")
+
     except BaseException:
         if process.poll() is None:
             _terminate_process_group(process)

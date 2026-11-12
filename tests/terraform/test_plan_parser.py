@@ -272,3 +272,31 @@ def test_detects_circular_dependencies():
 
     with pytest.raises(TerraformPlanParsingError):
         parse_terraform_plan(plan)
+
+@pytest.mark.parametrize(
+    "address",
+    [
+        None,
+        "",
+        "   ",
+        123,
+        [],
+        {},
+    ],
+)
+def test_rejects_invalid_resource_address(address):
+    plan = {
+        "resource_changes": [
+            {
+                "address": address,
+                "change": {
+                    "actions": ["create"],
+                    "before": None,
+                    "after": {},
+                },
+            }
+        ]
+    }
+
+    with pytest.raises(TerraformPlanParsingError):
+        parse_terraform_plan(plan)

@@ -42,6 +42,16 @@ from backend.app.services.terraform.execution import (
     reconstructed_terraform_workspace,
     initialize_terraform_apply_workspace,
 )
+from backend.app.services.terraform.state_manager import (
+    TerraformStateError,
+    get_state_record,
+    verify_active_state_snapshot,
+)
+
+from backend.app.services.terraform.s3_state_storage import (
+    S3StateStorageError,
+    create_s3_client,
+)
 
 WORKER_LEASE_MINUTES = 15
 
@@ -143,6 +153,7 @@ def _finish_operation(
     error_code: str,
     message: str,
     preflight_passed: bool = False,
+    result_summary_extra: dict | None = None,
 ) -> bool:
     """Finish an operation only while this worker owns its lease."""
 
@@ -166,6 +177,7 @@ def _finish_operation(
                 "message": message,
                 "preflight_passed": preflight_passed,
                 "terraform_apply_enabled": False,
+                **(result_summary_extra or {}),
             },
         )
         .execution_options(synchronize_session=False)
@@ -204,6 +216,7 @@ def _owned_operation_result(
     error_code: str,
     message: str,
     preflight_passed: bool = False,
+    result_summary_extra: dict | None = None,
 ) -> dict:
     finished = _finish_operation(
         db=db,
@@ -213,6 +226,7 @@ def _owned_operation_result(
         error_code=error_code,
         message=message,
         preflight_passed=preflight_passed,
+        result_summary_extra=result_summary_extra,
     )
 
     if not finished:
@@ -252,6 +266,7 @@ def execute_provision_operation(operation_id: int) -> dict:
             .where(
                 InfrastructureOperation.id == operation_id,
                 InfrastructureOperation.status == "queued",
+                InfrastructureOperation.operation == "provision",
             )
             .values(
                 status="running",
@@ -621,6 +636,548 @@ def execute_provision_operation(operation_id: int) -> dict:
 
 
 @celery_app.task(
+    name="aiops.execute_deprovision_operation",
+)
+def execute_deprovision_operation(operation_id: int) -> dict:
+    """Validate a confirmed destroy request without executing Terraform destroy."""
+
+    db = SessionLocal()
+    execution_token = str(uuid4())
+
+    try:
+        now = datetime.now(timezone.utc)
+
+        # Atomically claim only a queued deprovision operation.
+        claim_result = db.execute(
+            update(InfrastructureOperation)
+            .where(
+                InfrastructureOperation.id == operation_id,
+                InfrastructureOperation.status == "queued",
+                InfrastructureOperation.operation == "deprovision",
+            )
+            .values(
+                status="running",
+                started_at=now,
+                execution_token=execution_token,
+                lease_expires_at=now + timedelta(
+                    minutes=WORKER_LEASE_MINUTES
+                ),
+            )
+        )
+
+        if claim_result.rowcount != 1:
+            db.rollback()
+
+            operation = db.get(
+                InfrastructureOperation,
+                operation_id,
+            )
+
+            if operation is None:
+                return {
+                    "status": "not_found",
+                    "operation_id": operation_id,
+                }
+
+            return {
+                "status": operation.status,
+                "operation_id": operation_id,
+                "message": (
+                    "Operation is not a queued deprovision operation."
+                ),
+            }
+
+        db.commit()
+        db.expire_all()
+
+        operation = db.get(
+            InfrastructureOperation,
+            operation_id,
+        )
+
+        if operation is None:
+            return {
+                "status": "not_found",
+                "operation_id": operation_id,
+            }
+
+        # Validate explicit destroy confirmation.
+        result_summary = operation.result_summary or {}
+
+        if result_summary.get("destroy_confirmed") is not True:
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "DESTROY_CONFIRMATION_MISSING",
+                "Explicit destroy confirmation is missing.",
+                result_summary_extra={
+                    "destroy_confirmed": False,
+                    "terraform_destroy_enabled": False,
+                },
+            )
+
+        # Load the records associated with this operation.
+        approval = db.get(
+            ApprovalRequest,
+            operation.approval_request_id,
+        )
+        infrastructure_request = db.get(
+            InfrastructureRequest,
+            operation.infrastructure_request_id,
+        )
+        plan = db.get(
+            TerraformPlanRecord,
+            operation.terraform_plan_record_id,
+        )
+
+        if not all((approval, infrastructure_request, plan)):
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "DEPROVISION_RECORDS_MISSING",
+                "Required approval, infrastructure request or plan was not found.",
+                result_summary_extra={
+                    "destroy_confirmed": True,
+                    "terraform_destroy_enabled": False,
+                },
+            )
+
+        # Verify that all records refer to the same request and plan.
+        if (
+            approval.infrastructure_request_id
+            != infrastructure_request.id
+            or approval.terraform_plan_record_id != plan.id
+            or plan.infrastructure_request_id
+            != infrastructure_request.id
+            or plan.requester_id != operation.requester_id
+            or approval.requester_id != operation.requester_id
+        ):
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "DEPROVISION_OWNERSHIP_MISMATCH",
+                "The operation, approval and Terraform plan ownership do not match.",
+                result_summary_extra={
+                    "destroy_confirmed": True,
+                    "terraform_destroy_enabled": False,
+                },
+            )
+
+        # Verify that the infrastructure request belongs to the requester.
+        conversation = db.get(
+            Conversation,
+            infrastructure_request.conversation_id,
+        )
+
+        if (
+            conversation is None
+            or conversation.user_id != operation.requester_id
+        ):
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "REQUEST_OWNERSHIP_MISMATCH",
+                "The infrastructure request ownership check failed.",
+                result_summary_extra={
+                    "destroy_confirmed": True,
+                    "terraform_destroy_enabled": False,
+                },
+            )
+
+        # Only an approved deprovision plan can continue.
+        if (
+            operation.operation != "deprovision"
+            or plan.operation != "deprovision"
+            or plan.status != "succeeded"
+            or approval.status != "approved"
+        ):
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "DEPROVISION_APPROVAL_INVALID",
+                "The deprovision plan or its approval is not in an eligible state.",
+                result_summary_extra={
+                    "destroy_confirmed": True,
+                    "terraform_destroy_enabled": False,
+                },
+            )
+
+        # The approval must reference this exact Terraform plan.
+        if approval.plan_fingerprint != plan.plan_fingerprint:
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "DEPROVISION_PLAN_FINGERPRINT_MISMATCH",
+                "The approved plan fingerprint does not match the deprovision plan.",
+                result_summary_extra={
+                    "destroy_confirmed": True,
+                    "terraform_destroy_enabled": False,
+                },
+            )
+
+        # Verify that all three independent approval stages are approved.
+        stage_reviews = db.execute(
+            select(ApprovalStageReview).where(
+                ApprovalStageReview.approval_request_id == approval.id,
+            )
+        ).scalars().all()
+
+        required_stages = {"technical", "cost", "security"}
+
+        review_statuses = {
+            review.stage: review.status
+            for review in stage_reviews
+        }
+
+        if (
+            set(review_statuses) != required_stages
+            or any(
+                review_statuses[stage] != "approved"
+                for stage in required_stages
+            )
+        ):
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "DEPROVISION_STAGE_APPROVAL_INCOMPLETE",
+                "Technical, cost and security reviews must all be approved before destruction.",
+                result_summary_extra={
+                    "destroy_confirmed": True,
+                    "terraform_destroy_enabled": False,
+                },
+            )
+
+        # Revalidate the current infrastructure specification.
+        try:
+            specification = (
+                ValidatedInfrastructureSpecification.model_validate(
+                    infrastructure_request.requirements
+                )
+            )
+        except Exception:
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "SPECIFICATION_INVALID",
+                "The infrastructure specification is no longer valid.",
+                result_summary_extra={
+                    "destroy_confirmed": True,
+                    "terraform_destroy_enabled": False,
+                },
+            )
+
+        current_fingerprint = _fingerprint_specification(
+            specification
+        )
+
+        if plan.specification_fingerprint != current_fingerprint:
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "SPECIFICATION_FINGERPRINT_MISMATCH",
+                "Infrastructure requirements changed after destroy plan generation.",
+                result_summary_extra={
+                    "destroy_confirmed": True,
+                    "terraform_destroy_enabled": False,
+                },
+            )
+
+        # Retrieve the state record for this infrastructure request.
+        state_record = get_state_record(
+            db,
+            infrastructure_request.id,
+        )
+
+        if state_record is None:
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "STATE_RECORD_MISSING",
+                "Terraform state record was not found.",
+                result_summary_extra={
+                    "destroy_confirmed": True,
+                    "terraform_destroy_enabled": False,
+                    "state_snapshot_verified": False,
+                },
+            )
+
+        # Verify the current S3 state against the inventory snapshot.
+        try:
+            s3_client = create_s3_client(
+                state_record.state_region,
+            )
+
+            current_snapshot = verify_active_state_snapshot(
+                s3_client,
+                state_record,
+            )
+
+        except (TerraformStateError, S3StateStorageError):
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "STATE_SNAPSHOT_VERIFICATION_FAILED",
+                "The current Terraform state could not be verified. Synchronize inventory and investigate before destruction.",
+                result_summary_extra={
+                    "destroy_confirmed": True,
+                    "terraform_destroy_enabled": False,
+                    "state_snapshot_verified": False,
+                },
+            )
+
+        # The destroy plan must reference exactly the same state
+        # version, serial, lineage and checksum that we just verified.
+        plan_snapshot = {
+            "version_id": plan.state_version_id,
+            "serial": plan.state_serial,
+            "lineage": plan.state_lineage,
+            "sha256": plan.state_sha256,
+        }
+
+        if plan_snapshot != current_snapshot:
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "DESTROY_PLAN_STATE_SNAPSHOT_MISMATCH",
+                "Terraform state has changed since the destroy plan was generated. Generate a new destroy plan before proceeding.",
+                result_summary_extra={
+                    "destroy_confirmed": True,
+                    "terraform_destroy_enabled": False,
+                    "state_snapshot_verified": False,
+                },
+            )
+
+        # Verify the Terraform binary plan artifact.
+        if not plan.artifact_path or not plan.artifact_sha256:
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "PLAN_ARTIFACT_MISSING",
+                "The Terraform destroy plan artifact is unavailable.",
+                result_summary_extra={
+                    "destroy_confirmed": True,
+                    "terraform_destroy_enabled": False,
+                    "state_snapshot_verified": True,
+                },
+            )
+
+        if plan.plan_fingerprint != plan.artifact_sha256:
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "PLAN_ARTIFACT_FINGERPRINT_MISMATCH",
+                "The destroy plan fingerprint does not match its stored artifact checksum.",
+                result_summary_extra={
+                    "destroy_confirmed": True,
+                    "terraform_destroy_enabled": False,
+                    "state_snapshot_verified": True,
+                },
+            )
+
+        try:
+            load_plan_artifact(
+                plan.artifact_path,
+                plan.artifact_sha256,
+            )
+        except TerraformArtifactError:
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "PLAN_ARTIFACT_INVALID",
+                "Terraform destroy plan artifact integrity verification failed.",
+                result_summary_extra={
+                    "destroy_confirmed": True,
+                    "terraform_destroy_enabled": False,
+                    "state_snapshot_verified": True,
+                },
+            )
+
+        # Verify the provider lock artifact.
+        if not plan.provider_lock_path or not plan.provider_lock_sha256:
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "PROVIDER_LOCK_ARTIFACT_MISSING",
+                "The Terraform provider lock artifact is unavailable.",
+                result_summary_extra={
+                    "destroy_confirmed": True,
+                    "terraform_destroy_enabled": False,
+                    "state_snapshot_verified": True,
+                },
+            )
+
+        try:
+            load_provider_lock_artifact(
+                plan.provider_lock_path,
+                plan.provider_lock_sha256,
+            )
+        except TerraformArtifactError:
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "PROVIDER_LOCK_ARTIFACT_INVALID",
+                "Terraform provider lock artifact integrity verification failed.",
+                result_summary_extra={
+                    "destroy_confirmed": True,
+                    "terraform_destroy_enabled": False,
+                    "state_snapshot_verified": True,
+                },
+            )
+
+        # Verify the exact Terraform configuration used by the destroy plan.
+        if (
+            not plan.configuration_artifact_path
+            or not plan.configuration_artifact_sha256
+        ):
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "CONFIGURATION_ARTIFACT_MISSING",
+                "The Terraform configuration artifact is unavailable.",
+                result_summary_extra={
+                    "destroy_confirmed": True,
+                    "terraform_destroy_enabled": False,
+                    "state_snapshot_verified": True,
+                },
+            )
+
+        try:
+            load_configuration_artifact(
+                plan.configuration_artifact_path,
+                plan.configuration_artifact_sha256,
+            )
+        except TerraformArtifactError:
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "CONFIGURATION_ARTIFACT_INVALID",
+                "Terraform configuration artifact integrity verification failed.",
+                result_summary_extra={
+                    "destroy_confirmed": True,
+                    "terraform_destroy_enabled": False,
+                    "state_snapshot_verified": True,
+                },
+            )
+
+        # Reconstruct the exact Terraform workspace used for the destroy plan.
+        env, temp_root = build_terraform_environment()
+
+        try:
+            with reconstructed_terraform_workspace(
+                configuration_artifact_path=(
+                    plan.configuration_artifact_path
+                ),
+                configuration_artifact_sha256=(
+                    plan.configuration_artifact_sha256
+                ),
+                provider_lock_path=plan.provider_lock_path,
+                provider_lock_sha256=plan.provider_lock_sha256,
+                plan_artifact_path=plan.artifact_path,
+                plan_artifact_sha256=plan.artifact_sha256,
+                temp_root=temp_root,
+            ) as workspace:
+                # This performs Terraform initialization only.
+                initialize_terraform_apply_workspace(
+                    workspace,
+                    timeout_seconds=180,
+                    env=env,
+                    lease_renewal_callback=lambda: _renew_operation_lease(
+                        operation_id,
+                        execution_token,
+                    ),
+                )
+
+        except TerraformExecutionError:
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "failed",
+                "TERRAFORM_INITIALIZATION_FAILED",
+                "Terraform workspace initialization failed during destroy preflight.",
+                result_summary_extra={
+                    "destroy_confirmed": True,
+                    "terraform_destroy_enabled": False,
+                    "state_snapshot_verified": True,
+                    "terraform_initialization_completed": False,
+                },
+            )
+
+        # All preflight checks passed, but actual destruction remains disabled.
+        return _owned_operation_result(
+            db,
+            operation_id,
+            execution_token,
+            "blocked",
+            "TERRAFORM_DESTROY_DISABLED",
+            "Destroy preflight completed successfully. Terraform destroy execution remains disabled.",
+            preflight_passed=True,
+            result_summary_extra={
+                "destroy_confirmed": True,
+                "terraform_destroy_enabled": False,
+                "state_snapshot_verified": True,
+                "terraform_initialization_completed": True,
+            },
+        )
+
+    except Exception:
+        db.rollback()
+
+        return _owned_operation_result(
+            db,
+            operation_id,
+            execution_token,
+            "failed",
+            "DEPROVISION_WORKER_FAILED",
+            "An unexpected error occurred during deprovision preflight.",
+            result_summary_extra={
+                "terraform_destroy_enabled": False,
+            },
+        )
+
+    finally:
+        db.close()
+
+
+@celery_app.task(
     name="aiops.recover_stale_infrastructure_operations",
 )
 def recover_stale_infrastructure_operations(
@@ -680,6 +1237,7 @@ def recover_stale_infrastructure_operations(
                         ),
                         "recovery_source": "celery_recovery_task",
                         "terraform_apply_enabled": False,
+                        "terraform_destroy_enabled": False,
                         "manual_review_required": True,
                     },
                 )

@@ -1,6 +1,5 @@
 from datetime import datetime
-from typing import Any
-
+from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -66,3 +65,12 @@ class InfrastructureInventorySyncResponse(BaseModel):
     updated: int
     unchanged: int
     marked_absent: int
+
+class InfrastructureDeprovisionCreate(BaseModel):
+    """Request to destroy infrastructure after explicit confirmation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    approval_request_id: int = Field(gt=0)
+    confirm_destroy: Literal[True]
+    comments: str | None = Field(default=None, max_length=5000)

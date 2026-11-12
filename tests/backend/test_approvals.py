@@ -210,7 +210,11 @@ def _create_test_plan_artifact(setup_data):
     return artifact_path, artifact_checksum
 
 
-def create_trusted_plan_record(setup_data, plan=None):
+def create_trusted_plan_record(
+    setup_data,
+    plan=None,
+    operation="provision",
+):
     """
     Create a successful test plan record with a verified test artifact.
 
@@ -236,6 +240,7 @@ def create_trusted_plan_record(setup_data, plan=None):
         plan_record = TerraformPlanRecord(
             infrastructure_request_id=infra_request.id,
             requester_id=setup_data["requester_id"],
+            operation=operation,
             status="succeeded",
             plan_fingerprint=artifact_checksum,
             specification_fingerprint=_fingerprint_specification(
@@ -254,7 +259,11 @@ def create_trusted_plan_record(setup_data, plan=None):
         db.close()
 
 
-def create_pending_approval(setup_data, plan=None):
+def create_pending_approval(
+    setup_data,
+    plan=None,
+    operation="provision",
+):
     """
     Create a linked plan record, pending approval, and audit event.
 
@@ -280,6 +289,7 @@ def create_pending_approval(setup_data, plan=None):
         plan_record = TerraformPlanRecord(
             infrastructure_request_id=infra_request.id,
             requester_id=setup_data["requester_id"],
+            operation=operation,
             status="succeeded",
             plan_fingerprint=artifact_checksum,
             specification_fingerprint=_fingerprint_specification(
@@ -584,7 +594,59 @@ def test_approval_uses_trusted_plan_record(
     assert result["status"] == "pending"
     assert result["plan_summary"] == valid_plan
 
+def test_approval_accepts_trusted_deprovision_plan(
+    client, setup_data, valid_plan
+):
+    plan_record_id = create_trusted_plan_record(
+        setup_data,
+        valid_plan,
+        operation="deprovision",
+    )
 
+    response = client.post(
+        "/approvals",
+        headers=setup_data["requester_headers"],
+        json={
+            "infrastructure_request_id": setup_data["infra_request_id"],
+            "terraform_plan_record_id": plan_record_id,
+        },
+    )
+
+    assert response.status_code == 201, response.text
+
+    result = response.json()
+
+    assert result["terraform_plan_record_id"] == plan_record_id
+    assert result["infrastructure_request_id"] == (
+        setup_data["infra_request_id"]
+    )
+    assert result["status"] == "pending"
+
+    db = TestingSessionLocal()
+    try:
+        plan_record = db.get(TerraformPlanRecord, plan_record_id)
+        assert plan_record is not None
+        assert plan_record.operation == "deprovision"
+
+        approval = db.get(ApprovalRequest, result["id"])
+        assert approval is not None
+        assert approval.terraform_plan_record_id == plan_record_id
+
+        reviews = db.scalars(
+            select(ApprovalStageReview).where(
+                ApprovalStageReview.approval_request_id == approval.id
+            )
+        ).all()
+
+        assert {review.stage for review in reviews} == {
+            "technical",
+            "cost",
+            "security",
+        }
+        assert all(review.status == "pending" for review in reviews)
+
+    finally:
+        db.close()
 
 def test_approval_rejects_duplicate_for_same_plan(
     client, setup_data, valid_plan
@@ -1130,6 +1192,42 @@ def test_provision_rejects_modified_plan_artifact(
 
     assert response.status_code == 409, response.text
     assert "integrity verification failed" in response.json()["detail"]
+
+def test_provision_rejects_approved_deprovision_plan(
+    client,
+    setup_data,
+    valid_plan,
+    monkeypatch,
+):
+    approval_id = create_pending_approval(
+        setup_data,
+        valid_plan,
+        operation="deprovision",
+    )
+
+    approve_all_stages(client, setup_data, approval_id)
+
+    response = client.post(
+        f"/approvals/{approval_id}/decision",
+        headers=setup_data["reviewer_headers"],
+        json={
+            "decision": "approved",
+            "comments": "Destroy plan reviewed.",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+
+    provision_response = client.post(
+        "/infrastructure-operations/provision",
+        headers=setup_data["requester_headers"],
+        json={"approval_request_id": approval_id},
+    )
+
+    assert provision_response.status_code == 409
+    assert "Only provisioning plans can be provisioned." in (
+        provision_response.json()["detail"]
+    )
 
 def test_duplicate_provision_operation_is_rejected(
     client,

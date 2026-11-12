@@ -1277,3 +1277,346 @@ def test_empty_inventory_state_serial_is_persisted_and_protected(
 
     finally:
         db.close()
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"approval_request_id": 1},
+        {
+            "approval_request_id": 1,
+            "confirm_destroy": False,
+        },
+    ],
+)
+def test_deprovision_requires_explicit_destroy_confirmation(
+    client,
+    setup_data,
+    payload,
+):
+    response = client.post(
+        "/infrastructure-operations/deprovision",
+        headers=setup_data["requester_headers"],
+        json=payload,
+    )
+
+    assert response.status_code == 422
+
+def test_deprovision_creates_confirmed_operation(
+    client,
+    setup_data,
+    monkeypatch,
+):
+    from types import SimpleNamespace
+    from backend.app.workers import tasks
+
+    request_id = setup_data["request_id"]
+    requester_id = setup_data["requester_id"]
+
+    db = TestingSessionLocal()
+
+    try:
+        plan = TerraformPlanRecord(
+            infrastructure_request_id=request_id,
+            requester_id=requester_id,
+            operation="deprovision",
+            status="succeeded",
+            plan_fingerprint="a" * 64,
+            specification_fingerprint="b" * 64,
+            plan_summary={},
+        )
+        db.add(plan)
+        db.flush()
+
+        approval = ApprovalRequest(
+            infrastructure_request_id=request_id,
+            terraform_plan_record_id=plan.id,
+            requester_id=requester_id,
+            status="approved",
+            plan_summary={},
+            plan_fingerprint="a" * 64,
+        )
+        db.add(approval)
+        db.commit()
+
+        approval_id = approval.id
+        plan_id = plan.id
+
+    finally:
+        db.close()
+
+    def fake_validate_approved_plan(
+        approval,
+        current_user_id,
+        db,
+        expected_operation="provision",
+    ):
+        assert expected_operation == "deprovision"
+
+        return (
+            db.get(InfrastructureRequest, request_id),
+            db.get(TerraformPlanRecord, plan_id),
+        )
+
+    dispatched = []
+
+    def fake_dispatch(operation_id):
+        dispatched.append(operation_id)
+        return SimpleNamespace(id="test-deprovision-task")
+
+    monkeypatch.setattr(
+        operations_api,
+        "validate_approved_plan",
+        fake_validate_approved_plan,
+    )
+
+    monkeypatch.setattr(
+        tasks.execute_deprovision_operation,
+        "delay",
+        fake_dispatch,
+    )
+
+    response = client.post(
+        "/infrastructure-operations/deprovision",
+        headers=setup_data["requester_headers"],
+        json={
+            "approval_request_id": approval_id,
+            "confirm_destroy": True,
+            "comments": "Confirmed deprovision request",
+        },
+    )
+
+    assert response.status_code == 202, response.text
+
+    body = response.json()
+
+    assert body["operation"] == "deprovision"
+    assert body["status"] == "queued"
+    assert body["celery_task_id"] == "test-deprovision-task"
+    assert body["result_summary"]["destroy_confirmed"] is True
+    assert body["result_summary"]["terraform_destroy_enabled"] is False
+
+    assert dispatched == [body["id"]]
+
+    db = TestingSessionLocal()
+
+    try:
+        audit = db.query(ApprovalAuditEvent).filter_by(
+            approval_request_id=approval_id,
+            event_type="deprovision_requested",
+        ).one()
+
+        assert audit.actor_id == requester_id
+        assert audit.event_metadata["destroy_confirmed"] is True
+
+    finally:
+        db.close()
+
+def test_deprovision_dispatch_failure_is_audited(
+    client,
+    setup_data,
+    monkeypatch,
+):
+    from backend.app.workers import tasks
+
+    request_id = setup_data["request_id"]
+    requester_id = setup_data["requester_id"]
+
+    db = TestingSessionLocal()
+
+    try:
+        plan = TerraformPlanRecord(
+            infrastructure_request_id=request_id,
+            requester_id=requester_id,
+            operation="deprovision",
+            status="succeeded",
+            plan_fingerprint="a" * 64,
+            specification_fingerprint="b" * 64,
+            plan_summary={},
+        )
+        db.add(plan)
+        db.flush()
+
+        approval = ApprovalRequest(
+            infrastructure_request_id=request_id,
+            terraform_plan_record_id=plan.id,
+            requester_id=requester_id,
+            status="approved",
+            plan_summary={},
+            plan_fingerprint="a" * 64,
+        )
+        db.add(approval)
+        db.commit()
+
+        approval_id = approval.id
+        plan_id = plan.id
+
+    finally:
+        db.close()
+
+    def fake_validate_approved_plan(
+        approval,
+        current_user_id,
+        db,
+        expected_operation="provision",
+    ):
+        assert expected_operation == "deprovision"
+
+        return (
+            db.get(InfrastructureRequest, request_id),
+            db.get(TerraformPlanRecord, plan_id),
+        )
+
+    def fail_dispatch(operation_id):
+        raise RuntimeError("Broker unavailable")
+
+    monkeypatch.setattr(
+        operations_api,
+        "validate_approved_plan",
+        fake_validate_approved_plan,
+    )
+
+    monkeypatch.setattr(
+        tasks.execute_deprovision_operation,
+        "delay",
+        fail_dispatch,
+    )
+
+    response = client.post(
+        "/infrastructure-operations/deprovision",
+        headers=setup_data["requester_headers"],
+        json={
+            "approval_request_id": approval_id,
+            "confirm_destroy": True,
+            "comments": "Confirmed deprovision request",
+        },
+    )
+
+    assert response.status_code == 202, response.text
+
+    body = response.json()
+
+    assert body["status"] == "failed"
+    assert body["error_code"] == "CELERY_DISPATCH_FAILED"
+    assert body["result_summary"]["destroy_confirmed"] is True
+    assert body["result_summary"]["terraform_destroy_enabled"] is False
+
+    operation_id = body["id"]
+
+    db = TestingSessionLocal()
+
+    try:
+        event = db.query(InfrastructureOperationEvent).filter_by(
+            operation_id=operation_id,
+            event_type="celery_dispatch_failed",
+        ).one()
+
+        assert event.actor_type == "system"
+        assert event.actor_id is None
+        assert event.previous_status == "queued"
+        assert event.new_status == "failed"
+        assert event.event_metadata["automatic_retry"] is False
+
+    finally:
+        db.close()
+
+def test_deprovision_returns_409_for_database_uniqueness_conflict(
+    client,
+    setup_data,
+    monkeypatch,
+):
+    request_id = setup_data["request_id"]
+    requester_id = setup_data["requester_id"]
+
+    db = TestingSessionLocal()
+
+    try:
+        plan = TerraformPlanRecord(
+            infrastructure_request_id=request_id,
+            requester_id=requester_id,
+            operation="deprovision",
+            status="succeeded",
+            plan_fingerprint="a" * 64,
+            specification_fingerprint="b" * 64,
+            plan_summary={},
+        )
+        db.add(plan)
+        db.flush()
+
+        approval = ApprovalRequest(
+            infrastructure_request_id=request_id,
+            terraform_plan_record_id=plan.id,
+            requester_id=requester_id,
+            status="approved",
+            plan_summary={},
+            plan_fingerprint="a" * 64,
+        )
+        db.add(approval)
+        db.commit()
+
+        approval_id = approval.id
+        plan_id = plan.id
+
+    finally:
+        db.close()
+
+    def fake_validate_approved_plan(
+        approval,
+        current_user_id,
+        db,
+        expected_operation="provision",
+    ):
+        assert expected_operation == "deprovision"
+
+        return (
+            db.get(InfrastructureRequest, request_id),
+            db.get(TerraformPlanRecord, plan_id),
+        )
+
+    monkeypatch.setattr(
+        operations_api,
+        "validate_approved_plan",
+        fake_validate_approved_plan,
+    )
+
+    original_flush = Session.flush
+
+    def simulate_unique_constraint_conflict(
+        self,
+        *args,
+        **kwargs,
+    ):
+        if any(
+            isinstance(item, InfrastructureOperation)
+            for item in self.new
+        ):
+            raise operations_api.IntegrityError(
+                "INSERT",
+                {},
+                sqlite3.IntegrityError(
+                    "UNIQUE constraint failed: "
+                    "infrastructure_operations.approval_request_id, "
+                    "infrastructure_operations.operation"
+                ),
+            )
+
+        return original_flush(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        Session,
+        "flush",
+        simulate_unique_constraint_conflict,
+    )
+
+    response = client.post(
+        "/infrastructure-operations/deprovision",
+        headers=setup_data["requester_headers"],
+        json={
+            "approval_request_id": approval_id,
+            "confirm_destroy": True,
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "A deprovision operation already exists for this approval."
+    )

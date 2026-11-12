@@ -374,6 +374,12 @@ def parse_terraform_plan(plan: dict[str, Any]) -> dict[str, Any]:
         )
 
         address = resource.get("address")
+
+        if not isinstance(address, str) or not address.strip():
+            raise TerraformPlanParsingError(
+                "Each resource change must have a non-empty address."
+            )
+
         resource_type = resource.get("type")
         resource_name = resource.get("name")
 

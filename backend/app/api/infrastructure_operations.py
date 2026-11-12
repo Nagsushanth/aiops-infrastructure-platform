@@ -37,6 +37,7 @@ from backend.app.schemas.infrastructure_operation import (
     InfrastructureOperationResponse,
     TerraformStateVersionResponse,
     TerraformStateVersionSyncResponse,
+    InfrastructureDeprovisionCreate
 )
 
 from backend.app.services.terraform.artifacts import (
@@ -158,6 +159,7 @@ def validate_approved_plan(
     approval: ApprovalRequest,
     current_user_id: int,
     db: Session,
+    expected_operation: str = "provision",
 ):
     """Validate ownership, approval stages, plan integrity and freshness."""
 
@@ -200,10 +202,18 @@ def validate_approved_plan(
             detail="Trusted Terraform plan not found.",
         )
 
-    if plan.operation != "provision":
+    if plan.operation != expected_operation:
+        detail = {
+            "provision": "Only provisioning plans can be provisioned.",
+            "deprovision": "Only deprovision plans can be used for destruction.",
+        }.get(
+            expected_operation,
+            "Terraform plan operation does not match the requested operation.",
+        )
+
         raise HTTPException(
             status_code=409,
-            detail="Only provisioning plans can be provisioned.",
+            detail=detail,
         )
 
     if plan.status != "succeeded":
@@ -512,6 +522,173 @@ def get_operation(
             status_code=404,
             detail="Infrastructure operation not found.",
         )
+
+    return operation
+
+
+@router.post(
+    "/deprovision",
+    response_model=InfrastructureOperationResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def create_deprovision_operation(
+    payload: InfrastructureDeprovisionCreate,
+    current_user: CurrentUser,
+    db: Session = Depends(get_db),
+):
+    """Queue a confirmed deprovision operation."""
+
+    approval = db.get(
+        ApprovalRequest,
+        payload.approval_request_id,
+    )
+
+    if approval is None or approval.requester_id != current_user.id:
+        raise HTTPException(
+            status_code=404,
+            detail="Approval request not found.",
+        )
+
+    infrastructure_request, plan = validate_approved_plan(
+        approval,
+        current_user.id,
+        db,
+        expected_operation="deprovision",
+    )
+
+    # Prevent reusing the same approval for multiple destroy operations.
+    existing_operation = db.scalar(
+        select(InfrastructureOperation).where(
+            InfrastructureOperation.approval_request_id == approval.id,
+            InfrastructureOperation.operation == "deprovision",
+        )
+    )
+
+    if existing_operation is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="A deprovision operation already exists for this approval.",
+        )
+
+    operation = InfrastructureOperation(
+        infrastructure_request_id=infrastructure_request.id,
+        terraform_plan_record_id=plan.id,
+        approval_request_id=approval.id,
+        requester_id=current_user.id,
+        operation="deprovision",
+        status="queued",
+        comments=payload.comments,
+        result_summary={
+            "message": "Destroy operation queued for preflight.",
+            "destroy_confirmed": True,
+            "terraform_destroy_enabled": False,
+        },
+    )
+
+    try:
+        db.add(operation)
+        db.flush()
+
+        db.add(
+            ApprovalAuditEvent(
+                approval_request_id=approval.id,
+                actor_id=current_user.id,
+                event_type="deprovision_requested",
+                previous_status="approved",
+                new_status="approved",
+                comments=payload.comments,
+                event_metadata={
+                    "source": "infrastructure_operations_api",
+                    "operation_id": operation.id,
+                    "terraform_plan_record_id": plan.id,
+                    "destroy_confirmed": True,
+                },
+            )
+        )
+
+        db.commit()
+        db.refresh(operation)
+
+    except IntegrityError as exc:
+        db.rollback()
+
+        if is_duplicate_operation_integrity_error(exc):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "A deprovision operation already exists "
+                    "for this approval."
+                ),
+            ) from exc
+
+        raise
+
+    except Exception:
+        db.rollback()
+        raise
+
+    # Dispatch only after the database transaction has committed.
+    operation_id = operation.id
+
+    try:
+        from backend.app.workers.tasks import (
+            execute_deprovision_operation,
+        )
+
+        task = execute_deprovision_operation.delay(operation_id)
+
+    except Exception:
+        db.rollback()
+
+        operation = db.get(
+            InfrastructureOperation,
+            operation_id,
+        )
+
+        if operation is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=(
+                    "The operation record could not be reloaded "
+                    "after dispatch failure."
+                ),
+            )
+
+        operation.status = "failed"
+        operation.error_code = "CELERY_DISPATCH_FAILED"
+        operation.completed_at = datetime.now(timezone.utc)
+        operation.result_summary = {
+            "message": "The background worker could not be reached.",
+            "destroy_confirmed": True,
+            "terraform_destroy_enabled": False,
+            "automatic_retry": False,
+        }
+
+        db.add(
+            InfrastructureOperationEvent(
+                operation_id=operation.id,
+                actor_id=None,
+                actor_type="system",
+                event_type="celery_dispatch_failed",
+                previous_status="queued",
+                new_status="failed",
+                comments="The background worker could not be reached.",
+                event_metadata={
+                    "source": "infrastructure_operations_api",
+                    "error_code": "CELERY_DISPATCH_FAILED",
+                    "automatic_retry": False,
+                    "terraform_destroy_enabled": False,
+                },
+            )
+        )
+
+        db.commit()
+        db.refresh(operation)
+        return operation
+
+    operation.celery_task_id = task.id
+    db.commit()
+    db.refresh(operation)
 
     return operation
 

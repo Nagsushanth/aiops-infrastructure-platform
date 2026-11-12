@@ -678,6 +678,47 @@ def test_controlled_process_terminates_when_lease_is_lost():
 
     assert exc.value.code == "WORKER_LEASE_LOST"
 
+def test_controlled_process_rejects_lost_lease_after_process_exits():
+    callback_calls = []
+
+    def lease_callback():
+        callback_calls.append(True)
+        return False
+
+    with pytest.raises(TerraformExecutionError) as exc:
+        execution_module._run_controlled_process(
+            [sys.executable, "-c", "print('process-finished')"],
+            cwd=Path.cwd(),
+            timeout_seconds=5,
+            env=dict(os.environ),
+            lease_renewal_callback=lease_callback,
+            lease_renewal_interval_seconds=10,
+        )
+
+    assert exc.value.code == "WORKER_LEASE_LOST"
+    assert len(callback_calls) == 1
+
+
+def test_controlled_process_handles_lease_callback_exception():
+    def lease_callback():
+        raise RuntimeError("database connection failed")
+
+    with pytest.raises(TerraformExecutionError) as exc:
+        execution_module._run_controlled_process(
+            [
+                sys.executable,
+                "-c",
+                "import time; time.sleep(10)",
+            ],
+            cwd=Path.cwd(),
+            timeout_seconds=5,
+            env=dict(os.environ),
+            lease_renewal_callback=lease_callback,
+            lease_renewal_interval_seconds=0.1,
+        )
+
+    assert exc.value.code == "WORKER_LEASE_RENEWAL_FAILED"
+
 def test_terminate_process_group_kills_child_after_parent_exits(tmp_path):
     marker_file = tmp_path / "child_survived.txt"
 

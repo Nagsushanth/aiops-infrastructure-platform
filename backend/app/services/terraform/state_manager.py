@@ -7,7 +7,12 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
-
+from typing import Any
+from backend.app.services.terraform.s3_state_storage import (
+    S3StateStorageError,
+    parse_terraform_state,
+    read_state_object,
+)
 from backend.app.models.infrastructure_request import InfrastructureRequest
 from backend.app.models.terraform_state import TerraformStateRecord
 
@@ -193,3 +198,53 @@ def calculate_state_sha256(state_bytes: bytes) -> str:
         raise TerraformStateError("STATE_CONTENT_INVALID")
 
     return hashlib.sha256(state_bytes).hexdigest()
+
+
+def verify_active_state_snapshot(
+    client: Any,
+    state_record: TerraformStateRecord,
+) -> dict[str, Any]:
+    """Verify live S3 state against the registered database snapshot."""
+
+    if state_record.status != "active":
+        raise TerraformStateError("STATE_NOT_ACTIVE")
+
+    if not all(
+        (
+            state_record.state_version_id,
+            state_record.state_lineage,
+            state_record.state_sha256,
+        )
+    ) or state_record.state_serial is None:
+        raise TerraformStateError("STATE_SNAPSHOT_INCOMPLETE")
+
+    try:
+        state = read_state_object(
+            client,
+            state_record.state_bucket,
+            state_record.state_key,
+        )
+
+        metadata = parse_terraform_state(state["content"])
+
+    except S3StateStorageError as exc:
+        raise TerraformStateError(
+            "STATE_SNAPSHOT_READ_FAILED"
+        ) from exc
+
+    snapshot = {
+        "version_id": state["version_id"],
+        "serial": metadata["serial"],
+        "lineage": metadata["lineage"],
+        "sha256": state["sha256"],
+    }
+
+    if (
+        snapshot["version_id"] != state_record.state_version_id
+        or snapshot["serial"] != state_record.state_serial
+        or snapshot["lineage"] != state_record.state_lineage
+        or snapshot["sha256"] != state_record.state_sha256
+    ):
+        raise TerraformStateError("STATE_SNAPSHOT_CHANGED")
+
+    return snapshot
