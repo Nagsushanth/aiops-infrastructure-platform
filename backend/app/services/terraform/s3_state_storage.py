@@ -86,6 +86,20 @@ def read_state_object(
         if not content:
             raise S3StateStorageError("S3_STATE_CONTENT_EMPTY")
 
+        content_length = response.get("ContentLength")
+
+        if (
+            not isinstance(content_length, int)
+            or isinstance(content_length, bool)
+            or content_length < 0
+        ):
+            raise S3StateStorageError(
+                "S3_STATE_CONTENT_LENGTH_INVALID"
+            )
+
+        if content_length != len(content):
+            raise S3StateStorageError("S3_STATE_SIZE_MISMATCH")
+
         checksum = hashlib.sha256(content).hexdigest()
 
         return {
@@ -93,7 +107,7 @@ def read_state_object(
             "version_id": response.get("VersionId"),
             "etag": response.get("ETag"),
             "last_modified": response.get("LastModified"),
-            "content_length": len(content),
+            "content_length": content_length,
             "sha256": checksum,
         }
 
@@ -426,6 +440,7 @@ def parse_terraform_state(
             "S3_STATE_JSON_INVALID"
         ) from exc
 
+
 def sync_s3_state_versions(
     db: Session,
     client: Any,
@@ -433,13 +448,12 @@ def sync_s3_state_versions(
     bucket: str,
     key: str,
 ) -> dict[str, int]:
-    """Synchronize validated S3 state versions into PostgreSQL."""
+    """Synchronize the current versioned S3 Terraform state into PostgreSQL."""
 
     from backend.app.services.terraform.state_version_manager import (
         TerraformStateVersionError,
     )
 
-    # Validate the infrastructure request ID.
     if (
         not isinstance(infrastructure_request_id, int)
         or isinstance(infrastructure_request_id, bool)
@@ -447,7 +461,6 @@ def sync_s3_state_versions(
     ):
         raise S3StateStorageError("STATE_REQUEST_ID_INVALID")
 
-    # Validate the S3 bucket and object key.
     if not isinstance(bucket, str) or not bucket.strip():
         raise S3StateStorageError("S3_BUCKET_INVALID")
 
@@ -457,7 +470,6 @@ def sync_s3_state_versions(
     bucket = bucket.strip()
     key = key.strip()
 
-    # Verify that this request has a registered Terraform state record.
     state_record = db.scalar(
         select(TerraformStateRecord).where(
             TerraformStateRecord.infrastructure_request_id
@@ -468,7 +480,6 @@ def sync_s3_state_versions(
     if state_record is None:
         raise S3StateStorageError("STATE_RECORD_NOT_FOUND")
 
-    # Never synchronize a different bucket or state object.
     if (
         state_record.backend_type != "s3"
         or state_record.state_bucket != bucket
@@ -476,67 +487,55 @@ def sync_s3_state_versions(
     ):
         raise S3StateStorageError("S3_STATE_LOCATION_MISMATCH")
 
-    # Retrieve the versions belonging to this exact state object.
-    versions = list_state_object_versions(
-        client,
-        bucket,
-        key,
-    )
-
-    recorded = 0
-    skipped = 0
-
     try:
-        for version in versions:
-            # Read the exact historical S3 version.
-            state = read_state_object(
-                client,
-                bucket,
-                key,
-                version_id=version["version_id"],
+        # Read the current object and its VersionId in one S3 request.
+        state = read_state_object(client, bucket, key)
+
+        version_id = state.get("version_id")
+        if not isinstance(version_id, str) or not version_id.strip():
+            raise S3StateStorageError("S3_STATE_VERSION_ID_MISSING")
+
+        content = state.get("content")
+        if not isinstance(content, bytes) or not content:
+            raise S3StateStorageError("S3_STATE_CONTENT_EMPTY")
+
+        if state.get("content_length") != len(content):
+            raise S3StateStorageError("S3_STATE_SIZE_MISMATCH")
+
+        metadata = parse_terraform_state(content)
+
+        try:
+            record_state_version(
+                db,
+                infrastructure_request_id,
+                version_id=version_id,
+                state_serial=metadata["serial"],
+                state_lineage=metadata["lineage"],
+                state_sha256=state["sha256"],
+                size_bytes=len(content),
             )
+            recorded = 1
+            skipped = 0
 
-            # Verify the downloaded content size.
-            if state["content_length"] != version["size_bytes"]:
-                raise S3StateStorageError("S3_STATE_SIZE_MISMATCH")
+        except TerraformStateVersionError as exc:
+            error_code = exc.args[0] if exc.args else None
 
-            # Validate Terraform state JSON and extract metadata.
-            metadata = parse_terraform_state(state["content"])
-
-            try:
-                record_state_version(
-                    db,
-                    infrastructure_request_id,
-                    version_id=version["version_id"],
-                    state_serial=metadata["serial"],
-                    state_lineage=metadata["lineage"],
-                    state_sha256=state["sha256"],
-                    size_bytes=state["content_length"],
-                )
-
-                recorded += 1
-
-            except TerraformStateVersionError as exc:
-                error_code = exc.args[0] if exc.args else None
-
-                if error_code == "STATE_VERSION_ALREADY_EXISTS":
-                    skipped += 1
-                    continue
-
+            if error_code == "STATE_VERSION_ALREADY_EXISTS":
+                recorded = 0
+                skipped = 1
+            else:
                 raise S3StateStorageError(
                     "S3_STATE_VERSION_SYNC_FAILED"
                 ) from exc
 
-        # Commit only after every version has been processed successfully.
         db.commit()
 
+        return {
+            "total_versions": 1,
+            "recorded": recorded,
+            "skipped": skipped,
+        }
+
     except Exception:
-        # Roll back the entire batch if any version fails.
         db.rollback()
         raise
-
-    return {
-        "total_versions": len(versions),
-        "recorded": recorded,
-        "skipped": skipped,
-    }

@@ -93,6 +93,7 @@ def test_read_latest_state_object(s3_client):
         "VersionId": "version-001",
         "ETag": '"test-etag"',
         "LastModified": datetime.now(timezone.utc),
+        "ContentLength": len(content),
     }
 
     result = read_state_object(
@@ -118,6 +119,7 @@ def test_read_specific_state_version(s3_client):
     s3_client.get_object.return_value = {
         "Body": MagicMock(read=MagicMock(return_value=content)),
         "VersionId": "version-002",
+        "ContentLength": len(content),
     }
 
     result = read_state_object(
@@ -134,6 +136,24 @@ def test_read_specific_state_version(s3_client):
         Key="requests/1/terraform.tfstate",
         VersionId="version-002",
     )
+
+def test_read_state_object_rejects_content_length_mismatch(s3_client):
+    content = b'{"version": 4, "serial": 1}'
+
+    s3_client.get_object.return_value = {
+        "Body": MagicMock(read=MagicMock(return_value=content)),
+        "VersionId": "version-001",
+        "ContentLength": len(content) + 10,
+    }
+
+    with pytest.raises(S3StateStorageError) as exc:
+        read_state_object(
+            s3_client,
+            "test-state-bucket",
+            "requests/1/terraform.tfstate",
+        )
+
+    assert exc.value.args[0] == "S3_STATE_SIZE_MISMATCH"
 
 
 @pytest.mark.parametrize(
@@ -463,9 +483,8 @@ def test_invalid_terraform_state_is_rejected(content):
     with pytest.raises(S3StateStorageError):
         parse_terraform_state(content)
 
-def test_sync_s3_state_versions(db, s3_client):
-    from unittest.mock import patch
 
+def test_sync_s3_state_versions(db, s3_client):
     session, request_id = db
 
     state_content = json.dumps({
@@ -477,28 +496,24 @@ def test_sync_s3_state_versions(db, s3_client):
         "resources": [],
     }).encode()
 
-    versions = [
-        {
-            "version_id": "version-001",
-            "size_bytes": len(state_content),
-        },
-    ]
-
     state = {
         "content": state_content,
+        "version_id": "version-001",
         "content_length": len(state_content),
         "sha256": hashlib.sha256(state_content).hexdigest(),
     }
 
     with (
         patch(
-            "backend.app.services.terraform.s3_state_storage.list_state_object_versions",
-            return_value=versions,
-        ),
-        patch(
             "backend.app.services.terraform.s3_state_storage.read_state_object",
             return_value=state,
-        ),
+        ) as mock_read,
+        patch(
+            "backend.app.services.terraform.s3_state_storage.list_state_object_versions",
+            side_effect=AssertionError(
+                "Historical S3 versions must not be listed."
+            ),
+        ) as mock_list,
     ):
         result = sync_s3_state_versions(
             session,
@@ -514,93 +529,124 @@ def test_sync_s3_state_versions(db, s3_client):
         "skipped": 0,
     }
 
-    assert len(
-        get_state_versions(session, request_id)
-    ) == 1
+    mock_read.assert_called_once_with(
+        s3_client,
+        "test-state-bucket",
+        f"requests/{request_id}/terraform.tfstate",
+    )
+    mock_list.assert_not_called()
+
+    versions = get_state_versions(session, request_id)
+    assert len(versions) == 1
+    assert versions[0].version_id == "version-001"
+    assert versions[0].state_serial == 2
+
 
 def test_sync_s3_state_versions_skips_existing_version(db, s3_client):
     session, request_id = db
 
     state_content = json.dumps({
         "version": 4,
-        "terraform_version": "1.10.0",
+        "terraform_version": "1.15.6",
         "serial": 1,
         "lineage": str(uuid.uuid4()),
         "outputs": {},
         "resources": [],
     }).encode()
 
-    versions = [
-        {
-            "version_id": "version-1",
-            "is_latest": True,
-            "size_bytes": len(state_content),
-            "last_modified": datetime.now(timezone.utc),
-        }
-    ]
-
     state = {
         "content": state_content,
-        "version_id": "version-1",
+        "version_id": "version-001",
         "content_length": len(state_content),
         "sha256": hashlib.sha256(state_content).hexdigest(),
     }
 
-    with (
-        patch(
-            "backend.app.services.terraform.s3_state_storage.list_state_object_versions",
-            return_value=versions,
-        ),
-        patch(
-            "backend.app.services.terraform.s3_state_storage.read_state_object",
-            return_value=state,
-        ),
+    with patch(
+        "backend.app.services.terraform.s3_state_storage.read_state_object",
+        return_value=state,
     ):
         first_result = sync_s3_state_versions(
-            session, s3_client, request_id,
-            "test-state-bucket", f"requests/{request_id}/terraform.tfstate",
+            session,
+            s3_client,
+            request_id,
+            "test-state-bucket",
+            f"requests/{request_id}/terraform.tfstate",
         )
 
         second_result = sync_s3_state_versions(
-            session, s3_client, request_id,
-            "test-state-bucket", f"requests/{request_id}/terraform.tfstate",
+            session,
+            s3_client,
+            request_id,
+            "test-state-bucket",
+            f"requests/{request_id}/terraform.tfstate",
         )
 
     assert first_result["recorded"] == 1
+    assert first_result["skipped"] == 0
     assert second_result["recorded"] == 0
     assert second_result["skipped"] == 1
     assert len(get_state_versions(session, request_id)) == 1
 
-def test_sync_s3_state_versions_rejects_size_mismatch(db, s3_client):
+
+def test_sync_s3_state_versions_rejects_missing_version_id(
+    db,
+    s3_client,
+):
     session, request_id = db
 
-    state_content = b'{"version":4,"serial":1}'
-
-    versions = [
-        {
-            "version_id": "version-mismatch",
-            "is_latest": True,
-            "size_bytes": len(state_content) + 10,
-            "last_modified": datetime.now(timezone.utc),
-        }
-    ]
+    state_content = json.dumps({
+        "version": 4,
+        "serial": 1,
+        "lineage": str(uuid.uuid4()),
+        "resources": [],
+    }).encode()
 
     state = {
         "content": state_content,
-        "version_id": "version-mismatch",
+        "version_id": None,
         "content_length": len(state_content),
         "sha256": hashlib.sha256(state_content).hexdigest(),
     }
 
-    with (
-        patch(
-            "backend.app.services.terraform.s3_state_storage.list_state_object_versions",
-            return_value=versions,
-        ),
-        patch(
-            "backend.app.services.terraform.s3_state_storage.read_state_object",
-            return_value=state,
-        ),
+    with patch(
+        "backend.app.services.terraform.s3_state_storage.read_state_object",
+        return_value=state,
+    ):
+        with pytest.raises(
+            S3StateStorageError,
+            match="S3_STATE_VERSION_ID_MISSING",
+        ):
+            sync_s3_state_versions(
+                session,
+                s3_client,
+                request_id,
+                "test-state-bucket",
+                f"requests/{request_id}/terraform.tfstate",
+            )
+
+    assert get_state_versions(session, request_id) == []
+
+
+def test_sync_s3_state_versions_rejects_size_mismatch(db, s3_client):
+    session, request_id = db
+
+    state_content = json.dumps({
+        "version": 4,
+        "serial": 1,
+        "lineage": str(uuid.uuid4()),
+        "resources": [],
+    }).encode()
+
+    state = {
+        "content": state_content,
+        "version_id": "version-mismatch",
+        "content_length": len(state_content) + 10,
+        "sha256": hashlib.sha256(state_content).hexdigest(),
+    }
+
+    with patch(
+        "backend.app.services.terraform.s3_state_storage.read_state_object",
+        return_value=state,
     ):
         with pytest.raises(
             S3StateStorageError,
@@ -616,19 +662,11 @@ def test_sync_s3_state_versions_rejects_size_mismatch(db, s3_client):
 
     assert get_state_versions(session, request_id) == []
 
+
 def test_sync_s3_state_versions_rejects_invalid_state(db, s3_client):
     session, request_id = db
 
     state_content = b'{"version":4,"serial":-1}'
-
-    versions = [
-        {
-            "version_id": "invalid-version",
-            "is_latest": True,
-            "size_bytes": len(state_content),
-            "last_modified": datetime.now(timezone.utc),
-        }
-    ]
 
     state = {
         "content": state_content,
@@ -637,83 +675,9 @@ def test_sync_s3_state_versions_rejects_invalid_state(db, s3_client):
         "sha256": hashlib.sha256(state_content).hexdigest(),
     }
 
-    with (
-        patch(
-            "backend.app.services.terraform.s3_state_storage.list_state_object_versions",
-            return_value=versions,
-        ),
-        patch(
-            "backend.app.services.terraform.s3_state_storage.read_state_object",
-            return_value=state,
-        ),
-    ):
-        with pytest.raises(
-            S3StateStorageError,
-            match="S3_STATE_JSON_INVALID",
-        ):
-            sync_s3_state_versions(
-                session,
-                s3_client,
-                request_id,
-                "test-state-bucket",
-                f"requests/{request_id}/terraform.tfstate",
-            )
-
-    assert get_state_versions(session, request_id) == []
-
-def test_sync_s3_state_versions_rolls_back_on_invalid_second_version(
-    db, s3_client
-):
-    session, request_id = db
-
-    valid_state = json.dumps({
-        "version": 4,
-        "serial": 1,
-        "lineage": str(uuid.uuid4()),
-    }).encode()
-
-    invalid_state = b'{"version":4,"serial":-1}'
-
-    versions = [
-        {
-            "version_id": "valid-version",
-            "is_latest": False,
-            "size_bytes": len(valid_state),
-            "last_modified": datetime.now(timezone.utc),
-        },
-        {
-            "version_id": "invalid-version",
-            "is_latest": True,
-            "size_bytes": len(invalid_state),
-            "last_modified": datetime.now(timezone.utc),
-        },
-    ]
-
-    states = {
-        "valid-version": {
-            "content": valid_state,
-            "content_length": len(valid_state),
-            "sha256": hashlib.sha256(valid_state).hexdigest(),
-        },
-        "invalid-version": {
-            "content": invalid_state,
-            "content_length": len(invalid_state),
-            "sha256": hashlib.sha256(invalid_state).hexdigest(),
-        },
-    }
-
-    def mock_read_state(client, bucket, key, version_id=None):
-        return states[version_id]
-
-    with (
-        patch(
-            "backend.app.services.terraform.s3_state_storage.list_state_object_versions",
-            return_value=versions,
-        ),
-        patch(
-            "backend.app.services.terraform.s3_state_storage.read_state_object",
-            side_effect=mock_read_state,
-        ),
+    with patch(
+        "backend.app.services.terraform.s3_state_storage.read_state_object",
+        return_value=state,
     ):
         with pytest.raises(
             S3StateStorageError,
