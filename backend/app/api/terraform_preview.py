@@ -12,7 +12,13 @@ from backend.app.schemas.infrastructure import (
     TerraformPlanParseRequest,
     ValidatedInfrastructureSpecification,
 )
-from backend.app.services.terraform.generator import TerraformGenerationError
+from backend.app.services.terraform.aws_pricing import (
+    get_ec2_pricing_catalog,
+)
+from backend.app.services.terraform.generator import (
+    INSTANCE_CATALOG,
+    TerraformGenerationError,
+)
 from backend.app.services.terraform.plan_parser import (
     TerraformPlanParsingError,
     parse_terraform_plan,
@@ -29,9 +35,22 @@ def create_terraform_preview(
 ):
     """Generate a local proposed-resource preview without provisioning."""
     try:
+        instance_type = INSTANCE_CATALOG.get(
+            (specification.vcpus, specification.memory_gb)
+        )
+
+        pricing_catalog = (
+            get_ec2_pricing_catalog(
+                instance_type=instance_type,
+                region=specification.region,
+            )
+            if instance_type
+            else {}
+        )
+
         return build_plan_preview(
             specification,
-            pricing_catalog=PRICING_CATALOG,
+            pricing_catalog=pricing_catalog,
             budget_threshold=BUDGET_THRESHOLD_USD,
         )
     except TerraformGenerationError as exc:
@@ -40,13 +59,10 @@ def create_terraform_preview(
             detail=str(exc),
         ) from exc
     except ValueError as exc:
-        # A bad trusted pricing configuration is a server-side issue,
-        # not an invalid user specification. Do not expose internal details.
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Cost estimation configuration is invalid.",
         ) from exc
-
 
 @router.post("/plan/parse")
 def parse_terraform_plan_endpoint(

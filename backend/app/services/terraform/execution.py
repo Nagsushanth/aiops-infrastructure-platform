@@ -39,9 +39,9 @@ from backend.app.services.terraform.plan_parser import (
 from backend.app.services.terraform.security_policy import (
     evaluate_terraform_security,
 )
-from backend.app.core.terraform_pricing import (
-    BUDGET_THRESHOLD_USD,
-    PRICING_CATALOG,
+from backend.app.core.terraform_pricing import BUDGET_THRESHOLD_USD
+from backend.app.services.terraform.aws_pricing import (
+    get_ec2_pricing_catalog,
 )
 from backend.app.services.terraform.generator import (
     INSTANCE_CATALOG,
@@ -834,10 +834,15 @@ def execute_terraform_plan(
             (specification.vcpus, specification.memory_gb)
         ]
 
+        pricing_catalog = get_ec2_pricing_catalog(
+            instance_type=instance_type,
+            region=specification.region,
+        )
+
         cost_estimate = estimate_ec2_monthly_cost(
             instance_type=instance_type,
             region=specification.region,
-            pricing_catalog=PRICING_CATALOG,
+            pricing_catalog=pricing_catalog,
             budget_threshold=BUDGET_THRESHOLD_USD,
         )
 

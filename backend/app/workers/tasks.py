@@ -52,6 +52,9 @@ from backend.app.services.terraform.s3_state_storage import (
     S3StateStorageError,
     create_s3_client,
 )
+from backend.app.models.infrastructure_resource import (
+    InfrastructureResource,
+)
 
 WORKER_LEASE_MINUTES = 15
 
@@ -1427,6 +1430,99 @@ def recover_stale_infrastructure_operations(
     except Exception:
         db.rollback()
         raise
+
+    finally:
+        db.close()
+
+
+@celery_app.task(name="aiops.scan_scheduled_cleanup_candidates")
+def scan_scheduled_cleanup_candidates() -> dict:
+    """Identify explicitly opted-in cleanup candidates without deleting them."""
+
+    db = SessionLocal()
+
+    try:
+        resources = list(
+            db.scalars(
+                select(InfrastructureResource).where(
+                    InfrastructureResource.is_present.is_(True),
+                    InfrastructureResource.mode == "managed",
+                )
+            ).all()
+        )
+
+        active_request_ids = set(
+            db.scalars(
+                select(InfrastructureOperation.infrastructure_request_id).where(
+                    InfrastructureOperation.status.in_(
+                        ("queued", "running")
+                    )
+                )
+            ).all()
+        )
+
+        # A resource referenced by another present resource must not
+        # be considered independently eligible for cleanup.
+        depended_on_addresses = {
+            dependency
+            for resource in resources
+            for dependency in (resource.dependencies or [])
+            if isinstance(dependency, str)
+        }
+
+        candidates = []
+        skipped_active_operations = 0
+        skipped_dependencies = 0
+        skipped_without_opt_in = 0
+
+        for resource in resources:
+            if resource.resource_type != "aws_instance":
+                continue
+            tags = resource.tags or {}
+
+            cleanup_opt_in = any(
+                str(key).strip().lower() == "autocleanup"
+                and str(value).strip().lower() == "true"
+                for key, value in tags.items()
+            )
+
+            if not cleanup_opt_in:
+                skipped_without_opt_in += 1
+                continue
+
+            if resource.infrastructure_request_id in active_request_ids:
+                skipped_active_operations += 1
+                continue
+
+            if resource.resource_address in depended_on_addresses:
+                skipped_dependencies += 1
+                continue
+
+            if not resource.resource_id:
+                continue
+
+            candidates.append(
+                {
+                    "infrastructure_request_id": (
+                        resource.infrastructure_request_id
+                    ),
+                    "resource_address": resource.resource_address,
+                    "resource_type": resource.resource_type,
+                    "resource_id": resource.resource_id,
+                }
+            )
+
+        return {
+            "status": "completed",
+            "mode": "read_only",
+            "terraform_destroy_enabled": False,
+            "scanned_resources": len(resources),
+            "candidate_count": len(candidates),
+            "skipped_without_opt_in": skipped_without_opt_in,
+            "skipped_active_operations": skipped_active_operations,
+            "skipped_dependencies": skipped_dependencies,
+            "candidates": candidates,
+        }
 
     finally:
         db.close()

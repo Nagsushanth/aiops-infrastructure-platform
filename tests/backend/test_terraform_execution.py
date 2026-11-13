@@ -466,8 +466,8 @@ def test_plan_includes_unavailable_cost_estimate(specification):
         ),
         patch.object(
             execution_module,
-            "PRICING_CATALOG",
-            {},
+            "get_ec2_pricing_catalog",
+            return_value={},
         ),
         patch.object(
             execution_module,
@@ -565,8 +565,8 @@ def test_plan_includes_verified_cost_estimate(specification):
         ),
         patch.object(
             execution_module,
-            "PRICING_CATALOG",
-            test_catalog,
+            "get_ec2_pricing_catalog",
+            return_value=test_catalog,
         ),
         patch.object(
             execution_module,

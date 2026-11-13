@@ -47,6 +47,9 @@ from datetime import datetime, timedelta, timezone
 from backend.app.models.infrastructure_operation_event import (
     InfrastructureOperationEvent,
 )
+from backend.app.models.infrastructure_resource import (
+    InfrastructureResource,
+)
 
 
 @pytest.fixture
@@ -1127,7 +1130,6 @@ def test_progress_event_rejects_expired_lease(worker_db):
 
     finally:
         db.close()
-
 
 def test_worker_process_integration_renews_lease(worker_db):
     db = worker_db()
@@ -2561,3 +2563,181 @@ def test_recovery_disables_destroy_for_stale_deprovision_operation(
 
     finally:
         db.close()
+
+def _create_cleanup_scan_test_data(
+    db,
+    *,
+    tags=None,
+    dependencies=None,
+    active_operation=False,
+):
+    user = User(
+        email="cleanup-scan@example.com",
+        password_hash="test-hash",
+        role="user",
+        is_active=True,
+    )
+    db.add(user)
+    db.flush()
+
+    conversation = Conversation(
+        user_id=user.id,
+        session_id="cleanup-scan-session",
+        title="Cleanup scan test",
+    )
+    db.add(conversation)
+    db.flush()
+
+    request = InfrastructureRequest(
+        conversation_id=conversation.id,
+        status="complete",
+        requirements={},
+    )
+    db.add(request)
+    db.flush()
+
+    resource = InfrastructureResource(
+        infrastructure_request_id=request.id,
+        resource_address="aws_instance.web",
+        resource_type="aws_instance",
+        resource_name="web",
+        provider="provider[\"registry.terraform.io/hashicorp/aws\"]",
+        mode="managed",
+        module=None,
+        instance_key=None,
+        resource_id="i-cleanup123",
+        tags=tags if tags is not None else {"AutoCleanup": "true"},
+        dependencies=dependencies or [],
+        instance_status="unknown",
+        state_serial=1,
+        is_present=True,
+    )
+    db.add(resource)
+
+    if active_operation:
+        plan = TerraformPlanRecord(
+            infrastructure_request_id=request.id,
+            requester_id=user.id,
+            status="succeeded",
+            plan_fingerprint="a" * 64,
+            specification_fingerprint="b" * 64,
+            plan_summary={},
+        )
+        db.add(plan)
+        db.flush()
+
+        approval = ApprovalRequest(
+            infrastructure_request_id=request.id,
+            terraform_plan_record_id=plan.id,
+            requester_id=user.id,
+            status="approved",
+            plan_summary={},
+            plan_fingerprint="a" * 64,
+        )
+        db.add(approval)
+        db.flush()
+
+        db.add(
+            InfrastructureOperation(
+                infrastructure_request_id=request.id,
+                terraform_plan_record_id=plan.id,
+                approval_request_id=approval.id,
+                requester_id=user.id,
+                operation="provision",
+                status="running",
+            )
+        )
+
+    db.commit()
+    return request.id
+
+
+def test_cleanup_scan_includes_explicitly_opted_in_ec2(worker_db):
+    db = worker_db()
+
+    try:
+        _create_cleanup_scan_test_data(db)
+
+    finally:
+        db.close()
+
+    result = tasks.scan_scheduled_cleanup_candidates.run()
+
+    assert result["status"] == "completed"
+    assert result["mode"] == "read_only"
+    assert result["terraform_destroy_enabled"] is False
+    assert result["scanned_resources"] == 1
+    assert result["candidate_count"] == 1
+    assert result["candidates"][0]["resource_address"] == "aws_instance.web"
+    assert result["candidates"][0]["resource_id"] == "i-cleanup123"
+
+
+def test_cleanup_scan_excludes_resource_without_opt_in(worker_db):
+    db = worker_db()
+
+    try:
+        _create_cleanup_scan_test_data(
+            db,
+            tags={"Name": "web"},
+        )
+
+    finally:
+        db.close()
+
+    result = tasks.scan_scheduled_cleanup_candidates.run()
+
+    assert result["candidate_count"] == 0
+    assert result["skipped_without_opt_in"] == 1
+
+
+def test_cleanup_scan_excludes_resource_used_by_another_resource(worker_db):
+    db = worker_db()
+
+    try:
+        request_id = _create_cleanup_scan_test_data(db)
+
+        db.add(
+            InfrastructureResource(
+                infrastructure_request_id=request_id,
+                resource_address="aws_security_group.web",
+                resource_type="aws_security_group",
+                resource_name="web",
+                provider="provider[\"registry.terraform.io/hashicorp/aws\"]",
+                mode="managed",
+                module=None,
+                instance_key=None,
+                resource_id="sg-cleanup123",
+                tags={},
+                dependencies=["aws_instance.web"],
+                instance_status="unknown",
+                state_serial=1,
+                is_present=True,
+            )
+        )
+        db.commit()
+
+    finally:
+        db.close()
+
+    result = tasks.scan_scheduled_cleanup_candidates.run()
+
+    assert result["candidate_count"] == 0
+    assert result["skipped_dependencies"] == 1
+
+
+def test_cleanup_scan_excludes_resource_with_active_operation(worker_db):
+    db = worker_db()
+
+    try:
+        _create_cleanup_scan_test_data(
+            db,
+            active_operation=True,
+        )
+
+    finally:
+        db.close()
+
+    result = tasks.scan_scheduled_cleanup_candidates.run()
+
+    assert result["candidate_count"] == 0
+    assert result["skipped_active_operations"] == 1
