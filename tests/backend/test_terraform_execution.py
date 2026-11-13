@@ -35,6 +35,7 @@ from backend.app.services.terraform.execution import (
     initialize_terraform_apply_workspace,
     build_terraform_environment,
     execute_terraform_destroy_plan,
+    execute_terraform_compensating_plan,
 )
 
 
@@ -1501,7 +1502,6 @@ def test_execute_saved_plan_rejects_missing_plan(tmp_path):
 
     mock_process.assert_not_called()
 
-
 def test_execute_saved_plan_rejects_symlink(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -1553,3 +1553,165 @@ def test_execute_saved_plan_rejects_invalid_timeout(
             )
 
     mock_process.assert_not_called()
+
+def test_compensating_plan_generates_and_saves_plan_without_execution(
+    monkeypatch,
+):
+    configuration = (
+        'terraform { required_version = ">= 1.10.0" }'
+    )
+    provider_lock = b"# Test provider lock file\n"
+
+    configuration_path, configuration_checksum = (
+        save_configuration_artifact(configuration)
+    )
+    lock_path, lock_checksum = save_provider_lock_artifact(
+        provider_lock
+    )
+
+    commands = []
+
+    raw_plan = {
+        "resource_changes": [
+            {
+                "address": "aws_instance.this",
+                "mode": "managed",
+                "type": "aws_instance",
+                "name": "this",
+                "change": {
+                    "actions": ["update"],
+                },
+            }
+        ]
+    }
+
+    parsed_plan = {
+        "resources": [
+            {
+                "address": "aws_instance.this",
+                "mode": "managed",
+                "type": "aws_instance",
+                "name": "this",
+                "actions": ["update"],
+            }
+        ],
+        "resource_summary": {
+            "create": 0,
+            "update": 1,
+            "delete": 0,
+        },
+        "terraform_version": "1.15.6",
+        "format_version": "1.2",
+    }
+
+    def fake_initialize(workspace, **kwargs):
+        commands.append(["terraform", "init"])
+
+    def fake_controlled_process(command, *, cwd, **kwargs):
+        commands.append(command)
+
+        if command[1] == "plan":
+            assert "-out=tfplan" in command
+            (Path(cwd) / "tfplan").write_bytes(
+                b"mock-compensating-plan"
+            )
+            return subprocess.CompletedProcess(
+                command, 0, stdout="", stderr=""
+            )
+
+        if command[1] == "show":
+            assert command[-1] == "tfplan"
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=json.dumps(raw_plan),
+                stderr="",
+            )
+
+        raise AssertionError(
+            f"Unexpected Terraform command: {command}"
+        )
+
+    monkeypatch.setattr(
+        execution_module,
+        "initialize_terraform_apply_workspace",
+        fake_initialize,
+    )
+    monkeypatch.setattr(
+        execution_module,
+        "_run_controlled_process",
+        fake_controlled_process,
+    )
+    monkeypatch.setattr(
+        execution_module,
+        "parse_terraform_plan",
+        lambda value: parsed_plan,
+    )
+    monkeypatch.setattr(
+        execution_module,
+        "evaluate_terraform_security",
+        lambda value: {
+            "passed": True,
+            "findings": [],
+        },
+    )
+
+    result = execute_terraform_compensating_plan(
+        configuration_artifact_path=configuration_path,
+        configuration_artifact_sha256=configuration_checksum,
+        provider_lock_path=lock_path,
+        provider_lock_sha256=lock_checksum,
+        env=os.environ.copy(),
+        lease_renewal_callback=lambda: True,
+    )
+
+    assert [command[1] for command in commands] == [
+        "init",
+        "plan",
+        "show",
+    ]
+
+    assert result["status"] == "succeeded"
+    assert result["recovery_plan_generated"] is True
+    assert result["recovery_execution_enabled"] is False
+    assert result["automatic_rollback_executed"] is False
+
+    saved_plan = load_plan_artifact(
+        result["artifact_path"],
+        result["artifact_sha256"],
+    )
+
+    assert saved_plan == b"mock-compensating-plan"
+    assert len(result["plan_fingerprint"]) == 64
+
+    assert not any(
+        command[1] in ("apply", "destroy")
+        for command in commands
+    )
+
+
+def test_compensating_plan_rejects_invalid_timeout(
+    tmp_path,
+):
+    with pytest.raises(ValueError):
+        execute_terraform_compensating_plan(
+            configuration_artifact_path="unused",
+            configuration_artifact_sha256="unused",
+            provider_lock_path="unused",
+            provider_lock_sha256="unused",
+            timeout_seconds=0,
+            env=os.environ.copy(),
+            lease_renewal_callback=lambda: True,
+        )
+
+
+def test_compensating_plan_rejects_missing_lease_callback():
+    with pytest.raises(ValueError):
+        execute_terraform_compensating_plan(
+            configuration_artifact_path="unused",
+            configuration_artifact_sha256="unused",
+            provider_lock_path="unused",
+            provider_lock_sha256="unused",
+            env=os.environ.copy(),
+            lease_renewal_callback=None,
+        )

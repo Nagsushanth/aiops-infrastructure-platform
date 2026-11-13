@@ -30,6 +30,7 @@ from backend.app.models.base import Base
 from backend.app.models.approval import (
     ApprovalRequest,
     ApprovalStageReview,
+    ApprovalAuditEvent,
 )
 from backend.app.models.conversation import Conversation
 from backend.app.models.infrastructure_operation import (
@@ -50,7 +51,6 @@ from backend.app.models.infrastructure_operation_event import (
 from backend.app.models.infrastructure_resource import (
     InfrastructureResource,
 )
-
 
 @pytest.fixture
 def worker_db(monkeypatch):
@@ -2742,10 +2742,48 @@ def test_cleanup_scan_excludes_resource_with_active_operation(worker_db):
     assert result["candidate_count"] == 0
     assert result["skipped_active_operations"] == 1
 
+@pytest.mark.parametrize(
+    (
+        "apply_error_code",
+        "reconciliation_fails",
+        "expected_status",
+        "expected_recovery_status",
+        "expected_reconciled",
+    ),
+    [
+        (None, False, "succeeded", None, True),
+        (
+            "PROCESS_FAILED_TEST",
+            False,
+            "failed",
+            "RECOVERY_PLAN_READY",
+            True,
+        ),
+        (
+            "PROCESS_FAILED_TEST",
+            True,
+            "failed",
+            "MANUAL_REVIEW_REQUIRED",
+            False,
+        ),
+        (
+            "WORKER_LEASE_LOST",
+            False,
+            "blocked",
+            "WORKER_OWNERSHIP_UNCERTAIN",
+            False,
+        ),
+    ],
+)
 def test_provision_worker_executes_saved_plan_when_feature_flag_enabled(
     worker_db,
     monkeypatch,
     tmp_path,
+    apply_error_code,
+    reconciliation_fails,
+    expected_status,
+    expected_recovery_status,
+    expected_reconciled,
 ):
     requirements = {
         "cloud_provider": "aws",
@@ -2899,12 +2937,41 @@ def test_provision_worker_executes_saved_plan_when_feature_flag_enabled(
             "timeout_seconds": timeout_seconds,
         }
 
+        if apply_error_code:
+            raise tasks.TerraformExecutionError(apply_error_code)
+
     def fake_sync_state(db, infrastructure_request_id):
         calls["reconciled_request_id"] = infrastructure_request_id
+
+        if reconciliation_fails:
+            raise RuntimeError("TEST_STATE_RECONCILIATION_FAILURE")
+
         return {
             "state_reconciled": True,
             "state_serial": 4,
             "inventory": {"present_resources": 1},
+        }
+
+    def fake_recovery_plan(
+        db,
+        operation_id,
+        execution_token,
+        infrastructure_request_id,
+    ):
+        calls["recovery_request_id"] = infrastructure_request_id
+        calls["recovery_operation_id"] = operation_id
+
+        return {
+            "recovery_plan_generated": True,
+            "recovery_execution_enabled": False,
+            "automatic_rollback_executed": False,
+            "recovery_status": "RECOVERY_PLAN_READY",
+            "recovery_source_operation_id": 100,
+            "recovery_source_plan_record_id": 200,
+            "recovery_plan_fingerprint": "a" * 64,
+            "recovery_plan_artifact_path": "/tmp/recovery.tfplan",
+            "recovery_plan_artifact_sha256": "b" * 64,
+            "recovery_plan_summary": {"resource_summary": {"update": 1}},
         }
 
     monkeypatch.setattr(
@@ -2933,21 +3000,54 @@ def test_provision_worker_executes_saved_plan_when_feature_flag_enabled(
         fake_sync_state,
     )
 
+    monkeypatch.setattr(
+        tasks,
+        "_generate_compensating_recovery_plan",
+        fake_recovery_plan,
+    )
+
     try:
         result = tasks.execute_provision_operation.run(operation_id)
 
-        assert result["status"] == "succeeded", result
+        assert result["status"] == expected_status, result
         assert result["terraform_apply_enabled"] is True
-        assert result["terraform_apply_executed"] is True
-        assert result["deployment_succeeded"] is True
-        assert result["state_reconciled"] is True
+        assert result["terraform_apply_executed"] is (
+            apply_error_code is None
+        )
 
         assert calls["initialized"] is True
         assert calls["apply"]["workspace"] == (
             tmp_path / "fake-apply-workspace"
         )
         assert calls["apply"]["timeout_seconds"] == 600
-        assert calls["reconciled_request_id"] == request_id
+
+        if apply_error_code is None:
+            assert result["deployment_succeeded"] is True
+            assert result["state_reconciled"] is True
+            assert calls["reconciled_request_id"] == request_id
+        else:
+            assert result["error_code"] == apply_error_code
+            assert result["terraform_apply_attempted"] is True
+            assert result["deployment_succeeded"] is False
+            assert result["recovery_required"] is True
+            assert result["recovery_status"] == expected_recovery_status
+            assert result["state_reconciled"] is expected_reconciled
+            assert result["rollback_executed"] is False
+
+            if expected_reconciled:
+                assert calls["recovery_request_id"] == request_id
+                assert result["recovery_plan_generated"] is True
+                assert result["recovery_execution_enabled"] is False
+                assert result["automatic_rollback_executed"] is False
+                assert result["recovery_plan_fingerprint"] == "a" * 64
+            else:
+                assert "recovery_request_id" not in calls
+                assert result.get("recovery_plan_generated", False) is False
+
+            if apply_error_code == "WORKER_LEASE_LOST":
+                assert "reconciled_request_id" not in calls
+            elif expected_reconciled:
+                assert calls["reconciled_request_id"] == request_id
 
         verification_db = worker_db()
         try:
@@ -2955,13 +3055,29 @@ def test_provision_worker_executes_saved_plan_when_feature_flag_enabled(
                 InfrastructureOperation,
                 operation_id,
             )
-            assert saved_operation.status == "succeeded"
-            assert saved_operation.result_summary[
-                "terraform_apply_executed"
-            ] is True
-            assert saved_operation.result_summary[
-                "state_reconciled"
-            ] is True
+            assert saved_operation.status == expected_status
+
+            if apply_error_code is None:
+                assert saved_operation.result_summary[
+                    "state_reconciled"
+                ] is True
+            else:
+                assert saved_operation.result_summary[
+                    "recovery_required"
+                ] is True
+                assert saved_operation.result_summary[
+                    "recovery_status"
+                ] == expected_recovery_status
+                if expected_reconciled:
+                    assert saved_operation.result_summary[
+                        "recovery_plan_generated"
+                    ] is True
+                    assert saved_operation.result_summary[
+                        "recovery_execution_enabled"
+                    ] is False
+                    assert saved_operation.result_summary[
+                        "recovery_plan_artifact_path"
+                    ] == "/tmp/recovery.tfplan"
         finally:
             verification_db.close()
 
@@ -2970,11 +3086,48 @@ def test_provision_worker_executes_saved_plan_when_feature_flag_enabled(
         delete_provider_lock_artifact(provider_lock_path)
         delete_configuration_artifact(configuration_path)
 
-
+@pytest.mark.parametrize(
+    (
+        "destroy_error_code",
+        "reconciliation_fails",
+        "expected_status",
+        "expected_recovery_status",
+        "expected_reconciled",
+    ),
+    [
+        (None, False, "succeeded", None, True),
+        (
+            "PROCESS_FAILED_TEST",
+            False,
+            "failed",
+            "RECOVERY_PLAN_READY",
+            True,
+        ),
+        (
+            "PROCESS_FAILED_TEST",
+            True,
+            "failed",
+            "MANUAL_REVIEW_REQUIRED",
+            False,
+        ),
+        (
+            "WORKER_LEASE_LOST",
+            False,
+            "blocked",
+            "WORKER_OWNERSHIP_UNCERTAIN",
+            False,
+        ),
+    ],
+)
 def test_deprovision_worker_executes_saved_destroy_plan_when_feature_flag_enabled(
     worker_db,
     monkeypatch,
     tmp_path,
+    destroy_error_code,
+    reconciliation_fails,
+    expected_status,
+    expected_recovery_status,
+    expected_reconciled,
 ):
     with worker_db() as db:
         (
@@ -2987,9 +3140,7 @@ def test_deprovision_worker_executes_saved_destroy_plan_when_feature_flag_enable
 
     monkeypatch.setenv("AIOPS_TERRAFORM_DESTROY_ENABLED", "true")
 
-    calls = {
-        "state_verifications": 0,
-    }
+    calls = {"state_verifications": 0, "sync_calls": 0}
 
     fake_state_record = SimpleNamespace(
         state_region="ap-south-1",
@@ -3047,20 +3198,49 @@ def test_deprovision_worker_executes_saved_destroy_plan_when_feature_flag_enable
         env,
         lease_renewal_callback,
     ):
-        calls["destroy"] = {
-            "workspace": workspace,
-            "timeout_seconds": timeout_seconds,
-        }
+        calls["destroy_attempted"] = True
+        calls["destroy_timeout"] = timeout_seconds
+
+        if destroy_error_code:
+            raise TerraformExecutionError(destroy_error_code)
+
         assert lease_renewal_callback() is True
 
     def fake_sync_state(db, infrastructure_request_id):
+        calls["sync_calls"] += 1
         calls["reconciled_request_id"] = infrastructure_request_id
+
+        if reconciliation_fails:
+            raise RuntimeError("TEST_STATE_RECONCILIATION_FAILURE")
+
         return {
             "state_reconciled": True,
             "state_serial": 4,
             "inventory": {
                 "present_resources": 0,
             },
+        }
+
+    def fake_recovery_plan(
+        db,
+        operation_id,
+        execution_token,
+        infrastructure_request_id,
+    ):
+        calls["recovery_request_id"] = infrastructure_request_id
+        calls["recovery_operation_id"] = operation_id
+
+        return {
+            "recovery_plan_generated": True,
+            "recovery_execution_enabled": False,
+            "automatic_rollback_executed": False,
+            "recovery_status": "RECOVERY_PLAN_READY",
+            "recovery_source_operation_id": 100,
+            "recovery_source_plan_record_id": 200,
+            "recovery_plan_fingerprint": "a" * 64,
+            "recovery_plan_artifact_path": "/tmp/recovery.tfplan",
+            "recovery_plan_artifact_sha256": "b" * 64,
+            "recovery_plan_summary": {"resource_summary": {"update": 1}},
         }
 
     monkeypatch.setattr(
@@ -3093,27 +3273,56 @@ def test_deprovision_worker_executes_saved_destroy_plan_when_feature_flag_enable
         fake_sync_state,
     )
 
+    monkeypatch.setattr(
+        tasks,
+        "_generate_compensating_recovery_plan",
+        fake_recovery_plan,
+    )
+
     try:
-        result = tasks.execute_deprovision_operation.run(
-            operation_id
-        )
+        result = tasks.execute_deprovision_operation.run(operation_id)
 
-        assert result["status"] == "succeeded", result
-        assert result["terraform_destroy_enabled"] is True
-        assert result["terraform_destroy_executed"] is True
-        assert result["state_reconciled"] is True
-
-        # State must be verified before preflight and again
-        # immediately before executing the approved Destroy plan.
-        assert calls["state_verifications"] == 2
+        assert result["status"] == expected_status, result
+        assert result["operation_id"] == operation_id
+        assert result.get("recovery_status") == expected_recovery_status
+        assert result.get("state_reconciled", False) is expected_reconciled
 
         assert calls["initialized"] is True
         assert calls["initialization_timeout"] == 180
+        assert calls["destroy_attempted"] is True
+        assert calls["destroy_timeout"] == 600
 
-        assert calls["destroy"]["workspace"] == (
-            tmp_path / "fake-destroy-workspace"
-        )
-        assert calls["destroy"]["timeout_seconds"] == 600
+        # State must be verified before preflight and immediately
+        # before executing the approved Destroy plan.
+        assert calls["state_verifications"] == 2
+
+        if destroy_error_code == "WORKER_LEASE_LOST":
+            assert calls["sync_calls"] == 0
+            assert result["terraform_destroy_executed"] is False
+            assert result["recovery_required"] is True
+        else:
+            assert calls["sync_calls"] == 1
+
+        if destroy_error_code is None:
+            assert result["terraform_destroy_executed"] is True
+            assert result["state_reconciled"] is True
+        else:
+            assert result["terraform_destroy_executed"] is False
+            assert result["terraform_destroy_attempted"] is True
+            assert result["recovery_required"] is True
+            assert result["rollback_executed"] is False
+
+            if expected_reconciled:
+                assert calls["recovery_request_id"] == (
+                    calls["reconciled_request_id"]
+                )
+                assert result["recovery_plan_generated"] is True
+                assert result["recovery_execution_enabled"] is False
+                assert result["automatic_rollback_executed"] is False
+                assert result["recovery_plan_fingerprint"] == "a" * 64
+            else:
+                assert "recovery_request_id" not in calls
+                assert result.get("recovery_plan_generated", False) is False
 
         reconstructed = calls["workspace_artifacts"]
 
@@ -3132,16 +3341,31 @@ def test_deprovision_worker_executes_saved_destroy_plan_when_feature_flag_enable
             )
 
             assert saved_operation is not None
-            assert saved_operation.status == "succeeded"
-            assert saved_operation.result_summary[
-                "terraform_destroy_enabled"
-            ] is True
-            assert saved_operation.result_summary[
-                "terraform_destroy_executed"
-            ] is True
-            assert saved_operation.result_summary[
-                "state_reconciled"
-            ] is True
+            assert saved_operation.status == expected_status
+
+            if expected_recovery_status:
+                assert saved_operation.result_summary[
+                    "recovery_status"
+                ] == expected_recovery_status
+                if expected_reconciled:
+                    assert saved_operation.result_summary[
+                        "recovery_plan_generated"
+                    ] is True
+                    assert saved_operation.result_summary[
+                        "recovery_execution_enabled"
+                    ] is False
+                    assert saved_operation.result_summary[
+                        "recovery_plan_artifact_path"
+                    ] == "/tmp/recovery.tfplan"
+
+            if destroy_error_code is None:
+                assert saved_operation.result_summary[
+                    "terraform_destroy_executed"
+                ] is True
+            else:
+                assert saved_operation.result_summary[
+                    "recovery_required"
+                ] is True
 
         finally:
             verification_db.close()
@@ -3150,3 +3374,1272 @@ def test_deprovision_worker_executes_saved_destroy_plan_when_feature_flag_enable
         delete_plan_artifact(artifact_path)
         delete_provider_lock_artifact(provider_lock_path)
         delete_configuration_artifact(configuration_path)
+
+
+def _prepare_recovery_baseline(db):
+    (
+        operation_id,
+        _,
+        _,
+        _,
+        _,
+    ) = create_deprovision_test_operation(db)
+
+    operation = db.get(
+        InfrastructureOperation,
+        operation_id,
+    )
+    plan = db.get(
+        TerraformPlanRecord,
+        operation.terraform_plan_record_id,
+    )
+
+    # Convert the existing test records into a successful provision.
+    plan.operation = "provision"
+    operation.operation = "provision"
+    operation.status = "succeeded"
+    operation.result_summary = {
+        "terraform_apply_executed": True,
+        "deployment_succeeded": True,
+        "state_reconciled": True,
+    }
+
+    db.commit()
+
+    return operation, plan
+
+
+def test_recovery_baseline_loads_latest_verified_provision(
+    worker_db,
+):
+    db = worker_db()
+
+    try:
+        operation, plan = _prepare_recovery_baseline(db)
+
+        result = tasks._load_last_known_good_provisioning_artifacts(
+            db,
+            operation.infrastructure_request_id,
+        )
+
+        assert result["source_operation_id"] == operation.id
+        assert result["source_plan_record_id"] == plan.id
+        assert (
+            result["configuration_artifact_path"]
+            == plan.configuration_artifact_path
+        )
+        assert (
+            result["provider_lock_path"]
+            == plan.provider_lock_path
+        )
+
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    "result_summary",
+    [
+        {
+            "terraform_apply_executed": False,
+            "deployment_succeeded": True,
+            "state_reconciled": True,
+        },
+        {
+            "terraform_apply_executed": True,
+            "deployment_succeeded": False,
+            "state_reconciled": True,
+        },
+        {
+            "terraform_apply_executed": True,
+            "deployment_succeeded": True,
+            "state_reconciled": False,
+        },
+    ],
+)
+def test_recovery_baseline_ignores_unverified_operations(
+    worker_db,
+    result_summary,
+):
+    db = worker_db()
+
+    try:
+        operation, _ = _prepare_recovery_baseline(db)
+        operation.result_summary = result_summary
+        db.commit()
+
+        with pytest.raises(TerraformExecutionError) as exc_info:
+            tasks._load_last_known_good_provisioning_artifacts(
+                db,
+                operation.infrastructure_request_id,
+            )
+
+        assert exc_info.value.code == "RECOVERY_BASELINE_NOT_FOUND"
+
+    finally:
+        db.close()
+
+
+def test_recovery_baseline_rejects_corrupted_configuration_artifact(
+    worker_db,
+):
+    db = worker_db()
+
+    try:
+        operation, plan = _prepare_recovery_baseline(db)
+
+        plan.configuration_artifact_sha256 = "0" * 64
+        db.commit()
+
+        with pytest.raises(TerraformExecutionError) as exc_info:
+            tasks._load_last_known_good_provisioning_artifacts(
+                db,
+                operation.infrastructure_request_id,
+            )
+
+        assert (
+            exc_info.value.code
+            == "RECOVERY_BASELINE_ARTIFACT_INVALID"
+        )
+
+    finally:
+        db.close()
+
+
+def test_recovery_baseline_rejects_missing_artifact_metadata(
+    worker_db,
+):
+    db = worker_db()
+
+    try:
+        operation, plan = _prepare_recovery_baseline(db)
+
+        plan.provider_lock_path = None
+        plan.provider_lock_sha256 = None
+        db.commit()
+
+        with pytest.raises(TerraformExecutionError) as exc_info:
+            tasks._load_last_known_good_provisioning_artifacts(
+                db,
+                operation.infrastructure_request_id,
+            )
+
+        assert (
+            exc_info.value.code
+            == "RECOVERY_BASELINE_METADATA_INVALID"
+        )
+
+    finally:
+        db.close()
+
+
+def _create_valid_recovery_plan_result():
+    artifact_path, artifact_checksum = save_plan_artifact(
+        b"verified-test-recovery-plan"
+    )
+
+    result = {
+        "status": "succeeded",
+        "recovery_plan_generated": True,
+        "recovery_execution_enabled": False,
+        "automatic_rollback_executed": False,
+        "plan_fingerprint": artifact_checksum,
+        "artifact_path": artifact_path,
+        "artifact_sha256": artifact_checksum,
+        "plan_summary": {
+            "resource_summary": {"update": 1},
+            "resources": [
+                {
+                    "address": "aws_instance.example",
+                    "mode": "managed",
+                    "type": "aws_instance",
+                    "name": "example",
+                    "actions": ["update"],
+                }
+            ],
+            "security_analysis": {
+                "policy_version": "initial-1",
+                "checks_completed": True,
+                "deployment_enabled": False,
+                "passed": True,
+                "finding_count": 0,
+                "severity_counts": {
+                    "critical": 0,
+                    "high": 0,
+                    "medium": 0,
+                    "low": 0,
+                },
+                "findings": [],
+            },
+        },
+    }
+
+    return result
+
+def _valid_recovery_state_snapshot():
+    return {
+        "version_id": "recovery-test-version-001",
+        "serial": 7,
+        "lineage": "123e4567-e89b-12d3-a456-426614174000",
+        "sha256": "c" * 64,
+    }
+
+def test_recovery_approval_creates_plan_and_three_pending_reviews(
+    worker_db,
+):
+    db = worker_db()
+    result = _create_valid_recovery_plan_result()
+
+    try:
+        operation, _ = _prepare_recovery_baseline(db)
+
+        baseline = tasks._load_last_known_good_provisioning_artifacts(
+            db,
+            operation.infrastructure_request_id,
+        )
+
+        approval_metadata = tasks._create_recovery_approval(
+            db=db,
+            infrastructure_request_id=operation.infrastructure_request_id,
+            failed_operation_id=99999,
+            baseline=baseline,
+            result=result,
+            state_snapshot=_valid_recovery_state_snapshot(),
+        )
+
+        assert approval_metadata["recovery_approval_status"] == "pending"
+
+        plan_record = db.get(
+            TerraformPlanRecord,
+            approval_metadata["recovery_plan_record_id"],
+        )
+
+        approval = db.get(
+            ApprovalRequest,
+            approval_metadata["recovery_approval_id"],
+        )
+
+        assert plan_record is not None
+        assert plan_record.operation == "recovery"
+        assert plan_record.status == "succeeded"
+        assert plan_record.plan_fingerprint == result["plan_fingerprint"]
+        assert plan_record.specification_fingerprint == (
+            baseline["specification_fingerprint"]
+        )
+        snapshot = _valid_recovery_state_snapshot()
+        assert plan_record.state_version_id == snapshot["version_id"]
+        assert plan_record.state_serial == snapshot["serial"]
+        assert plan_record.state_lineage == snapshot["lineage"]
+        assert plan_record.state_sha256 == snapshot["sha256"]
+
+        assert approval is not None
+        assert approval.status == "pending"
+        assert approval.terraform_plan_record_id == plan_record.id
+
+        reviews = db.scalars(
+            select(ApprovalStageReview).where(
+                ApprovalStageReview.approval_request_id == approval.id
+            )
+        ).all()
+
+        assert {review.stage for review in reviews} == {
+            "technical",
+            "cost",
+            "security",
+        }
+        assert all(review.status == "pending" for review in reviews)
+
+        audit = db.scalar(
+            select(ApprovalAuditEvent).where(
+                ApprovalAuditEvent.approval_request_id == approval.id
+            )
+        )
+
+        assert audit is not None
+        assert audit.event_type == "submitted"
+        assert audit.event_metadata["source"] == "compensating_recovery"
+        assert audit.event_metadata["failed_operation_id"] == 99999
+        assert audit.event_metadata["source_operation_id"] == (
+            baseline["source_operation_id"]
+        )
+
+    finally:
+        db.close()
+        delete_plan_artifact(result["artifact_path"])
+
+
+def test_recovery_approval_prevents_duplicate_creation(worker_db):
+    db = worker_db()
+    result = _create_valid_recovery_plan_result()
+
+    try:
+        operation, _ = _prepare_recovery_baseline(db)
+
+        baseline = tasks._load_last_known_good_provisioning_artifacts(
+            db,
+            operation.infrastructure_request_id,
+        )
+
+        first = tasks._create_recovery_approval(
+            db=db,
+            infrastructure_request_id=operation.infrastructure_request_id,
+            failed_operation_id=99999,
+            baseline=baseline,
+            result=result,
+            state_snapshot=_valid_recovery_state_snapshot(),
+        )
+
+        second = tasks._create_recovery_approval(
+            db=db,
+            infrastructure_request_id=operation.infrastructure_request_id,
+            failed_operation_id=99999,
+            baseline=baseline,
+            result=result,
+            state_snapshot=_valid_recovery_state_snapshot(),
+        )
+
+        assert second["recovery_plan_record_id"] == (
+            first["recovery_plan_record_id"]
+        )
+        assert second["recovery_approval_id"] == (
+            first["recovery_approval_id"]
+        )
+
+        recovery_plans = db.scalars(
+            select(TerraformPlanRecord).where(
+                TerraformPlanRecord.infrastructure_request_id
+                == operation.infrastructure_request_id,
+                TerraformPlanRecord.operation == "recovery",
+            )
+        ).all()
+
+        assert len(recovery_plans) == 1
+
+    finally:
+        db.close()
+        delete_plan_artifact(result["artifact_path"])
+
+def test_recovery_approval_rejects_duplicate_with_different_snapshot(
+    worker_db,
+):
+    db = worker_db()
+    result = _create_valid_recovery_plan_result()
+
+    try:
+        operation, _ = _prepare_recovery_baseline(db)
+
+        baseline = tasks._load_last_known_good_provisioning_artifacts(
+            db,
+            operation.infrastructure_request_id,
+        )
+
+        original_snapshot = _valid_recovery_state_snapshot()
+
+        first = tasks._create_recovery_approval(
+            db=db,
+            infrastructure_request_id=operation.infrastructure_request_id,
+            failed_operation_id=99999,
+            baseline=baseline,
+            result=result,
+            state_snapshot=original_snapshot,
+        )
+
+        changed_snapshot = {
+            **original_snapshot,
+            "serial": original_snapshot["serial"] + 1,
+        }
+
+        with pytest.raises(TerraformExecutionError) as exc_info:
+            tasks._create_recovery_approval(
+                db=db,
+                infrastructure_request_id=operation.infrastructure_request_id,
+                failed_operation_id=99999,
+                baseline=baseline,
+                result=result,
+                state_snapshot=changed_snapshot,
+            )
+
+        assert exc_info.value.code == (
+            "RECOVERY_APPROVAL_STATE_SNAPSHOT_CONFLICT"
+        )
+
+        assert first["recovery_approval_status"] == "pending"
+
+    finally:
+        db.close()
+        delete_plan_artifact(result["artifact_path"])
+
+def test_recovery_approval_rejects_failed_security_analysis(worker_db):
+    db = worker_db()
+    result = _create_valid_recovery_plan_result()
+
+    try:
+        operation, _ = _prepare_recovery_baseline(db)
+
+        baseline = tasks._load_last_known_good_provisioning_artifacts(
+            db,
+            operation.infrastructure_request_id,
+        )
+
+        result["plan_summary"]["security_analysis"]["passed"] = False
+        result["plan_summary"]["security_analysis"]["finding_count"] = 1
+        result["plan_summary"]["security_analysis"]["findings"] = [
+            {"severity": "high"}
+        ]
+
+        with pytest.raises(TerraformExecutionError) as exc_info:
+            tasks._create_recovery_approval(
+                db=db,
+                infrastructure_request_id=operation.infrastructure_request_id,
+                failed_operation_id=99999,
+                baseline=baseline,
+                result=result,
+                state_snapshot=_valid_recovery_state_snapshot(),
+            )
+
+        assert exc_info.value.code == "RECOVERY_SECURITY_CHECK_FAILED"
+
+        recovery_plans = db.scalars(
+            select(TerraformPlanRecord).where(
+                TerraformPlanRecord.infrastructure_request_id
+                == operation.infrastructure_request_id,
+                TerraformPlanRecord.operation == "recovery",
+            )
+        ).all()
+
+        assert recovery_plans == []
+
+    finally:
+        db.close()
+        delete_plan_artifact(result["artifact_path"])
+
+def test_recovery_approval_rejects_invalid_state_snapshot(worker_db):
+    db = worker_db()
+    result = _create_valid_recovery_plan_result()
+
+    try:
+        operation, _ = _prepare_recovery_baseline(db)
+
+        baseline = tasks._load_last_known_good_provisioning_artifacts(
+            db,
+            operation.infrastructure_request_id,
+        )
+
+        invalid_snapshot = _valid_recovery_state_snapshot()
+        invalid_snapshot["sha256"] = "invalid"
+
+        with pytest.raises(TerraformExecutionError) as exc_info:
+            tasks._create_recovery_approval(
+                db=db,
+                infrastructure_request_id=operation.infrastructure_request_id,
+                failed_operation_id=99999,
+                baseline=baseline,
+                result=result,
+                state_snapshot=invalid_snapshot,
+            )
+
+        assert exc_info.value.code == "RECOVERY_STATE_SNAPSHOT_INVALID"
+
+        recovery_plans = db.scalars(
+            select(TerraformPlanRecord).where(
+                TerraformPlanRecord.infrastructure_request_id
+                == operation.infrastructure_request_id,
+                TerraformPlanRecord.operation == "recovery",
+            )
+        ).all()
+
+        assert recovery_plans == []
+
+    finally:
+        db.close()
+        delete_plan_artifact(result["artifact_path"])
+
+def test_compensating_recovery_plan_generates_pending_approval(
+    worker_db,
+    monkeypatch,
+    tmp_path,
+):
+    result = _create_valid_recovery_plan_result()
+
+    try:
+        with worker_db() as db:
+            baseline_operation, _ = _prepare_recovery_baseline(db)
+            request_id = baseline_operation.infrastructure_request_id
+
+            calls = {"snapshot": 0, "progress": 0, "plan": 0}
+
+            snapshot = _valid_recovery_state_snapshot()
+
+            monkeypatch.setattr(
+                tasks,
+                "_record_operation_progress",
+                lambda *args, **kwargs: (
+                    calls.__setitem__(
+                        "progress",
+                        calls["progress"] + 1,
+                    ) or True
+                ),
+            )
+
+            monkeypatch.setattr(
+                tasks,
+                "_renew_operation_lease",
+                lambda *args, **kwargs: True,
+            )
+
+            monkeypatch.setattr(
+                tasks,
+                "get_state_record",
+                lambda db, request_id: SimpleNamespace(
+                    state_region="ap-south-1",
+                ),
+            )
+
+            monkeypatch.setattr(
+                tasks,
+                "create_s3_client",
+                lambda region: object(),
+            )
+
+            def fake_verify_snapshot(client, state_record):
+                calls["snapshot"] += 1
+                return snapshot
+
+            monkeypatch.setattr(
+                tasks,
+                "verify_active_state_snapshot",
+                fake_verify_snapshot,
+            )
+
+            monkeypatch.setattr(
+                tasks,
+                "build_terraform_environment",
+                lambda: (
+                    {
+                        "PATH": os.environ.get("PATH", ""),
+                        "TF_INPUT": "0",
+                        "TF_IN_AUTOMATION": "1",
+                    },
+                    tmp_path,
+                ),
+            )
+
+            def fake_execute_recovery_plan(**kwargs):
+                calls["plan"] += 1
+                assert kwargs["lease_renewal_callback"]() is True
+                return result
+
+            monkeypatch.setattr(
+                tasks,
+                "execute_terraform_compensating_plan",
+                fake_execute_recovery_plan,
+            )
+
+            recovery = tasks._generate_compensating_recovery_plan(
+                db=db,
+                operation_id=baseline_operation.id,
+                execution_token="recovery-test-token",
+                infrastructure_request_id=request_id,
+            )
+
+            assert calls["snapshot"] == 2
+            assert calls["progress"] == 2
+            assert calls["plan"] == 1
+
+            assert recovery["recovery_plan_generated"] is True
+            assert recovery["recovery_execution_enabled"] is False
+            assert recovery["automatic_rollback_executed"] is False
+            assert recovery["recovery_status"] == "RECOVERY_PLAN_READY"
+            assert recovery["recovery_approval_status"] == "pending"
+
+            approval = db.get(
+                ApprovalRequest,
+                recovery["recovery_approval_id"],
+            )
+
+            assert approval is not None
+            assert approval.status == "pending"
+
+    finally:
+        delete_plan_artifact(result["artifact_path"])
+
+
+def test_compensating_recovery_plan_rejects_state_change(
+    worker_db,
+    monkeypatch,
+    tmp_path,
+):
+    result = _create_valid_recovery_plan_result()
+
+    try:
+        with worker_db() as db:
+            baseline_operation, _ = _prepare_recovery_baseline(db)
+            request_id = baseline_operation.infrastructure_request_id
+
+            initial_snapshot = _valid_recovery_state_snapshot()
+            changed_snapshot = {
+                **initial_snapshot,
+                "serial": initial_snapshot["serial"] + 1,
+            }
+
+            calls = {"snapshot": 0, "plan": 0}
+
+            monkeypatch.setattr(
+                tasks,
+                "_record_operation_progress",
+                lambda *args, **kwargs: True,
+            )
+
+            monkeypatch.setattr(
+                tasks,
+                "_renew_operation_lease",
+                lambda *args, **kwargs: True,
+            )
+
+            monkeypatch.setattr(
+                tasks,
+                "get_state_record",
+                lambda db, request_id: SimpleNamespace(
+                    state_region="ap-south-1",
+                ),
+            )
+
+            monkeypatch.setattr(
+                tasks,
+                "create_s3_client",
+                lambda region: object(),
+            )
+
+            def fake_verify_snapshot(client, state_record):
+                calls["snapshot"] += 1
+
+                if calls["snapshot"] == 1:
+                    return initial_snapshot
+
+                return changed_snapshot
+
+            monkeypatch.setattr(
+                tasks,
+                "verify_active_state_snapshot",
+                fake_verify_snapshot,
+            )
+
+            monkeypatch.setattr(
+                tasks,
+                "build_terraform_environment",
+                lambda: (
+                    {
+                        "PATH": os.environ.get("PATH", ""),
+                        "TF_INPUT": "0",
+                        "TF_IN_AUTOMATION": "1",
+                    },
+                    tmp_path,
+                ),
+            )
+
+            def fake_execute_recovery_plan(**kwargs):
+                calls["plan"] += 1
+                return result
+
+            monkeypatch.setattr(
+                tasks,
+                "execute_terraform_compensating_plan",
+                fake_execute_recovery_plan,
+            )
+
+            with pytest.raises(TerraformExecutionError) as exc_info:
+                tasks._generate_compensating_recovery_plan(
+                    db=db,
+                    operation_id=baseline_operation.id,
+                    execution_token="recovery-test-token",
+                    infrastructure_request_id=request_id,
+                )
+
+            assert (
+                exc_info.value.code
+                == "RECOVERY_STATE_CHANGED_DURING_PLANNING"
+            )
+
+            assert calls["snapshot"] == 2
+            assert calls["plan"] == 1
+
+            recovery_plans = db.scalars(
+                select(TerraformPlanRecord).where(
+                    TerraformPlanRecord.infrastructure_request_id
+                    == request_id,
+                    TerraformPlanRecord.operation == "recovery",
+                )
+            ).all()
+
+            assert recovery_plans == []
+
+    finally:
+        delete_plan_artifact(result["artifact_path"])
+
+
+def test_recovery_worker_blocks_execution_when_feature_flag_disabled(
+    worker_db,
+    monkeypatch,
+    tmp_path,
+):
+    db = worker_db()
+    result = _create_valid_recovery_plan_result()
+
+    source_artifacts = None
+
+    try:
+        source_operation, source_plan = _prepare_recovery_baseline(db)
+
+        source_artifacts = (
+            source_plan.artifact_path,
+            source_plan.provider_lock_path,
+            source_plan.configuration_artifact_path,
+        )
+
+        baseline = tasks._load_last_known_good_provisioning_artifacts(
+            db,
+            source_operation.infrastructure_request_id,
+        )
+
+        approval_metadata = tasks._create_recovery_approval(
+            db=db,
+            infrastructure_request_id=source_operation.infrastructure_request_id,
+            failed_operation_id=99999,
+            baseline=baseline,
+            result=result,
+            state_snapshot=_valid_recovery_state_snapshot(),
+        )
+
+        recovery_plan = db.get(
+            TerraformPlanRecord,
+            approval_metadata["recovery_plan_record_id"],
+        )
+        approval = db.get(
+            ApprovalRequest,
+            approval_metadata["recovery_approval_id"],
+        )
+
+        # Approve all three independent review stages.
+        for review in db.scalars(
+            select(ApprovalStageReview).where(
+                ApprovalStageReview.approval_request_id
+                == approval.id
+            )
+        ).all():
+            review.status = "approved"
+
+        approval.status = "approved"
+
+        recovery_operation = InfrastructureOperation(
+            infrastructure_request_id=source_operation.infrastructure_request_id,
+            terraform_plan_record_id=recovery_plan.id,
+            approval_request_id=approval.id,
+            requester_id=source_operation.requester_id,
+            operation="recovery",
+            status="queued",
+            result_summary={},
+        )
+        db.add(recovery_operation)
+        db.commit()
+
+        operation_id = recovery_operation.id
+
+    finally:
+        db.close()
+
+    # Recovery execution must remain disabled by default.
+    monkeypatch.delenv(
+        "AIOPS_TERRAFORM_RECOVERY_ENABLED",
+        raising=False,
+    )
+
+    monkeypatch.setattr(
+        tasks,
+        "get_state_record",
+        lambda db, request_id: SimpleNamespace(
+            state_region="ap-south-1",
+        ),
+    )
+    monkeypatch.setattr(
+        tasks,
+        "create_s3_client",
+        lambda region: object(),
+    )
+    monkeypatch.setattr(
+        tasks,
+        "verify_active_state_snapshot",
+        lambda client, state_record: _valid_recovery_state_snapshot(),
+    )
+    monkeypatch.setattr(
+        tasks,
+        "_record_operation_progress",
+        lambda *args, **kwargs: True,
+    )
+    monkeypatch.setattr(
+        tasks,
+        "_renew_operation_lease",
+        lambda *args, **kwargs: True,
+    )
+    monkeypatch.setattr(
+        tasks,
+        "build_terraform_environment",
+        lambda: ({}, str(tmp_path)),
+    )
+
+    @contextmanager
+    def fake_workspace(**kwargs):
+        yield tmp_path
+
+    monkeypatch.setattr(
+        tasks,
+        "reconstructed_terraform_workspace",
+        fake_workspace,
+    )
+    monkeypatch.setattr(
+        tasks,
+        "initialize_terraform_apply_workspace",
+        lambda *args, **kwargs: None,
+    )
+
+    def unexpected_execution(*args, **kwargs):
+        pytest.fail(
+            "Terraform recovery execution must not run when disabled."
+        )
+
+    monkeypatch.setattr(
+        tasks,
+        "execute_terraform_saved_plan",
+        unexpected_execution,
+    )
+
+    try:
+        response = tasks.execute_recovery_operation.run(
+            operation_id
+        )
+
+        assert response["status"] == "blocked"
+        assert response["error_code"] == (
+            "TERRAFORM_RECOVERY_DISABLED"
+        )
+
+        verification_db = worker_db()
+
+        try:
+            operation = verification_db.get(
+                InfrastructureOperation,
+                operation_id,
+            )
+
+            assert operation.status == "blocked"
+            assert operation.result_summary[
+                "terraform_recovery_enabled"
+            ] is False
+            assert operation.result_summary[
+                "terraform_recovery_executed"
+            ] is False
+            assert operation.result_summary[
+                "rollback_executed"
+            ] is False
+
+        finally:
+            verification_db.close()
+
+    finally:
+        delete_plan_artifact(result["artifact_path"])
+
+        if source_artifacts:
+            delete_plan_artifact(source_artifacts[0])
+            delete_provider_lock_artifact(source_artifacts[1])
+            delete_configuration_artifact(source_artifacts[2])
+
+
+def test_recovery_worker_executes_approved_saved_plan(
+    worker_db,
+    monkeypatch,
+    tmp_path,
+):
+    db = worker_db()
+    result = _create_valid_recovery_plan_result()
+    source_artifacts = None
+
+    try:
+        source_operation, source_plan = _prepare_recovery_baseline(db)
+        source_artifacts = (
+            source_plan.artifact_path,
+            source_plan.provider_lock_path,
+            source_plan.configuration_artifact_path,
+        )
+
+        baseline = tasks._load_last_known_good_provisioning_artifacts(
+            db,
+            source_operation.infrastructure_request_id,
+        )
+
+        approval_metadata = tasks._create_recovery_approval(
+            db=db,
+            infrastructure_request_id=source_operation.infrastructure_request_id,
+            failed_operation_id=99999,
+            baseline=baseline,
+            result=result,
+            state_snapshot=_valid_recovery_state_snapshot(),
+        )
+
+        recovery_plan = db.get(
+            TerraformPlanRecord,
+            approval_metadata["recovery_plan_record_id"],
+        )
+        approval = db.get(
+            ApprovalRequest,
+            approval_metadata["recovery_approval_id"],
+        )
+
+        for review in db.scalars(
+            select(ApprovalStageReview).where(
+                ApprovalStageReview.approval_request_id == approval.id
+            )
+        ).all():
+            review.status = "approved"
+
+        approval.status = "approved"
+
+        recovery_operation = InfrastructureOperation(
+            infrastructure_request_id=source_operation.infrastructure_request_id,
+            terraform_plan_record_id=recovery_plan.id,
+            approval_request_id=approval.id,
+            requester_id=source_operation.requester_id,
+            operation="recovery",
+            status="queued",
+            result_summary={},
+        )
+        db.add(recovery_operation)
+        db.commit()
+
+        operation_id = recovery_operation.id
+
+    finally:
+        db.close()
+
+    monkeypatch.setenv(
+        "AIOPS_TERRAFORM_RECOVERY_ENABLED",
+        "true",
+    )
+
+    monkeypatch.setattr(
+        tasks,
+        "get_state_record",
+        lambda db, request_id: SimpleNamespace(
+            state_region="ap-south-1",
+        ),
+    )
+    monkeypatch.setattr(
+        tasks,
+        "create_s3_client",
+        lambda region: object(),
+    )
+    monkeypatch.setattr(
+        tasks,
+        "verify_active_state_snapshot",
+        lambda client, state_record: _valid_recovery_state_snapshot(),
+    )
+    monkeypatch.setattr(
+        tasks,
+        "_record_operation_progress",
+        lambda *args, **kwargs: True,
+    )
+    monkeypatch.setattr(
+        tasks,
+        "_renew_operation_lease",
+        lambda *args, **kwargs: True,
+    )
+    monkeypatch.setattr(
+        tasks,
+        "build_terraform_environment",
+        lambda: ({}, str(tmp_path)),
+    )
+
+    @contextmanager
+    def fake_workspace(**kwargs):
+        assert kwargs["plan_artifact_path"] == result["artifact_path"]
+        assert kwargs["plan_artifact_sha256"] == result["artifact_sha256"]
+        yield tmp_path
+
+    monkeypatch.setattr(
+        tasks,
+        "reconstructed_terraform_workspace",
+        fake_workspace,
+    )
+    monkeypatch.setattr(
+        tasks,
+        "initialize_terraform_apply_workspace",
+        lambda *args, **kwargs: None,
+    )
+
+    execution_calls = []
+
+    def fake_execute_saved_plan(*args, **kwargs):
+        execution_calls.append((args, kwargs))
+
+    monkeypatch.setattr(
+        tasks,
+        "execute_terraform_saved_plan",
+        fake_execute_saved_plan,
+    )
+    monkeypatch.setattr(
+        tasks,
+        "_sync_state_after_execution",
+        lambda db, request_id: {
+            "state_reconciled": True,
+            "state_serial": 8,
+            "inventory": {"updated": 1},
+        },
+    )
+
+    try:
+        response = tasks.execute_recovery_operation.run(operation_id)
+
+        assert response["status"] == "succeeded"
+        assert response["error_code"] == "NONE"
+        assert len(execution_calls) == 1
+
+        verification_db = worker_db()
+
+        try:
+            operation = verification_db.get(
+                InfrastructureOperation,
+                operation_id,
+            )
+
+            assert operation.status == "succeeded"
+            assert operation.result_summary[
+                "terraform_recovery_enabled"
+            ] is True
+            assert operation.result_summary[
+                "terraform_recovery_executed"
+            ] is True
+            assert operation.result_summary[
+                "state_reconciled"
+            ] is True
+            assert operation.result_summary[
+                "rollback_executed"
+            ] is True
+            assert operation.execution_token is None
+            assert operation.lease_expires_at is None
+
+        finally:
+            verification_db.close()
+
+    finally:
+        delete_plan_artifact(result["artifact_path"])
+
+        if source_artifacts:
+            delete_plan_artifact(source_artifacts[0])
+            delete_provider_lock_artifact(source_artifacts[1])
+            delete_configuration_artifact(source_artifacts[2])
+
+
+def _create_queued_recovery_operation_for_worker_test(db):
+    result = _create_valid_recovery_plan_result()
+    source_operation, source_plan = _prepare_recovery_baseline(db)
+
+    source_artifacts = (
+        source_plan.artifact_path,
+        source_plan.provider_lock_path,
+        source_plan.configuration_artifact_path,
+    )
+
+    baseline = tasks._load_last_known_good_provisioning_artifacts(
+        db,
+        source_operation.infrastructure_request_id,
+    )
+
+    metadata = tasks._create_recovery_approval(
+        db=db,
+        infrastructure_request_id=source_operation.infrastructure_request_id,
+        failed_operation_id=99999,
+        baseline=baseline,
+        result=result,
+        state_snapshot=_valid_recovery_state_snapshot(),
+    )
+
+    plan = db.get(
+        TerraformPlanRecord,
+        metadata["recovery_plan_record_id"],
+    )
+    approval = db.get(
+        ApprovalRequest,
+        metadata["recovery_approval_id"],
+    )
+
+    for review in db.scalars(
+        select(ApprovalStageReview).where(
+            ApprovalStageReview.approval_request_id == approval.id
+        )
+    ).all():
+        review.status = "approved"
+
+    approval.status = "approved"
+
+    operation = InfrastructureOperation(
+        infrastructure_request_id=source_operation.infrastructure_request_id,
+        terraform_plan_record_id=plan.id,
+        approval_request_id=approval.id,
+        requester_id=source_operation.requester_id,
+        operation="recovery",
+        status="queued",
+        result_summary={},
+    )
+    db.add(operation)
+    db.commit()
+
+    return operation.id, result, source_artifacts
+
+
+def _cleanup_recovery_worker_test_artifacts(result, source_artifacts):
+    delete_plan_artifact(result["artifact_path"])
+    delete_plan_artifact(source_artifacts[0])
+    delete_provider_lock_artifact(source_artifacts[1])
+    delete_configuration_artifact(source_artifacts[2])
+
+
+def test_recovery_worker_blocks_when_state_snapshot_changes(
+    worker_db,
+    monkeypatch,
+):
+    db = worker_db()
+
+    try:
+        operation_id, result, source_artifacts = (
+            _create_queued_recovery_operation_for_worker_test(db)
+        )
+    finally:
+        db.close()
+
+    changed_snapshot = _valid_recovery_state_snapshot()
+    changed_snapshot["serial"] += 1
+
+    monkeypatch.setenv("AIOPS_TERRAFORM_RECOVERY_ENABLED", "true")
+    monkeypatch.setattr(
+        tasks,
+        "get_state_record",
+        lambda db, request_id: SimpleNamespace(
+            state_region="ap-south-1",
+        ),
+    )
+    monkeypatch.setattr(
+        tasks,
+        "create_s3_client",
+        lambda region: object(),
+    )
+    monkeypatch.setattr(
+        tasks,
+        "verify_active_state_snapshot",
+        lambda client, state_record: changed_snapshot,
+    )
+
+    def unexpected_execution(*args, **kwargs):
+        pytest.fail("Recovery must not execute after a state change.")
+
+    monkeypatch.setattr(
+        tasks,
+        "execute_terraform_saved_plan",
+        unexpected_execution,
+    )
+
+    try:
+        response = tasks.execute_recovery_operation.run(operation_id)
+
+        assert response["status"] == "blocked"
+        assert response["error_code"] == (
+            "RECOVERY_STATE_SNAPSHOT_MISMATCH"
+        )
+
+        verification_db = worker_db()
+        try:
+            operation = verification_db.get(
+                InfrastructureOperation,
+                operation_id,
+            )
+            assert operation.status == "blocked"
+            assert operation.result_summary[
+                "terraform_recovery_executed"
+            ] is False
+        finally:
+            verification_db.close()
+
+    finally:
+        _cleanup_recovery_worker_test_artifacts(
+            result,
+            source_artifacts,
+        )
+
+
+def test_recovery_worker_stops_when_lease_is_lost(
+    worker_db,
+    monkeypatch,
+):
+    db = worker_db()
+
+    try:
+        operation_id, result, source_artifacts = (
+            _create_queued_recovery_operation_for_worker_test(db)
+        )
+    finally:
+        db.close()
+
+    monkeypatch.setenv("AIOPS_TERRAFORM_RECOVERY_ENABLED", "true")
+    monkeypatch.setattr(
+        tasks,
+        "get_state_record",
+        lambda db, request_id: SimpleNamespace(
+            state_region="ap-south-1",
+        ),
+    )
+    monkeypatch.setattr(
+        tasks,
+        "create_s3_client",
+        lambda region: object(),
+    )
+    monkeypatch.setattr(
+        tasks,
+        "verify_active_state_snapshot",
+        lambda client, state_record: _valid_recovery_state_snapshot(),
+    )
+    monkeypatch.setattr(
+        tasks,
+        "_record_operation_progress",
+        lambda *args, **kwargs: False,
+    )
+
+    def unexpected_execution(*args, **kwargs):
+        pytest.fail("Recovery must not execute after worker lease loss.")
+
+    monkeypatch.setattr(
+        tasks,
+        "execute_terraform_saved_plan",
+        unexpected_execution,
+    )
+
+    try:
+        response = tasks.execute_recovery_operation.run(operation_id)
+
+        assert response["status"] == "blocked"
+        assert response["error_code"] == "WORKER_LEASE_LOST"
+
+        verification_db = worker_db()
+        try:
+            operation = verification_db.get(
+                InfrastructureOperation,
+                operation_id,
+            )
+            assert operation.status == "blocked"
+            assert operation.result_summary[
+                "terraform_recovery_executed"
+            ] is False
+        finally:
+            verification_db.close()
+
+    finally:
+        _cleanup_recovery_worker_test_artifacts(
+            result,
+            source_artifacts,
+        )

@@ -5,8 +5,14 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
-
+from backend.app.models.infrastructure_operation import (
+    InfrastructureOperation,
+)
+from backend.app.models.infrastructure_operation_event import (
+    InfrastructureOperationEvent,
+)
 from backend.app.core.auth_dependencies import CurrentUser, AdminUser
 from backend.app.core.dependencies import get_db
 from backend.app.models.approval import (
@@ -606,8 +612,6 @@ def decide_approval_stage(
         db.rollback()
         raise
 
-
-
 @router.post("/{approval_id}/decision", response_model=ApprovalResponse)
 def decide_approval(
     approval_id: int,
@@ -615,6 +619,8 @@ def decide_approval(
     reviewer: AdminUser,
     db: Session = Depends(get_db),
 ):
+    """Record final approval and dispatch an approved recovery operation."""
+
     # Lock the approval row so concurrent decisions cannot both succeed.
     statement = (
         select(ApprovalRequest)
@@ -640,6 +646,8 @@ def decide_approval(
             status_code=status.HTTP_409_CONFLICT,
             detail="This approval request has already been decided.",
         )
+
+    stage_reviews = []
 
     if payload.decision == "approved":
         stage_statement = select(ApprovalStageReview).where(
@@ -667,6 +675,75 @@ def decide_approval(
                 ),
             )
 
+    # Recovery operations are created only for explicitly approved
+    # recovery plans. Normal provision/deprovision approvals are unchanged.
+    recovery_plan = None
+
+    if (
+        payload.decision == "approved"
+        and approval.terraform_plan_record_id is not None
+    ):
+        plan_record = db.get(
+            TerraformPlanRecord,
+            approval.terraform_plan_record_id,
+        )
+
+        if plan_record is not None and plan_record.operation == "recovery":
+            recovery_plan = plan_record
+
+            if (
+                recovery_plan.infrastructure_request_id
+                != approval.infrastructure_request_id
+                or recovery_plan.requester_id != approval.requester_id
+                or recovery_plan.status != "succeeded"
+                or not recovery_plan.artifact_path
+                or not _is_sha256_fingerprint(
+                    recovery_plan.artifact_sha256
+                )
+                or recovery_plan.plan_fingerprint
+                != recovery_plan.artifact_sha256
+                or recovery_plan.plan_fingerprint
+                != approval.plan_fingerprint
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        "The recovery plan metadata or artifact "
+                        "does not match the approval."
+                    ),
+                )
+
+            try:
+                load_plan_artifact(
+                    recovery_plan.artifact_path,
+                    recovery_plan.artifact_sha256,
+                )
+            except TerraformArtifactError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        "Recovery plan artifact integrity "
+                        "verification failed."
+                    ),
+                ) from exc
+
+            existing_recovery_operation = db.scalar(
+                select(InfrastructureOperation).where(
+                    InfrastructureOperation.approval_request_id
+                    == approval.id,
+                    InfrastructureOperation.operation == "recovery",
+                )
+            )
+
+            if existing_recovery_operation is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        "A recovery operation already exists "
+                        "for this approval."
+                    ),
+                )
+
     previous_status = approval.status
     decided_at = datetime.now(timezone.utc)
 
@@ -676,6 +753,44 @@ def decide_approval(
     approval.decided_at = decided_at
     approval.updated_at = decided_at
 
+    recovery_operation = None
+
+    if recovery_plan is not None:
+        recovery_operation = InfrastructureOperation(
+            infrastructure_request_id=approval.infrastructure_request_id,
+            terraform_plan_record_id=recovery_plan.id,
+            approval_request_id=approval.id,
+            requester_id=approval.requester_id,
+            operation="recovery",
+            status="queued",
+            comments=payload.comments,
+            result_summary={
+                "message": (
+                    "Approved compensating recovery queued for preflight."
+                ),
+                "terraform_recovery_enabled": False,
+                "terraform_recovery_executed": False,
+                "automatic_rollback_executed": False,
+                "automatic_retry": False,
+            },
+        )
+
+        db.add(recovery_operation)
+        db.flush()
+
+    approval_event_metadata = {
+        "source": "approval_api",
+    }
+
+    if recovery_operation is not None:
+        approval_event_metadata.update(
+            {
+                "operation": "recovery",
+                "operation_id": recovery_operation.id,
+                "terraform_plan_record_id": recovery_plan.id,
+            }
+        )
+
     db.add(
         ApprovalAuditEvent(
             approval_request_id=approval.id,
@@ -684,14 +799,109 @@ def decide_approval(
             previous_status=previous_status,
             new_status=payload.decision,
             comments=payload.comments,
-            event_metadata={"source": "approval_api"},
+            event_metadata=approval_event_metadata,
         )
     )
 
     try:
+        # Approval and recovery operation are committed atomically.
         db.commit()
         db.refresh(approval)
-        return approval
+
+        if recovery_operation is not None:
+            db.refresh(recovery_operation)
+
+    except IntegrityError as exc:
+        db.rollback()
+
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "A recovery operation already exists or "
+                "the approval could not be committed."
+            ),
+        ) from exc
+
     except Exception:
         db.rollback()
         raise
+
+    # Dispatch recovery only after the database commit succeeds.
+    if recovery_operation is not None:
+        operation_id = recovery_operation.id
+
+        try:
+            from backend.app.workers.tasks import (
+                execute_recovery_operation,
+            )
+
+            task = execute_recovery_operation.delay(operation_id)
+
+        except Exception:
+            # The broker did not accept the task. Keep the approval
+            # approved, but record the recovery operation as failed.
+            db.rollback()
+
+            operation = db.get(
+                InfrastructureOperation,
+                operation_id,
+            )
+
+            if operation is None:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=(
+                        "The recovery operation could not be reloaded "
+                        "after dispatch failure."
+                    ),
+                )
+
+            operation.status = "failed"
+            operation.error_code = "CELERY_DISPATCH_FAILED"
+            operation.completed_at = datetime.now(timezone.utc)
+            operation.result_summary = {
+                "message": "The background worker could not be reached.",
+                "terraform_recovery_enabled": False,
+                "terraform_recovery_executed": False,
+                "automatic_rollback_executed": False,
+                "automatic_retry": False,
+            }
+
+            db.add(
+                InfrastructureOperationEvent(
+                    operation_id=operation.id,
+                    actor_id=None,
+                    actor_type="system",
+                    event_type="celery_dispatch_failed",
+                    previous_status="queued",
+                    new_status="failed",
+                    comments=(
+                        "The background worker could not be reached."
+                    ),
+                    event_metadata={
+                        "source": "approval_api",
+                        "error_code": "CELERY_DISPATCH_FAILED",
+                        "automatic_retry": False,
+                        "terraform_recovery_enabled": False,
+                    },
+                )
+            )
+
+            db.commit()
+            db.refresh(approval)
+
+            return approval
+
+        # The broker accepted the task. Save its ID separately.
+        # Do not mark the operation failed if this database update fails:
+        # the worker may already have received the task.
+        operation = db.get(
+            InfrastructureOperation,
+            operation_id,
+        )
+        operation.celery_task_id = task.id
+
+        db.commit()
+        db.refresh(approval)
+
+    return approval

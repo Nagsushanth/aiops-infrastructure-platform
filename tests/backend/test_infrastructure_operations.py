@@ -1818,3 +1818,52 @@ def test_health_returns_404_when_state_record_is_missing(
 
     assert response.status_code == 404
     assert response.json()["detail"] == "Terraform state record not found."
+
+
+@pytest.mark.parametrize(
+    "expected_operation",
+    ["provision", "deprovision"],
+)
+def test_recovery_approval_cannot_authorize_apply_or_destroy(
+    setup_data,
+    expected_operation,
+):
+    db = TestingSessionLocal()
+
+    try:
+        plan = TerraformPlanRecord(
+            infrastructure_request_id=setup_data["request_id"],
+            requester_id=setup_data["requester_id"],
+            operation="recovery",
+            status="succeeded",
+            plan_fingerprint="a" * 64,
+            specification_fingerprint="b" * 64,
+            plan_summary={},
+        )
+        db.add(plan)
+        db.flush()
+
+        approval = ApprovalRequest(
+            infrastructure_request_id=setup_data["request_id"],
+            terraform_plan_record_id=plan.id,
+            requester_id=setup_data["requester_id"],
+            status="approved",
+            plan_summary={},
+            plan_fingerprint="a" * 64,
+        )
+        db.add(approval)
+        db.commit()
+
+        with pytest.raises(operations_api.HTTPException) as exc_info:
+            operations_api.validate_approved_plan(
+                approval=approval,
+                current_user_id=setup_data["requester_id"],
+                db=db,
+                expected_operation=expected_operation,
+            )
+
+        assert exc_info.value.status_code == 409
+        assert "plans" in exc_info.value.detail.lower()
+
+    finally:
+        db.close()

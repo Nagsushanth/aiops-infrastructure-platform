@@ -41,7 +41,8 @@ from backend.app.services.terraform.execution import (
     build_terraform_environment,
     reconstructed_terraform_workspace,
     initialize_terraform_apply_workspace,
-    execute_terraform_saved_plan
+    execute_terraform_saved_plan,
+    execute_terraform_compensating_plan,
 )
 from backend.app.services.terraform.state_manager import (
     TerraformStateError,
@@ -79,6 +80,470 @@ def _terraform_feature_enabled(name: str) -> bool:
     """Enable Terraform execution only through an explicit true flag."""
     return os.getenv(name, "").strip().lower() == "true"
 
+
+def _load_last_known_good_provisioning_artifacts(
+    db,
+    infrastructure_request_id: int,
+) -> dict:
+    """Find and verify the latest successfully deployed configuration."""
+
+    statement = (
+        select(InfrastructureOperation, TerraformPlanRecord)
+        .join(
+            TerraformPlanRecord,
+            InfrastructureOperation.terraform_plan_record_id
+            == TerraformPlanRecord.id,
+        )
+        .where(
+            InfrastructureOperation.infrastructure_request_id
+            == infrastructure_request_id,
+            InfrastructureOperation.operation == "provision",
+            InfrastructureOperation.status == "succeeded",
+        )
+        .order_by(InfrastructureOperation.created_at.desc())
+    )
+
+    candidates = db.execute(statement).all()
+
+    for operation, plan in candidates:
+        summary = operation.result_summary or {}
+
+        if not (
+            summary.get("terraform_apply_executed") is True
+            and summary.get("deployment_succeeded") is True
+            and summary.get("state_reconciled") is True
+        ):
+            continue
+
+        if (
+            plan.infrastructure_request_id != infrastructure_request_id
+            or plan.operation != "provision"
+            or plan.status != "succeeded"
+            or not plan.configuration_artifact_path
+            or not plan.configuration_artifact_sha256
+            or not plan.provider_lock_path
+            or not plan.provider_lock_sha256
+        ):
+            raise TerraformExecutionError(
+                "RECOVERY_BASELINE_METADATA_INVALID"
+            )
+
+        try:
+            # Verify both persisted artifacts before allowing recovery
+            # planning to use their references.
+            load_configuration_artifact(
+                plan.configuration_artifact_path,
+                plan.configuration_artifact_sha256,
+            )
+            load_provider_lock_artifact(
+                plan.provider_lock_path,
+                plan.provider_lock_sha256,
+            )
+        except (TerraformArtifactError, OSError) as exc:
+            raise TerraformExecutionError(
+                "RECOVERY_BASELINE_ARTIFACT_INVALID"
+            ) from exc
+
+        return {
+            "source_operation_id": operation.id,
+            "source_plan_record_id": plan.id,
+            "configuration_artifact_path": (
+                plan.configuration_artifact_path
+            ),
+            "configuration_artifact_sha256": (
+                plan.configuration_artifact_sha256
+            ),
+            "provider_lock_path": plan.provider_lock_path,
+            "provider_lock_sha256": plan.provider_lock_sha256,
+            "specification_fingerprint": plan.specification_fingerprint,
+        }
+
+    raise TerraformExecutionError(
+        "RECOVERY_BASELINE_NOT_FOUND"
+    )
+
+def _create_recovery_approval(
+    db,
+    infrastructure_request_id: int,
+    failed_operation_id: int,
+    baseline: dict,
+    result: dict,
+    state_snapshot: dict,
+) -> dict:
+    """Persist a trusted recovery plan and its separate approval workflow."""
+    required_snapshot_fields = {
+        "version_id",
+        "serial",
+        "lineage",
+        "sha256",
+    }
+
+    if (
+        not isinstance(state_snapshot, dict)
+        or not required_snapshot_fields.issubset(state_snapshot)
+        or not isinstance(state_snapshot["version_id"], str)
+        or not state_snapshot["version_id"].strip()
+        or not isinstance(state_snapshot["serial"], int)
+        or isinstance(state_snapshot["serial"], bool)
+        or state_snapshot["serial"] < 0
+        or not isinstance(state_snapshot["lineage"], str)
+        or not isinstance(state_snapshot["sha256"], str)
+        or len(state_snapshot["sha256"]) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in state_snapshot["sha256"].lower()
+        )
+    ):
+        raise TerraformExecutionError(
+            "RECOVERY_STATE_SNAPSHOT_INVALID"
+        )
+
+    from backend.app.models.approval import ApprovalAuditEvent
+
+    infrastructure_request = db.get(
+        InfrastructureRequest,
+        infrastructure_request_id,
+    )
+
+    if infrastructure_request is None:
+        raise TerraformExecutionError(
+            "RECOVERY_REQUEST_NOT_FOUND"
+        )
+
+    conversation = db.get(
+        Conversation,
+        infrastructure_request.conversation_id,
+    )
+
+    if conversation is None or conversation.user_id is None:
+        raise TerraformExecutionError(
+            "RECOVERY_REQUESTER_NOT_FOUND"
+        )
+
+    plan_summary = result.get("plan_summary")
+
+    if not isinstance(plan_summary, dict):
+        raise TerraformExecutionError(
+            "RECOVERY_PLAN_SUMMARY_INVALID"
+        )
+
+    analysis = plan_summary.get("security_analysis")
+
+    if not isinstance(analysis, dict):
+        raise TerraformExecutionError(
+            "RECOVERY_SECURITY_ANALYSIS_MISSING"
+        )
+
+    expected_severities = {"critical", "high", "medium", "low"}
+
+    if not (
+        analysis.get("checks_completed") is True
+        and analysis.get("deployment_enabled") is False
+        and analysis.get("passed") is True
+        and type(analysis.get("finding_count")) is int
+        and analysis["finding_count"] == 0
+        and analysis.get("findings") == []
+        and isinstance(analysis.get("severity_counts"), dict)
+        and set(analysis["severity_counts"]) == expected_severities
+        and all(
+            type(analysis["severity_counts"][key]) is int
+            and analysis["severity_counts"][key] == 0
+            for key in expected_severities
+        )
+    ):
+        raise TerraformExecutionError(
+            "RECOVERY_SECURITY_CHECK_FAILED"
+        )
+
+    artifact_path = result.get("artifact_path")
+    artifact_sha256 = result.get("artifact_sha256")
+    plan_fingerprint = result.get("plan_fingerprint")
+
+    if (
+        not artifact_path
+        or not isinstance(artifact_sha256, str)
+        or len(artifact_sha256) != 64
+        or artifact_sha256 != plan_fingerprint
+    ):
+        raise TerraformExecutionError(
+            "RECOVERY_PLAN_ARTIFACT_INVALID"
+        )
+
+    try:
+        load_plan_artifact(artifact_path, artifact_sha256)
+    except (TerraformArtifactError, OSError) as exc:
+        raise TerraformExecutionError(
+            "RECOVERY_PLAN_ARTIFACT_INVALID"
+        ) from exc
+
+    specification_fingerprint = baseline.get(
+        "specification_fingerprint"
+    )
+
+    if (
+        not isinstance(specification_fingerprint, str)
+        or len(specification_fingerprint) != 64
+    ):
+        raise TerraformExecutionError(
+            "RECOVERY_SPECIFICATION_FINGERPRINT_INVALID"
+        )
+
+    # Prevent duplicate recovery approvals if a worker retry reaches
+    # this point after the original approval was committed.
+    existing = db.scalar(
+        select(ApprovalRequest).join(
+            TerraformPlanRecord,
+            ApprovalRequest.terraform_plan_record_id
+            == TerraformPlanRecord.id,
+        ).where(
+            ApprovalRequest.infrastructure_request_id
+            == infrastructure_request_id,
+            TerraformPlanRecord.operation == "recovery",
+            TerraformPlanRecord.plan_fingerprint == plan_fingerprint,
+        )
+    )
+
+    if existing is not None:
+        existing_plan = db.get(
+            TerraformPlanRecord,
+            existing.terraform_plan_record_id,
+        )
+
+        if existing_plan is None:
+            raise TerraformExecutionError(
+                "RECOVERY_EXISTING_PLAN_NOT_FOUND"
+            )
+
+        existing_snapshot = {
+            "version_id": existing_plan.state_version_id,
+            "serial": existing_plan.state_serial,
+            "lineage": existing_plan.state_lineage,
+            "sha256": existing_plan.state_sha256,
+        }
+
+        if existing_snapshot != state_snapshot:
+            raise TerraformExecutionError(
+                "RECOVERY_APPROVAL_STATE_SNAPSHOT_CONFLICT"
+            )
+
+        return {
+            "recovery_plan_record_id": (
+                existing.terraform_plan_record_id
+            ),
+            "recovery_approval_id": existing.id,
+            "recovery_approval_status": existing.status,
+        }
+
+    plan_record = TerraformPlanRecord(
+        infrastructure_request_id=infrastructure_request_id,
+        requester_id=conversation.user_id,
+        operation="recovery",
+        status="succeeded",
+        plan_fingerprint=plan_fingerprint,
+        specification_fingerprint=specification_fingerprint,
+        artifact_path=artifact_path,
+        artifact_sha256=artifact_sha256,
+        provider_lock_path=baseline["provider_lock_path"],
+        provider_lock_sha256=baseline["provider_lock_sha256"],
+        state_version_id=state_snapshot["version_id"],
+        state_serial=state_snapshot["serial"],
+        state_lineage=state_snapshot["lineage"],
+        state_sha256=state_snapshot["sha256"],
+        configuration_artifact_path=(
+            baseline["configuration_artifact_path"]
+        ),
+        configuration_artifact_sha256=(
+            baseline["configuration_artifact_sha256"]
+        ),
+        plan_summary={
+            **plan_summary,
+            "recovery_provenance": {
+                "failed_operation_id": failed_operation_id,
+                "source_operation_id": baseline["source_operation_id"],
+                "source_plan_record_id": baseline[
+                    "source_plan_record_id"
+                ],
+            },
+        },
+    )
+
+    try:
+        db.add(plan_record)
+        db.flush()
+
+        approval = ApprovalRequest(
+            infrastructure_request_id=infrastructure_request_id,
+            terraform_plan_record_id=plan_record.id,
+            requester_id=conversation.user_id,
+            status="pending",
+            plan_summary=plan_record.plan_summary,
+            plan_fingerprint=plan_fingerprint,
+        )
+
+        db.add(approval)
+        db.flush()
+
+        for stage in ("technical", "cost", "security"):
+            db.add(
+                ApprovalStageReview(
+                    approval_request_id=approval.id,
+                    stage=stage,
+                    status="pending",
+                )
+            )
+
+        db.add(
+            ApprovalAuditEvent(
+                approval_request_id=approval.id,
+                actor_id=conversation.user_id,
+                event_type="submitted",
+                previous_status=None,
+                new_status="pending",
+                comments=(
+                    "Recovery plan generated after infrastructure "
+                    "operation failure. Independent review required."
+                ),
+                event_metadata={
+                    "source": "compensating_recovery",
+                    "failed_operation_id": failed_operation_id,
+                    "source_operation_id": baseline[
+                        "source_operation_id"
+                    ],
+                    "source_plan_record_id": baseline[
+                        "source_plan_record_id"
+                    ],
+                    "recovery_plan_record_id": plan_record.id,
+                },
+            )
+        )
+
+        db.commit()
+        db.refresh(approval)
+
+        return {
+            "recovery_plan_record_id": plan_record.id,
+            "recovery_approval_id": approval.id,
+            "recovery_approval_status": approval.status,
+        }
+
+    except Exception:
+        db.rollback()
+        raise
+
+def _generate_compensating_recovery_plan(
+    db,
+    operation_id: int,
+    execution_token: str,
+    infrastructure_request_id: int,
+) -> dict:
+    """Generate a recovery plan from the last verified deployment."""
+
+    if not _record_operation_progress(
+        db,
+        operation_id,
+        execution_token,
+        "compensating_recovery_plan_started",
+        "Generating a recovery plan from the last known-good deployment.",
+    ):
+        raise TerraformExecutionError("WORKER_LEASE_LOST")
+
+    baseline = _load_last_known_good_provisioning_artifacts(
+        db,
+        infrastructure_request_id,
+    )
+
+    state_record = get_state_record(
+        db,
+        infrastructure_request_id,
+    )
+
+    if state_record is None:
+        raise TerraformExecutionError(
+            "RECOVERY_STATE_RECORD_NOT_FOUND"
+        )
+
+    state_client = create_s3_client(state_record.state_region)
+
+    try:
+        initial_snapshot = verify_active_state_snapshot(
+            state_client,
+            state_record,
+        )
+    except TerraformStateError as exc:
+        raise TerraformExecutionError(
+            "RECOVERY_STATE_SNAPSHOT_INVALID"
+        ) from exc
+
+    env, temp_root = build_terraform_environment()
+
+    result = execute_terraform_compensating_plan(
+        configuration_artifact_path=(
+            baseline["configuration_artifact_path"]
+        ),
+        configuration_artifact_sha256=(
+            baseline["configuration_artifact_sha256"]
+        ),
+        provider_lock_path=baseline["provider_lock_path"],
+        provider_lock_sha256=baseline["provider_lock_sha256"],
+        timeout_seconds=600,
+        env=env,
+        temp_root=temp_root,
+        lease_renewal_callback=lambda: _renew_operation_lease(
+            operation_id,
+            execution_token,
+        ),
+    )
+
+    try:
+        final_snapshot = verify_active_state_snapshot(
+            state_client,
+            state_record,
+        )
+    except TerraformStateError as exc:
+        raise TerraformExecutionError(
+            "RECOVERY_STATE_CHANGED_DURING_PLANNING"
+        ) from exc
+
+    if final_snapshot != initial_snapshot:
+        raise TerraformExecutionError(
+            "RECOVERY_STATE_CHANGED_DURING_PLANNING"
+        )
+
+    if not _record_operation_progress(
+        db,
+        operation_id,
+        execution_token,
+        "compensating_recovery_plan_generated",
+        "Recovery plan generated. Separate review and approval are required.",
+    ):
+        raise TerraformExecutionError("WORKER_LEASE_LOST")
+
+    approval_metadata = _create_recovery_approval(
+        db=db,
+        infrastructure_request_id=infrastructure_request_id,
+        failed_operation_id=operation_id,
+        baseline=baseline,
+        result=result,
+        state_snapshot=final_snapshot,
+    )
+
+    return {
+        "recovery_plan_generated": True,
+        "recovery_execution_enabled": False,
+        "automatic_rollback_executed": False,
+        "recovery_status": "RECOVERY_PLAN_READY",
+        "recovery_source_operation_id": baseline[
+            "source_operation_id"
+        ],
+        "recovery_source_plan_record_id": baseline[
+            "source_plan_record_id"
+        ],
+        "recovery_plan_fingerprint": result["plan_fingerprint"],
+        "recovery_plan_artifact_path": result["artifact_path"],
+        "recovery_plan_artifact_sha256": result["artifact_sha256"],
+        "recovery_plan_summary": result["plan_summary"],
+        **approval_metadata,
+    }
 
 def _sync_state_after_execution(
     db,
@@ -296,6 +761,8 @@ def _finish_operation(
                 "preflight_passed": preflight_passed,
                 "terraform_apply_enabled": False,
                 "terraform_destroy_enabled": False,
+                "terraform_recovery_enabled": False,
+                "terraform_recovery_executed": False,
                 **(result_summary_extra or {}),
             },
         )
@@ -370,6 +837,9 @@ def _owned_operation_result(
             result_summary_extra or {}
         ).get("terraform_destroy_enabled", False),
         **(result_summary_extra or {}),
+        "terraform_recovery_enabled": (
+        result_summary_extra or {}
+        ).get("terraform_recovery_enabled", False),
     }
 
 @celery_app.task(
@@ -800,20 +1270,122 @@ def execute_provision_operation(operation_id: int) -> dict:
                     ),
                 )
                 apply_executed = True
-
         except TerraformExecutionError as exc:
+            # Never attempt recovery if worker ownership is uncertain.
+            if exc.code in {
+                "WORKER_LEASE_LOST",
+                "WORKER_LEASE_RENEWAL_FAILED",
+            }:
+                return _owned_operation_result(
+                    db,
+                    operation_id,
+                    execution_token,
+                    "blocked",
+                    exc.code,
+                    "Terraform execution stopped after worker ownership was lost. Manual recovery review is required.",
+                    preflight_passed=True,
+                    result_summary_extra={
+                        "terraform_apply_enabled": apply_enabled,
+                        "terraform_apply_attempted": True,
+                        "terraform_apply_executed": False,
+                        "deployment_succeeded": False,
+                        "state_reconciled": False,
+                        "recovery_required": True,
+                        "recovery_status": "WORKER_OWNERSHIP_UNCERTAIN",
+                        "rollback_executed": False,
+                    },
+                )
+
+            # Reconcile actual state before generating a recovery plan.
+            reconciliation = {}
+            state_reconciled = False
+
+            try:
+                reconciliation = _sync_state_after_execution(
+                    db,
+                    infrastructure_request.id,
+                )
+                state_reconciled = True
+            except Exception:
+                db.rollback()
+
+            recovery_details = {}
+
+            if state_reconciled:
+                try:
+                    recovery_details = (
+                        _generate_compensating_recovery_plan(
+                            db,
+                            operation_id,
+                            execution_token,
+                            infrastructure_request.id,
+                        )
+                    )
+                except TerraformExecutionError as recovery_exc:
+                    if recovery_exc.code in {
+                        "WORKER_LEASE_LOST",
+                        "WORKER_LEASE_RENEWAL_FAILED",
+                    }:
+                        return _owned_operation_result(
+                            db,
+                            operation_id,
+                            execution_token,
+                            "blocked",
+                            recovery_exc.code,
+                            "Recovery planning stopped because worker ownership was lost.",
+                            preflight_passed=True,
+                            result_summary_extra={
+                                "recovery_required": True,
+                                "recovery_status": "WORKER_OWNERSHIP_UNCERTAIN",
+                                "recovery_execution_enabled": False,
+                                "rollback_executed": False,
+                            },
+                        )
+
+                    recovery_details = {
+                        "recovery_plan_generated": False,
+                        "recovery_execution_enabled": False,
+                        "recovery_status": "MANUAL_REVIEW_REQUIRED",
+                        "recovery_error_code": recovery_exc.code,
+                    }
+                except Exception:
+                    recovery_details = {
+                        "recovery_plan_generated": False,
+                        "recovery_execution_enabled": False,
+                        "recovery_status": "MANUAL_REVIEW_REQUIRED",
+                        "recovery_error_code": "RECOVERY_PLAN_GENERATION_FAILED",
+                    }
+            else:
+                recovery_details = {
+                    "recovery_plan_generated": False,
+                    "recovery_execution_enabled": False,
+                    "recovery_status": "MANUAL_REVIEW_REQUIRED",
+                }
+
             return _owned_operation_result(
                 db,
                 operation_id,
                 execution_token,
                 "failed",
                 exc.code,
-                "Terraform provision execution failed.",
+                (
+                    "Terraform Apply failed. A compensating recovery plan "
+                    "was generated and requires separate approval."
+                    if recovery_details.get("recovery_plan_generated")
+                    else
+                    "Terraform Apply failed. Recovery requires manual review."
+                ),
                 preflight_passed=True,
                 result_summary_extra={
                     "terraform_apply_enabled": apply_enabled,
-                    "terraform_apply_executed": apply_executed,
+                    "terraform_apply_attempted": True,
+                    "terraform_apply_executed": False,
                     "deployment_succeeded": False,
+                    "state_reconciled": state_reconciled,
+                    "recovery_required": True,
+                    "rollback_executed": False,
+                    **reconciliation,
+                    **recovery_details,
                 },
             )
 
@@ -1573,20 +2145,127 @@ def execute_deprovision_operation(operation_id: int) -> dict:
                 destroy_executed = True
 
         except TerraformExecutionError as exc:
+            # Never attempt recovery if worker ownership is uncertain.
+            if exc.code in {
+                "WORKER_LEASE_LOST",
+                "WORKER_LEASE_RENEWAL_FAILED",
+            }:
+                return _owned_operation_result(
+                    db,
+                    operation_id,
+                    execution_token,
+                    "blocked",
+                    exc.code,
+                    (
+                        "Terraform Destroy stopped after worker ownership "
+                        "was lost. Manual recovery review is required."
+                    ),
+                    preflight_passed=True,
+                    result_summary_extra={
+                        "destroy_confirmed": True,
+                        "terraform_destroy_enabled": destroy_enabled,
+                        "terraform_destroy_attempted": True,
+                        "terraform_destroy_executed": False,
+                        "deployment_succeeded": False,
+                        "state_reconciled": False,
+                        "recovery_required": True,
+                        "recovery_status": "WORKER_OWNERSHIP_UNCERTAIN",
+                        "rollback_executed": False,
+                    },
+                )
+
+            # A failed Destroy may have partially removed infrastructure.
+            # Reconcile actual state before generating a recovery plan.
+            reconciliation = {}
+            state_reconciled = False
+
+            try:
+                reconciliation = _sync_state_after_execution(
+                    db,
+                    infrastructure_request.id,
+                )
+                state_reconciled = True
+            except Exception:
+                db.rollback()
+
+            recovery_details = {}
+
+            if state_reconciled:
+                try:
+                    recovery_details = (
+                        _generate_compensating_recovery_plan(
+                            db,
+                            operation_id,
+                            execution_token,
+                            infrastructure_request.id,
+                        )
+                    )
+                except TerraformExecutionError as recovery_exc:
+                    if recovery_exc.code in {
+                        "WORKER_LEASE_LOST",
+                        "WORKER_LEASE_RENEWAL_FAILED",
+                    }:
+                        return _owned_operation_result(
+                            db,
+                            operation_id,
+                            execution_token,
+                            "blocked",
+                            recovery_exc.code,
+                            "Recovery planning stopped because worker ownership was lost.",
+                            preflight_passed=True,
+                            result_summary_extra={
+                                "recovery_required": True,
+                                "recovery_status": "WORKER_OWNERSHIP_UNCERTAIN",
+                                "recovery_execution_enabled": False,
+                                "rollback_executed": False,
+                            },
+                        )
+
+                    recovery_details = {
+                        "recovery_plan_generated": False,
+                        "recovery_execution_enabled": False,
+                        "recovery_status": "MANUAL_REVIEW_REQUIRED",
+                        "recovery_error_code": recovery_exc.code,
+                    }
+                except Exception:
+                    recovery_details = {
+                        "recovery_plan_generated": False,
+                        "recovery_execution_enabled": False,
+                        "recovery_status": "MANUAL_REVIEW_REQUIRED",
+                        "recovery_error_code": "RECOVERY_PLAN_GENERATION_FAILED",
+                    }
+            else:
+                recovery_details = {
+                    "recovery_plan_generated": False,
+                    "recovery_execution_enabled": False,
+                    "recovery_status": "MANUAL_REVIEW_REQUIRED",
+                }
+
             return _owned_operation_result(
                 db,
                 operation_id,
                 execution_token,
                 "failed",
                 exc.code,
-                "Terraform destroy execution failed.",
+                (
+                    "Terraform Destroy failed. A compensating recovery plan "
+                    "was generated and requires separate approval."
+                    if recovery_details.get("recovery_plan_generated")
+                    else
+                    "Terraform Destroy failed. Recovery requires manual review."
+                ),
                 preflight_passed=True,
                 result_summary_extra={
                     "destroy_confirmed": True,
                     "terraform_destroy_enabled": destroy_enabled,
-                    "terraform_destroy_executed": destroy_executed,
-                    "state_snapshot_verified": True,
+                    "terraform_destroy_attempted": True,
+                    "terraform_destroy_executed": False,
                     "deployment_succeeded": False,
+                    "state_reconciled": state_reconciled,
+                    "recovery_required": True,
+                    "rollback_executed": False,
+                    **reconciliation,
+                    **recovery_details,
                 },
             )
 
@@ -1673,6 +2352,693 @@ def execute_deprovision_operation(operation_id: int) -> dict:
     finally:
         db.close()
 
+
+@celery_app.task(
+    name="aiops.execute_recovery_operation",
+)
+def execute_recovery_operation(operation_id: int) -> dict:
+    """Execute an independently approved compensating recovery plan."""
+
+    db = SessionLocal()
+    execution_token = str(uuid4())
+    recovery_enabled = _terraform_feature_enabled(
+        "AIOPS_TERRAFORM_RECOVERY_ENABLED"
+    )
+
+    try:
+        now = datetime.now(timezone.utc)
+
+        # Atomically claim only a queued recovery operation.
+        claim_result = db.execute(
+            update(InfrastructureOperation)
+            .where(
+                InfrastructureOperation.id == operation_id,
+                InfrastructureOperation.status == "queued",
+                InfrastructureOperation.operation == "recovery",
+            )
+            .values(
+                status="running",
+                started_at=now,
+                execution_token=execution_token,
+                lease_expires_at=now + timedelta(
+                    minutes=WORKER_LEASE_MINUTES
+                ),
+            )
+        )
+
+        if claim_result.rowcount != 1:
+            db.rollback()
+            operation = db.get(
+                InfrastructureOperation,
+                operation_id,
+            )
+
+            if operation is None:
+                return {
+                    "status": "not_found",
+                    "operation_id": operation_id,
+                }
+
+            return {
+                "status": operation.status,
+                "operation_id": operation_id,
+                "message": (
+                    "Operation is not a queued recovery operation."
+                ),
+            }
+
+        db.commit()
+        db.expire_all()
+
+        operation = db.get(
+            InfrastructureOperation,
+            operation_id,
+        )
+
+        if operation is None:
+            return {
+                "status": "not_found",
+                "operation_id": operation_id,
+            }
+
+        approval = db.get(
+            ApprovalRequest,
+            operation.approval_request_id,
+        )
+        infrastructure_request = db.get(
+            InfrastructureRequest,
+            operation.infrastructure_request_id,
+        )
+        plan = db.get(
+            TerraformPlanRecord,
+            operation.terraform_plan_record_id,
+        )
+
+        if not all((approval, infrastructure_request, plan)):
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "RECOVERY_RECORDS_MISSING",
+                "Required recovery approval, request or plan was not found.",
+            )
+
+        # Verify that all related records belong to the same request.
+        if (
+            operation.operation != "recovery"
+            or plan.operation != "recovery"
+            or plan.status != "succeeded"
+            or approval.infrastructure_request_id
+            != infrastructure_request.id
+            or approval.terraform_plan_record_id != plan.id
+            or plan.infrastructure_request_id
+            != infrastructure_request.id
+            or plan.requester_id != operation.requester_id
+            or approval.requester_id != operation.requester_id
+        ):
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "RECOVERY_OWNERSHIP_MISMATCH",
+                "Recovery operation, approval, request and plan do not match.",
+            )
+
+        conversation = db.get(
+            Conversation,
+            infrastructure_request.conversation_id,
+        )
+
+        if (
+            conversation is None
+            or conversation.user_id != operation.requester_id
+        ):
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "REQUEST_OWNERSHIP_MISMATCH",
+                "The infrastructure request ownership check failed.",
+            )
+
+        # Require final approval and all three independent reviews.
+        if approval.status != "approved":
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "RECOVERY_APPROVAL_NOT_APPROVED",
+                "The recovery plan has not received final approval.",
+            )
+
+        reviews = db.execute(
+            select(ApprovalStageReview).where(
+                ApprovalStageReview.approval_request_id
+                == approval.id
+            )
+        ).scalars().all()
+
+        required_stages = {
+            "technical",
+            "cost",
+            "security",
+        }
+
+        review_statuses = {
+            review.stage: review.status
+            for review in reviews
+        }
+
+        if (
+            set(review_statuses) != required_stages
+            or any(
+                review_statuses[stage] != "approved"
+                for stage in required_stages
+            )
+        ):
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "APPROVAL_STAGES_INCOMPLETE",
+                "All technical, cost and security reviews must be approved.",
+            )
+
+        # Ensure infrastructure requirements have not changed.
+        try:
+            specification = (
+                ValidatedInfrastructureSpecification.model_validate(
+                    infrastructure_request.requirements
+                )
+            )
+        except Exception:
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "SPECIFICATION_INVALID",
+                "The infrastructure specification is no longer valid.",
+            )
+
+        current_fingerprint = _fingerprint_specification(
+            specification
+        )
+
+        if plan.specification_fingerprint != current_fingerprint:
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "SPECIFICATION_FINGERPRINT_MISMATCH",
+                "Infrastructure requirements changed after recovery planning.",
+            )
+
+        # Verify the recovery plan fingerprint and binary artifact.
+        if (
+            not plan.artifact_path
+            or not plan.artifact_sha256
+            or not plan.plan_fingerprint
+        ):
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "RECOVERY_PLAN_ARTIFACT_MISSING",
+                "The approved recovery plan artifact is unavailable.",
+                result_summary_extra={
+                    "terraform_recovery_enabled": recovery_enabled,
+                    "terraform_recovery_executed": False,
+                },
+            )
+
+        if (
+            plan.plan_fingerprint != plan.artifact_sha256
+            or approval.plan_fingerprint != plan.plan_fingerprint
+        ):
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "RECOVERY_PLAN_FINGERPRINT_MISMATCH",
+                "The recovery plan fingerprint does not match its approval.",
+            )
+
+        try:
+            load_plan_artifact(
+                plan.artifact_path,
+                plan.artifact_sha256,
+            )
+        except TerraformArtifactError:
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "RECOVERY_PLAN_ARTIFACT_INVALID",
+                "Recovery plan artifact integrity verification failed.",
+            )
+
+        # Verify the provider lock artifact.
+        if (
+            not plan.provider_lock_path
+            or not plan.provider_lock_sha256
+        ):
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "PROVIDER_LOCK_ARTIFACT_MISSING",
+                "The recovery provider lock artifact is unavailable.",
+            )
+
+        try:
+            load_provider_lock_artifact(
+                plan.provider_lock_path,
+                plan.provider_lock_sha256,
+            )
+        except TerraformArtifactError:
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "PROVIDER_LOCK_ARTIFACT_INVALID",
+                "Recovery provider lock integrity verification failed.",
+            )
+
+        # Verify the exact configuration used to generate the plan.
+        if (
+            not plan.configuration_artifact_path
+            or not plan.configuration_artifact_sha256
+        ):
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "CONFIGURATION_ARTIFACT_MISSING",
+                "The recovery configuration artifact is unavailable.",
+            )
+
+        try:
+            load_configuration_artifact(
+                plan.configuration_artifact_path,
+                plan.configuration_artifact_sha256,
+            )
+        except TerraformArtifactError:
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "CONFIGURATION_ARTIFACT_INVALID",
+                "Recovery configuration integrity verification failed.",
+            )
+
+        # Verify the exact Terraform state snapshot approved for recovery.
+        state_record = get_state_record(
+            db,
+            infrastructure_request.id,
+        )
+
+        if state_record is None:
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "STATE_RECORD_MISSING",
+                "Terraform state record is unavailable for recovery.",
+            )
+
+        plan_snapshot = {
+            "version_id": plan.state_version_id,
+            "serial": plan.state_serial,
+            "lineage": plan.state_lineage,
+            "sha256": plan.state_sha256,
+        }
+
+        if (
+            not plan_snapshot["version_id"]
+            or not isinstance(plan_snapshot["serial"], int)
+            or not plan_snapshot["lineage"]
+            or not plan_snapshot["sha256"]
+        ):
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "RECOVERY_STATE_SNAPSHOT_INVALID",
+                "The approved recovery state snapshot is incomplete.",
+            )
+
+        try:
+            s3_client = create_s3_client(state_record.state_region)
+            current_snapshot = verify_active_state_snapshot(
+                s3_client,
+                state_record,
+            )
+        except (TerraformStateError, S3StateStorageError):
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "STATE_SNAPSHOT_VERIFICATION_FAILED",
+                "Current Terraform state could not be verified.",
+            )
+
+        if current_snapshot != plan_snapshot:
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "RECOVERY_STATE_SNAPSHOT_MISMATCH",
+                "Terraform state changed after recovery approval. A new recovery plan is required.",
+            )
+
+        if not _record_operation_progress(
+            db,
+            operation_id,
+            execution_token,
+            "recovery_state_snapshot_verified",
+            "Current Terraform state matches the approved recovery snapshot.",
+        ):
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "WORKER_LEASE_LOST",
+                "Worker no longer owns this recovery operation.",
+            )
+
+        if not _record_operation_progress(
+            db,
+            operation_id,
+            execution_token,
+            "terraform_initialization_started",
+            "Initializing the approved Terraform recovery workspace.",
+        ):
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "WORKER_LEASE_LOST",
+                "Worker no longer owns this recovery operation.",
+            )
+
+        env, temp_root = build_terraform_environment()
+        recovery_executed = False
+
+        try:
+            with reconstructed_terraform_workspace(
+                configuration_artifact_path=(
+                    plan.configuration_artifact_path
+                ),
+                configuration_artifact_sha256=(
+                    plan.configuration_artifact_sha256
+                ),
+                provider_lock_path=plan.provider_lock_path,
+                provider_lock_sha256=plan.provider_lock_sha256,
+                plan_artifact_path=plan.artifact_path,
+                plan_artifact_sha256=plan.artifact_sha256,
+                temp_root=temp_root,
+            ) as workspace:
+
+                try:
+                    initialize_terraform_apply_workspace(
+                        workspace,
+                        timeout_seconds=180,
+                        env=env,
+                        lease_renewal_callback=lambda: (
+                            _renew_operation_lease(
+                                operation_id,
+                                execution_token,
+                            )
+                        ),
+                    )
+                except TerraformExecutionError as exc:
+                    return _owned_operation_result(
+                        db,
+                        operation_id,
+                        execution_token,
+                        "failed",
+                        "RECOVERY_INITIALIZATION_FAILED",
+                        "Terraform recovery workspace initialization failed.",
+                        result_summary_extra={
+                            "terraform_recovery_enabled": recovery_enabled,
+                            "terraform_recovery_executed": False,
+                            "recovery_error_code": exc.code,
+                            "state_snapshot_verified": True,
+                        },
+                    )
+
+                if not _record_operation_progress(
+                    db,
+                    operation_id,
+                    execution_token,
+                    "recovery_preflight_completed",
+                    "Recovery workspace initialization completed.",
+                ):
+                    return _owned_operation_result(
+                        db,
+                        operation_id,
+                        execution_token,
+                        "blocked",
+                        "WORKER_LEASE_LOST",
+                        "Worker no longer owns this recovery operation.",
+                        result_summary_extra={
+                            "terraform_recovery_enabled": recovery_enabled,
+                            "terraform_recovery_executed": False,
+                        },
+                    )
+
+                # Execution remains disabled unless explicitly enabled.
+                if not recovery_enabled:
+                    return _owned_operation_result(
+                        db,
+                        operation_id,
+                        execution_token,
+                        "blocked",
+                        "TERRAFORM_RECOVERY_DISABLED",
+                        (
+                            "Recovery preflight completed successfully. "
+                            "Terraform recovery execution remains disabled "
+                            "because its feature flag is off."
+                        ),
+                        preflight_passed=True,
+                        result_summary_extra={
+                            "terraform_recovery_enabled": False,
+                            "terraform_recovery_executed": False,
+                            "state_snapshot_verified": True,
+                            "terraform_initialization_completed": True,
+                            "rollback_executed": False,
+                        },
+                    )
+
+                # Reverify state immediately before executing the plan.
+                try:
+                    latest_s3_client = create_s3_client(
+                        state_record.state_region
+                    )
+                    latest_snapshot = verify_active_state_snapshot(
+                        latest_s3_client,
+                        state_record,
+                    )
+                except (TerraformStateError, S3StateStorageError):
+                    return _owned_operation_result(
+                        db,
+                        operation_id,
+                        execution_token,
+                        "blocked",
+                        "STATE_SNAPSHOT_VERIFICATION_FAILED",
+                        "Terraform state could not be reverified immediately before recovery execution.",
+                    )
+
+                if latest_snapshot != plan_snapshot:
+                    return _owned_operation_result(
+                        db,
+                        operation_id,
+                        execution_token,
+                        "blocked",
+                        "RECOVERY_STATE_SNAPSHOT_MISMATCH",
+                        "Terraform state changed after recovery preflight. Recovery execution was stopped.",
+                    )
+
+                if not _record_operation_progress(
+                    db,
+                    operation_id,
+                    execution_token,
+                    "terraform_recovery_started",
+                    "Executing the separately approved Terraform recovery plan.",
+                ):
+                    return _owned_operation_result(
+                        db,
+                        operation_id,
+                        execution_token,
+                        "blocked",
+                        "WORKER_LEASE_LOST",
+                        "Worker no longer owns this recovery operation.",
+                    )
+
+                # Execute only the exact approved binary recovery plan.
+                try:
+                    execute_terraform_saved_plan(
+                        workspace,
+                        timeout_seconds=600,
+                        env=env,
+                        lease_renewal_callback=lambda: (
+                            _renew_operation_lease(
+                                operation_id,
+                                execution_token,
+                            )
+                        ),
+                    )
+                    recovery_executed = True
+
+                except TerraformExecutionError as exc:
+                    # Never reconcile or retry when worker ownership is uncertain.
+                    if exc.code in {
+                        "WORKER_LEASE_LOST",
+                        "WORKER_LEASE_RENEWAL_FAILED",
+                    }:
+                        return _owned_operation_result(
+                            db,
+                            operation_id,
+                            execution_token,
+                            "blocked",
+                            exc.code,
+                            "Recovery execution stopped after worker ownership was lost. Manual review is required.",
+                            result_summary_extra={
+                                "terraform_recovery_enabled": True,
+                                "terraform_recovery_executed": False,
+                                "state_reconciled": False,
+                                "recovery_status": "WORKER_OWNERSHIP_UNCERTAIN",
+                                "rollback_executed": False,
+                            },
+                        )
+
+                    # A failed recovery may have partially changed infrastructure.
+                    try:
+                        reconciliation = _sync_state_after_execution(
+                            db,
+                            infrastructure_request.id,
+                        )
+                    except Exception:
+                        db.rollback()
+                        reconciliation = {
+                            "state_reconciled": False,
+                            "recovery_status": "MANUAL_REVIEW_REQUIRED",
+                        }
+                    else:
+                        reconciliation["recovery_status"] = (
+                            "RECOVERY_EXECUTION_FAILED_RECONCILED"
+                        )
+
+                    return _owned_operation_result(
+                        db,
+                        operation_id,
+                        execution_token,
+                        "failed",
+                        exc.code,
+                        "Approved Terraform recovery execution failed. No further automatic recovery will be attempted.",
+                        preflight_passed=True,
+                        result_summary_extra={
+                            "terraform_recovery_enabled": True,
+                            "terraform_recovery_executed": False,
+                            "recovery_required": True,
+                            "rollback_executed": False,
+                            **reconciliation,
+                        },
+                    )
+
+                # Terraform succeeded. Synchronize state and inventory.
+                try:
+                    reconciliation = _sync_state_after_execution(
+                        db,
+                        infrastructure_request.id,
+                    )
+                except Exception:
+                    db.rollback()
+                    return _owned_operation_result(
+                        db,
+                        operation_id,
+                        execution_token,
+                        "failed",
+                        "RECOVERY_STATE_RECONCILIATION_FAILED",
+                        "Terraform recovery executed, but state and inventory reconciliation requires manual review.",
+                        preflight_passed=True,
+                        result_summary_extra={
+                            "terraform_recovery_enabled": True,
+                            "terraform_recovery_executed": True,
+                            "state_reconciled": False,
+                            "recovery_status": "MANUAL_REVIEW_REQUIRED",
+                            "rollback_executed": False,
+                        },
+                    )
+
+                return _owned_operation_result(
+                    db,
+                    operation_id,
+                    execution_token,
+                    "succeeded",
+                    "NONE",
+                    "Approved Terraform recovery completed and infrastructure inventory was synchronized.",
+                    preflight_passed=True,
+                    result_summary_extra={
+                        "terraform_recovery_enabled": True,
+                        "terraform_recovery_executed": True,
+                        "deployment_succeeded": True,
+                        "recovery_status": "RECOVERY_EXECUTED",
+                        "rollback_executed": True,
+                        **reconciliation,
+                    },
+                )
+
+        except TerraformExecutionError as exc:
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "failed",
+                exc.code,
+                "Terraform recovery preflight failed.",
+                result_summary_extra={
+                    "terraform_recovery_enabled": recovery_enabled,
+                    "terraform_recovery_executed": recovery_executed,
+                },
+            )
+
+    except Exception:
+        db.rollback()
+        return _owned_operation_result(
+            db,
+            operation_id,
+            execution_token,
+            "failed",
+            "RECOVERY_WORKER_FAILED",
+            "An unexpected error occurred during recovery validation or execution.",
+            result_summary_extra={
+                "terraform_recovery_enabled": recovery_enabled,
+            },
+        )
+
+    finally:
+        db.close()
 
 @celery_app.task(
     name="aiops.recover_stale_infrastructure_operations",

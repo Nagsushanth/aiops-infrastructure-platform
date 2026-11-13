@@ -1131,3 +1131,153 @@ def execute_terraform_destroy_plan(
         raise TerraformExecutionError(
             "DESTROY_PLAN_ARTIFACT_VALIDATION_FAILED"
         ) from exc
+
+
+def execute_terraform_compensating_plan(
+    *,
+    configuration_artifact_path: str,
+    configuration_artifact_sha256: str,
+    provider_lock_path: str,
+    provider_lock_sha256: str,
+    timeout_seconds: int = 600,
+    env: dict[str, str],
+    temp_root: Path | None = None,
+    lease_renewal_callback,
+) -> dict[str, Any]:
+    """
+    Generate a fresh recovery plan from a verified known-good configuration.
+
+    This function only generates and persists a Terraform plan.
+    It never applies or destroys infrastructure.
+    """
+
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, int)
+        or not 1 <= timeout_seconds <= 600
+    ):
+        raise ValueError(
+            "timeout_seconds must be an integer between 1 and 600."
+        )
+
+    if not callable(lease_renewal_callback):
+        raise ValueError("A lease renewal callback is required.")
+
+    with reconstructed_terraform_configuration_workspace(
+        configuration_artifact_path=configuration_artifact_path,
+        configuration_artifact_sha256=configuration_artifact_sha256,
+        provider_lock_path=provider_lock_path,
+        provider_lock_sha256=provider_lock_sha256,
+        temp_root=temp_root,
+    ) as workspace:
+
+        # Initialize against the existing S3 backend and preserve
+        # the verified provider lock file.
+        initialize_terraform_apply_workspace(
+            workspace,
+            timeout_seconds=timeout_seconds,
+            env=env,
+            lease_renewal_callback=lease_renewal_callback,
+        )
+
+        # Generate a fresh plan. Terraform refreshes provider state
+        # before calculating the changes required by the known-good
+        # configuration.
+        _run_controlled_process(
+            [
+                "terraform",
+                "plan",
+                "-input=false",
+                "-no-color",
+                "-lock-timeout=5m",
+                "-out=tfplan",
+            ],
+            cwd=workspace,
+            timeout_seconds=timeout_seconds,
+            env=env,
+            lease_renewal_callback=lease_renewal_callback,
+        )
+
+        plan_file = workspace / "tfplan"
+
+        if not plan_file.is_file() or plan_file.is_symlink():
+            raise TerraformExecutionError(
+                "RECOVERY_PLAN_ARTIFACT_MISSING"
+            )
+
+        try:
+            plan_bytes = plan_file.read_bytes()
+        except OSError as exc:
+            raise TerraformExecutionError(
+                "RECOVERY_PLAN_ARTIFACT_READ_FAILED"
+            ) from exc
+
+        if not plan_bytes:
+            raise TerraformExecutionError(
+                "RECOVERY_PLAN_ARTIFACT_EMPTY"
+            )
+
+        shown = _run_controlled_process(
+            [
+                "terraform",
+                "show",
+                "-json",
+                "tfplan",
+            ],
+            cwd=workspace,
+            timeout_seconds=timeout_seconds,
+            env=env,
+            lease_renewal_callback=lease_renewal_callback,
+        )
+
+        try:
+            raw_plan = json.loads(shown.stdout)
+            parsed = parse_terraform_plan(raw_plan)
+            security_analysis = evaluate_terraform_security(raw_plan)
+        except (
+            json.JSONDecodeError,
+            TerraformPlanParsingError,
+            ValueError,
+        ) as exc:
+            raise TerraformExecutionError(
+                "RECOVERY_PLAN_PARSE_FAILED"
+            ) from exc
+
+        resources = [
+            {
+                "address": item.get("address"),
+                "mode": item.get("mode"),
+                "type": item.get("type"),
+                "name": item.get("name"),
+                "actions": item.get("actions", []),
+            }
+            for item in parsed["resources"]
+        ]
+
+        plan_fingerprint = _sha256(plan_bytes)
+
+        try:
+            artifact_path, artifact_sha256 = save_plan_artifact(
+                plan_bytes
+            )
+        except (OSError, TerraformArtifactError) as exc:
+            raise TerraformExecutionError(
+                "RECOVERY_PLAN_ARTIFACT_SAVE_FAILED"
+            ) from exc
+
+        return {
+            "status": "succeeded",
+            "recovery_plan_generated": True,
+            "recovery_execution_enabled": False,
+            "automatic_rollback_executed": False,
+            "plan_fingerprint": plan_fingerprint,
+            "artifact_path": artifact_path,
+            "artifact_sha256": artifact_sha256,
+            "plan_summary": {
+                "resource_summary": parsed["resource_summary"],
+                "resources": resources,
+                "terraform_version": parsed.get("terraform_version"),
+                "format_version": parsed.get("format_version"),
+                "security_analysis": security_analysis,
+            },
+        }
