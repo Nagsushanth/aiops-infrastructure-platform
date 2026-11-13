@@ -2741,3 +2741,412 @@ def test_cleanup_scan_excludes_resource_with_active_operation(worker_db):
 
     assert result["candidate_count"] == 0
     assert result["skipped_active_operations"] == 1
+
+def test_provision_worker_executes_saved_plan_when_feature_flag_enabled(
+    worker_db,
+    monkeypatch,
+    tmp_path,
+):
+    requirements = {
+        "cloud_provider": "aws",
+        "resource_type": "EC2",
+        "environment": "development",
+        "region": "ap-south-1",
+        "vcpus": 2,
+        "memory_gb": 4,
+        "public_access": False,
+    }
+
+    specification = ValidatedInfrastructureSpecification.model_validate(
+        requirements
+    )
+    canonical = json.dumps(
+        specification.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    specification_fingerprint = hashlib.sha256(canonical).hexdigest()
+
+    artifact_path, artifact_checksum = save_plan_artifact(
+        b"valid-test-terraform-plan"
+    )
+    provider_lock_path, provider_lock_checksum = (
+        save_provider_lock_artifact(b'# Test provider lock file\n')
+    )
+    configuration_path, configuration_checksum = (
+        save_configuration_artifact(
+            'terraform {\n  required_version = ">= 1.10.0"\n}\n'
+        )
+    )
+
+    db = worker_db()
+
+    try:
+        user = User(
+            email="apply-enabled@example.com",
+            password_hash="test-hash",
+            role="user",
+            is_active=True,
+        )
+        db.add(user)
+        db.flush()
+
+        conversation = Conversation(
+            user_id=user.id,
+            session_id="apply-enabled-session",
+            title="Apply enabled test",
+        )
+        db.add(conversation)
+        db.flush()
+
+        request = InfrastructureRequest(
+            conversation_id=conversation.id,
+            status="complete",
+            requirements=requirements,
+        )
+        db.add(request)
+        db.flush()
+
+        plan = TerraformPlanRecord(
+            infrastructure_request_id=request.id,
+            requester_id=user.id,
+            status="succeeded",
+            plan_fingerprint=artifact_checksum,
+            specification_fingerprint=specification_fingerprint,
+            plan_summary={},
+            artifact_path=artifact_path,
+            artifact_sha256=artifact_checksum,
+            provider_lock_path=provider_lock_path,
+            provider_lock_sha256=provider_lock_checksum,
+            configuration_artifact_path=configuration_path,
+            configuration_artifact_sha256=configuration_checksum,
+        )
+        db.add(plan)
+        db.flush()
+
+        approval = ApprovalRequest(
+            infrastructure_request_id=request.id,
+            terraform_plan_record_id=plan.id,
+            requester_id=user.id,
+            status="approved",
+            plan_summary={},
+            plan_fingerprint=artifact_checksum,
+        )
+        db.add(approval)
+        db.flush()
+
+        for stage in ("technical", "cost", "security"):
+            db.add(
+                ApprovalStageReview(
+                    approval_request_id=approval.id,
+                    stage=stage,
+                    status="approved",
+                )
+            )
+
+        operation = InfrastructureOperation(
+            infrastructure_request_id=request.id,
+            terraform_plan_record_id=plan.id,
+            approval_request_id=approval.id,
+            requester_id=user.id,
+            operation="provision",
+            status="queued",
+        )
+        db.add(operation)
+        db.commit()
+        operation_id = operation.id
+        request_id = request.id
+
+    finally:
+        db.close()
+
+    monkeypatch.setenv("AIOPS_TERRAFORM_APPLY_ENABLED", "true")
+
+    calls = {}
+
+    def fake_build_environment():
+        return {
+            "PATH": os.environ.get("PATH", ""),
+            "TF_INPUT": "0",
+            "TF_IN_AUTOMATION": "1",
+        }, tmp_path
+
+    @contextmanager
+    def fake_reconstructed_workspace(**kwargs):
+        calls["workspace_artifacts"] = kwargs
+        yield tmp_path / "fake-apply-workspace"
+
+    def fake_initialize_workspace(
+        workspace,
+        *,
+        timeout_seconds,
+        env,
+        lease_renewal_callback,
+    ):
+        calls["initialized"] = True
+        assert lease_renewal_callback() is True
+
+    def fake_execute_saved_plan(
+        workspace,
+        *,
+        timeout_seconds,
+        env,
+        lease_renewal_callback,
+    ):
+        calls["apply"] = {
+            "workspace": workspace,
+            "timeout_seconds": timeout_seconds,
+        }
+
+    def fake_sync_state(db, infrastructure_request_id):
+        calls["reconciled_request_id"] = infrastructure_request_id
+        return {
+            "state_reconciled": True,
+            "state_serial": 4,
+            "inventory": {"present_resources": 1},
+        }
+
+    monkeypatch.setattr(
+        tasks,
+        "build_terraform_environment",
+        fake_build_environment,
+    )
+    monkeypatch.setattr(
+        tasks,
+        "reconstructed_terraform_workspace",
+        fake_reconstructed_workspace,
+    )
+    monkeypatch.setattr(
+        tasks,
+        "initialize_terraform_apply_workspace",
+        fake_initialize_workspace,
+    )
+    monkeypatch.setattr(
+        tasks,
+        "execute_terraform_saved_plan",
+        fake_execute_saved_plan,
+    )
+    monkeypatch.setattr(
+        tasks,
+        "_sync_state_after_execution",
+        fake_sync_state,
+    )
+
+    try:
+        result = tasks.execute_provision_operation.run(operation_id)
+
+        assert result["status"] == "succeeded", result
+        assert result["terraform_apply_enabled"] is True
+        assert result["terraform_apply_executed"] is True
+        assert result["deployment_succeeded"] is True
+        assert result["state_reconciled"] is True
+
+        assert calls["initialized"] is True
+        assert calls["apply"]["workspace"] == (
+            tmp_path / "fake-apply-workspace"
+        )
+        assert calls["apply"]["timeout_seconds"] == 600
+        assert calls["reconciled_request_id"] == request_id
+
+        verification_db = worker_db()
+        try:
+            saved_operation = verification_db.get(
+                InfrastructureOperation,
+                operation_id,
+            )
+            assert saved_operation.status == "succeeded"
+            assert saved_operation.result_summary[
+                "terraform_apply_executed"
+            ] is True
+            assert saved_operation.result_summary[
+                "state_reconciled"
+            ] is True
+        finally:
+            verification_db.close()
+
+    finally:
+        delete_plan_artifact(artifact_path)
+        delete_provider_lock_artifact(provider_lock_path)
+        delete_configuration_artifact(configuration_path)
+
+
+def test_deprovision_worker_executes_saved_destroy_plan_when_feature_flag_enabled(
+    worker_db,
+    monkeypatch,
+    tmp_path,
+):
+    with worker_db() as db:
+        (
+            operation_id,
+            state_snapshot,
+            artifact_path,
+            provider_lock_path,
+            configuration_path,
+        ) = create_deprovision_test_operation(db)
+
+    monkeypatch.setenv("AIOPS_TERRAFORM_DESTROY_ENABLED", "true")
+
+    calls = {
+        "state_verifications": 0,
+    }
+
+    fake_state_record = SimpleNamespace(
+        state_region="ap-south-1",
+    )
+
+    monkeypatch.setattr(
+        tasks,
+        "get_state_record",
+        lambda db, request_id: fake_state_record,
+    )
+
+    monkeypatch.setattr(
+        tasks,
+        "create_s3_client",
+        lambda region: object(),
+    )
+
+    def fake_verify_state_snapshot(client, state_record):
+        calls["state_verifications"] += 1
+        return state_snapshot
+
+    monkeypatch.setattr(
+        tasks,
+        "verify_active_state_snapshot",
+        fake_verify_state_snapshot,
+    )
+
+    def fake_build_environment():
+        return {
+            "PATH": os.environ.get("PATH", ""),
+            "TF_INPUT": "0",
+            "TF_IN_AUTOMATION": "1",
+        }, tmp_path
+
+    @contextmanager
+    def fake_reconstructed_workspace(**kwargs):
+        calls["workspace_artifacts"] = kwargs
+        yield tmp_path / "fake-destroy-workspace"
+
+    def fake_initialize_workspace(
+        workspace,
+        *,
+        timeout_seconds,
+        env,
+        lease_renewal_callback,
+    ):
+        calls["initialized"] = True
+        calls["initialization_timeout"] = timeout_seconds
+        assert lease_renewal_callback() is True
+
+    def fake_execute_saved_plan(
+        workspace,
+        *,
+        timeout_seconds,
+        env,
+        lease_renewal_callback,
+    ):
+        calls["destroy"] = {
+            "workspace": workspace,
+            "timeout_seconds": timeout_seconds,
+        }
+        assert lease_renewal_callback() is True
+
+    def fake_sync_state(db, infrastructure_request_id):
+        calls["reconciled_request_id"] = infrastructure_request_id
+        return {
+            "state_reconciled": True,
+            "state_serial": 4,
+            "inventory": {
+                "present_resources": 0,
+            },
+        }
+
+    monkeypatch.setattr(
+        tasks,
+        "build_terraform_environment",
+        fake_build_environment,
+    )
+
+    monkeypatch.setattr(
+        tasks,
+        "reconstructed_terraform_workspace",
+        fake_reconstructed_workspace,
+    )
+
+    monkeypatch.setattr(
+        tasks,
+        "initialize_terraform_apply_workspace",
+        fake_initialize_workspace,
+    )
+
+    monkeypatch.setattr(
+        tasks,
+        "execute_terraform_saved_plan",
+        fake_execute_saved_plan,
+    )
+
+    monkeypatch.setattr(
+        tasks,
+        "_sync_state_after_execution",
+        fake_sync_state,
+    )
+
+    try:
+        result = tasks.execute_deprovision_operation.run(
+            operation_id
+        )
+
+        assert result["status"] == "succeeded", result
+        assert result["terraform_destroy_enabled"] is True
+        assert result["terraform_destroy_executed"] is True
+        assert result["state_reconciled"] is True
+
+        # State must be verified before preflight and again
+        # immediately before executing the approved Destroy plan.
+        assert calls["state_verifications"] == 2
+
+        assert calls["initialized"] is True
+        assert calls["initialization_timeout"] == 180
+
+        assert calls["destroy"]["workspace"] == (
+            tmp_path / "fake-destroy-workspace"
+        )
+        assert calls["destroy"]["timeout_seconds"] == 600
+
+        reconstructed = calls["workspace_artifacts"]
+
+        assert reconstructed["plan_artifact_path"] == artifact_path
+        assert reconstructed["provider_lock_path"] == provider_lock_path
+        assert reconstructed["configuration_artifact_path"] == (
+            configuration_path
+        )
+        assert reconstructed["temp_root"] == tmp_path
+
+        verification_db = worker_db()
+        try:
+            saved_operation = verification_db.get(
+                InfrastructureOperation,
+                operation_id,
+            )
+
+            assert saved_operation is not None
+            assert saved_operation.status == "succeeded"
+            assert saved_operation.result_summary[
+                "terraform_destroy_enabled"
+            ] is True
+            assert saved_operation.result_summary[
+                "terraform_destroy_executed"
+            ] is True
+            assert saved_operation.result_summary[
+                "state_reconciled"
+            ] is True
+
+        finally:
+            verification_db.close()
+
+    finally:
+        delete_plan_artifact(artifact_path)
+        delete_provider_lock_artifact(provider_lock_path)
+        delete_configuration_artifact(configuration_path)

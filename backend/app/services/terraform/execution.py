@@ -621,6 +621,46 @@ def initialize_terraform_apply_workspace(
     )
 
 
+def execute_terraform_saved_plan(
+    workspace: Path,
+    *,
+    timeout_seconds: int,
+    env: dict[str, str],
+    lease_renewal_callback,
+) -> subprocess.CompletedProcess[str]:
+    """Execute only the previously verified Terraform saved plan."""
+
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, int)
+        or not 1 <= timeout_seconds <= 600
+    ):
+        raise ValueError(
+            "timeout_seconds must be an integer between 1 and 600."
+        )
+
+    plan_path = workspace / "tfplan"
+
+    if not plan_path.is_file() or plan_path.is_symlink():
+        raise TerraformExecutionError(
+            "SAVED_PLAN_ARTIFACT_MISSING"
+        )
+
+    return _run_controlled_process(
+        [
+            "terraform",
+            "apply",
+            "-input=false",
+            "-no-color",
+            "-lock-timeout=5m",
+            "tfplan",
+        ],
+        cwd=workspace,
+        timeout_seconds=timeout_seconds,
+        env=env,
+        lease_renewal_callback=lease_renewal_callback,
+    )
+
 def build_terraform_environment() -> tuple[dict[str, str], Path]:
     """Build a restricted Terraform environment and private temp root."""
 

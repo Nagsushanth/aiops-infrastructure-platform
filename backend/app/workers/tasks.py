@@ -1,6 +1,6 @@
 
 """Background tasks for infrastructure lifecycle operations."""
-
+import os
 import hashlib
 import json
 from datetime import datetime, timedelta, timezone
@@ -41,13 +41,30 @@ from backend.app.services.terraform.execution import (
     build_terraform_environment,
     reconstructed_terraform_workspace,
     initialize_terraform_apply_workspace,
+    execute_terraform_saved_plan
 )
 from backend.app.services.terraform.state_manager import (
     TerraformStateError,
     get_state_record,
     verify_active_state_snapshot,
 )
+from backend.app.services.terraform.s3_state_storage import (
+    S3StateStorageError,
+    create_s3_client,
+    read_state_object,
+    parse_terraform_state,
+)
+from backend.app.services.terraform.state_manager import (
+    TerraformStateError,
+    get_state_record,
+    verify_active_state_snapshot,
+    update_state_metadata,
+)
 
+from backend.app.services.terraform.inventory_manager import (
+    sync_infrastructure_inventory,
+    InfrastructureInventoryError,
+)
 from backend.app.services.terraform.s3_state_storage import (
     S3StateStorageError,
     create_s3_client,
@@ -57,6 +74,54 @@ from backend.app.models.infrastructure_resource import (
 )
 
 WORKER_LEASE_MINUTES = 15
+
+def _terraform_feature_enabled(name: str) -> bool:
+    """Enable Terraform execution only through an explicit true flag."""
+    return os.getenv(name, "").strip().lower() == "true"
+
+
+def _sync_state_after_execution(
+    db,
+    infrastructure_request_id: int,
+) -> dict:
+    """Reconcile Terraform state and inventory after successful execution."""
+
+    state_record = get_state_record(db, infrastructure_request_id)
+
+    if state_record is None:
+        raise TerraformStateError("STATE_RECORD_MISSING")
+
+    client = create_s3_client(state_record.state_region)
+
+    state_object = read_state_object(
+        client,
+        state_record.state_bucket,
+        state_record.state_key,
+    )
+
+    metadata = parse_terraform_state(state_object["content"])
+
+    inventory_result = sync_infrastructure_inventory(
+        db,
+        infrastructure_request_id,
+        state_serial=metadata["serial"],
+        resources=metadata["resources"],
+        state_version_id=state_object["version_id"],
+        state_lineage=metadata["lineage"],
+        state_sha256=state_object["sha256"],
+    )
+
+    update_state_metadata(
+        db,
+        infrastructure_request_id,
+        status="active",
+    )
+
+    return {
+        "state_reconciled": True,
+        "state_serial": metadata["serial"],
+        "inventory": inventory_result,
+    }
 
 @celery_app.task(name="aiops.health_check")
 def health_check() -> dict[str, str]:
@@ -230,6 +295,7 @@ def _finish_operation(
                 "message": message,
                 "preflight_passed": preflight_passed,
                 "terraform_apply_enabled": False,
+                "terraform_destroy_enabled": False,
                 **(result_summary_extra or {}),
             },
         )
@@ -297,9 +363,14 @@ def _owned_operation_result(
         "operation_id": operation_id,
         "error_code": error_code,
         "preflight_passed": preflight_passed,
-        "terraform_apply_enabled": False,
+        "terraform_apply_enabled": (
+            result_summary_extra or {}
+        ).get("terraform_apply_enabled", False),
+        "terraform_destroy_enabled": (
+            result_summary_extra or {}
+        ).get("terraform_destroy_enabled", False),
+        **(result_summary_extra or {}),
     }
-
 
 @celery_app.task(
     name="aiops.execute_provision_operation",
@@ -632,10 +703,13 @@ def execute_provision_operation(operation_id: int) -> dict:
                 "Worker no longer owns this operation.",
             )
 
+        apply_enabled = _terraform_feature_enabled(
+            "AIOPS_TERRAFORM_APPLY_ENABLED"
+        )
 
-
-        # Reconstruct the exact approved Terraform workspace.
+        # Reconstruct and retain the exact approved Terraform workspace.
         env, temp_root = build_terraform_environment()
+        apply_executed = False
 
         try:
             with reconstructed_terraform_workspace(
@@ -661,6 +735,72 @@ def execute_provision_operation(operation_id: int) -> dict:
                     ),
                 )
 
+                if not _record_operation_progress(
+                    db,
+                    operation_id,
+                    execution_token,
+                    "preflight_completed",
+                    "Terraform initialization and provision preflight completed successfully.",
+                ):
+                    return _owned_operation_result(
+                        db,
+                        operation_id,
+                        execution_token,
+                        "blocked",
+                        "WORKER_LEASE_LOST",
+                        "Worker no longer owns this operation.",
+                    )
+
+                if not apply_enabled:
+                    return _owned_operation_result(
+                        db,
+                        operation_id,
+                        execution_token,
+                        "blocked",
+                        "TERRAFORM_APPLY_DISABLED",
+                        (
+                            "Preflight validation succeeded. Terraform apply "
+                            "remains disabled because its feature flag is off."
+                        ),
+                        preflight_passed=True,
+                        result_summary_extra={
+                            "terraform_apply_enabled": False,
+                            "terraform_apply_executed": False,
+                        },
+                    )
+
+                if not _record_operation_progress(
+                    db,
+                    operation_id,
+                    execution_token,
+                    "terraform_apply_started",
+                    "Executing the approved Terraform saved plan.",
+                ):
+                    return _owned_operation_result(
+                        db,
+                        operation_id,
+                        execution_token,
+                        "blocked",
+                        "WORKER_LEASE_LOST",
+                        "Worker no longer owns this operation.",
+                        preflight_passed=True,
+                        result_summary_extra={
+                            "terraform_apply_enabled": True,
+                            "terraform_apply_executed": False,
+                        },
+                    )
+
+                execute_terraform_saved_plan(
+                    workspace,
+                    timeout_seconds=600,
+                    env=env,
+                    lease_renewal_callback=lambda: _renew_operation_lease(
+                        operation_id,
+                        execution_token,
+                    ),
+                )
+                apply_executed = True
+
         except TerraformExecutionError as exc:
             return _owned_operation_result(
                 db,
@@ -668,43 +808,72 @@ def execute_provision_operation(operation_id: int) -> dict:
                 execution_token,
                 "failed",
                 exc.code,
-                "Terraform initialization failed safely.",
+                "Terraform provision execution failed.",
                 preflight_passed=True,
+                result_summary_extra={
+                    "terraform_apply_enabled": apply_enabled,
+                    "terraform_apply_executed": apply_executed,
+                    "deployment_succeeded": False,
+                },
             )
 
-
-        if not _record_operation_progress(
-            db,
-            operation_id,
-            execution_token,
-            "preflight_completed",
-            "Terraform initialization and provision preflight completed successfully.",
-        ):
+        if not apply_executed:
             return _owned_operation_result(
                 db,
                 operation_id,
                 execution_token,
-                "blocked",
-                "WORKER_LEASE_LOST",
-                "Worker no longer owns this operation.",
+                "failed",
+                "TERRAFORM_APPLY_NOT_EXECUTED",
+                "Terraform Apply did not complete.",
+                preflight_passed=True,
+                result_summary_extra={
+                    "terraform_apply_enabled": apply_enabled,
+                    "terraform_apply_executed": False,
+                },
             )
 
+        # Terraform succeeded. Reconcile the resulting state and inventory.
+        try:
+            reconciliation = _sync_state_after_execution(
+                db,
+                infrastructure_request.id,
+            )
+        except Exception:
+            db.rollback()
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "succeeded",
+                "STATE_RECONCILIATION_REQUIRED",
+                (
+                    "Terraform Apply succeeded, but state and inventory "
+                    "reconciliation requires manual review."
+                ),
+                preflight_passed=True,
+                result_summary_extra={
+                    "terraform_apply_enabled": True,
+                    "terraform_apply_executed": True,
+                    "deployment_succeeded": True,
+                    "state_reconciled": False,
+                    "state_reconciliation_required": True,
+                },
+            )
 
-
-        # Deliberate safety boundary:
-        # Terraform apply remains disabled.
         return _owned_operation_result(
             db,
             operation_id,
             execution_token,
-            "blocked",
-            "TERRAFORM_APPLY_DISABLED",
-            (
-                "Preflight validation succeeded. Terraform apply remains "
-                "disabled until persistent state and deployment safeguards "
-                "are implemented."
-            ),
+            "succeeded",
+            "NONE",
+            "Terraform Apply completed and infrastructure inventory was synchronized.",
             preflight_passed=True,
+            result_summary_extra={
+                "terraform_apply_enabled": True,
+                "terraform_apply_executed": True,
+                "deployment_succeeded": True,
+                **reconciliation,
+            },
         )
 
     except Exception:
@@ -1225,10 +1394,12 @@ def execute_deprovision_operation(operation_id: int) -> dict:
                     "state_snapshot_verified": True,
                 },
             )
-
-        # Reconstruct the exact Terraform workspace used for the destroy plan.
+        destroy_enabled = _terraform_feature_enabled(
+            "AIOPS_TERRAFORM_DESTROY_ENABLED"
+        )
+        # Reconstruct and retain the exact approved destroy workspace.
         env, temp_root = build_terraform_environment()
-
+        destroy_executed = False
         try:
             with reconstructed_terraform_workspace(
                 configuration_artifact_path=(
@@ -1243,69 +1414,244 @@ def execute_deprovision_operation(operation_id: int) -> dict:
                 plan_artifact_sha256=plan.artifact_sha256,
                 temp_root=temp_root,
             ) as workspace:
-                # This performs Terraform initialization only.
-                initialize_terraform_apply_workspace(
+                try:
+                    initialize_terraform_apply_workspace(
+                        workspace,
+                        timeout_seconds=180,
+                        env=env,
+                        lease_renewal_callback=lambda: _renew_operation_lease(
+                            operation_id,
+                            execution_token,
+                        ),
+                    )
+                except TerraformExecutionError:
+                    return _owned_operation_result(
+                        db,
+                        operation_id,
+                        execution_token,
+                        "failed",
+                        "TERRAFORM_INITIALIZATION_FAILED",
+                        "Terraform workspace initialization failed during destroy preflight.",
+                        result_summary_extra={
+                            "destroy_confirmed": True,
+                            "terraform_destroy_enabled": destroy_enabled,
+                            "terraform_destroy_executed": False,
+                            "state_snapshot_verified": True,
+                            "terraform_initialization_completed": False,
+                        },
+                    )
+
+                if not _record_operation_progress(
+                    db,
+                    operation_id,
+                    execution_token,
+                    "preflight_completed",
+                    "Terraform destroy preflight and initialization completed successfully.",
+                ):
+                    return _owned_operation_result(
+                        db,
+                        operation_id,
+                        execution_token,
+                        "blocked",
+                        "WORKER_LEASE_LOST",
+                        "Worker no longer owns this operation.",
+                        result_summary_extra={
+                            "destroy_confirmed": True,
+                            "terraform_destroy_enabled": destroy_enabled,
+                            "terraform_destroy_executed": False,
+                            "state_snapshot_verified": True,
+                            "terraform_initialization_completed": True,
+                        },
+                    )
+
+                if not destroy_enabled:
+                    return _owned_operation_result(
+                        db,
+                        operation_id,
+                        execution_token,
+                        "blocked",
+                        "TERRAFORM_DESTROY_DISABLED",
+                        (
+                            "Destroy preflight completed successfully. "
+                            "Terraform destroy execution remains disabled "
+                            "because its feature flag is off."
+                        ),
+                        preflight_passed=True,
+                        result_summary_extra={
+                            "destroy_confirmed": True,
+                            "terraform_destroy_enabled": False,
+                            "terraform_destroy_executed": False,
+                            "state_snapshot_verified": True,
+                            "terraform_initialization_completed": True,
+                        },
+                    )
+
+                # Reverify the live state immediately before destruction.
+                try:
+                    latest_s3_client = create_s3_client(
+                        state_record.state_region
+                    )
+                    latest_snapshot = verify_active_state_snapshot(
+                        latest_s3_client,
+                        state_record,
+                    )
+                except (TerraformStateError, S3StateStorageError):
+                    return _owned_operation_result(
+                        db,
+                        operation_id,
+                        execution_token,
+                        "blocked",
+                        "STATE_SNAPSHOT_VERIFICATION_FAILED",
+                        (
+                            "Terraform state could not be reverified "
+                            "immediately before destruction."
+                        ),
+                        preflight_passed=True,
+                        result_summary_extra={
+                            "destroy_confirmed": True,
+                            "terraform_destroy_enabled": True,
+                            "terraform_destroy_executed": False,
+                            "state_snapshot_verified": False,
+                            "terraform_initialization_completed": True,
+                        },
+                    )
+
+                if latest_snapshot != plan_snapshot:
+                    return _owned_operation_result(
+                        db,
+                        operation_id,
+                        execution_token,
+                        "blocked",
+                        "DESTROY_PLAN_STATE_SNAPSHOT_MISMATCH",
+                        (
+                            "Terraform state changed after preflight. "
+                            "Generate and approve a new destroy plan."
+                        ),
+                        preflight_passed=True,
+                        result_summary_extra={
+                            "destroy_confirmed": True,
+                            "terraform_destroy_enabled": True,
+                            "terraform_destroy_executed": False,
+                            "state_snapshot_verified": False,
+                            "terraform_initialization_completed": True,
+                        },
+                    )
+
+                if not _record_operation_progress(
+                    db,
+                    operation_id,
+                    execution_token,
+                    "terraform_destroy_started",
+                    "Executing the approved Terraform saved destroy plan.",
+                ):
+                    return _owned_operation_result(
+                        db,
+                        operation_id,
+                        execution_token,
+                        "blocked",
+                        "WORKER_LEASE_LOST",
+                        "Worker no longer owns this operation.",
+                        preflight_passed=True,
+                        result_summary_extra={
+                            "destroy_confirmed": True,
+                            "terraform_destroy_enabled": True,
+                            "terraform_destroy_executed": False,
+                            "state_snapshot_verified": True,
+                        },
+                    )
+
+                # Execute only the previously approved binary destroy plan.
+                execute_terraform_saved_plan(
                     workspace,
-                    timeout_seconds=180,
+                    timeout_seconds=600,
                     env=env,
                     lease_renewal_callback=lambda: _renew_operation_lease(
                         operation_id,
                         execution_token,
                     ),
                 )
+                destroy_executed = True
 
-        except TerraformExecutionError:
+        except TerraformExecutionError as exc:
             return _owned_operation_result(
                 db,
                 operation_id,
                 execution_token,
                 "failed",
-                "TERRAFORM_INITIALIZATION_FAILED",
-                "Terraform workspace initialization failed during destroy preflight.",
+                exc.code,
+                "Terraform destroy execution failed.",
+                preflight_passed=True,
                 result_summary_extra={
                     "destroy_confirmed": True,
-                    "terraform_destroy_enabled": False,
+                    "terraform_destroy_enabled": destroy_enabled,
+                    "terraform_destroy_executed": destroy_executed,
                     "state_snapshot_verified": True,
-                    "terraform_initialization_completed": False,
+                    "deployment_succeeded": False,
                 },
             )
 
-        if not _record_operation_progress(
-            db,
-            operation_id,
-            execution_token,
-            "preflight_completed",
-            "Terraform destroy preflight and initialization completed successfully.",
-        ):
+        if not destroy_executed:
             return _owned_operation_result(
                 db,
                 operation_id,
                 execution_token,
-                "blocked",
-                "WORKER_LEASE_LOST",
-                "Worker no longer owns this operation.",
+                "failed",
+                "TERRAFORM_DESTROY_NOT_EXECUTED",
+                "Terraform Destroy did not complete.",
+                preflight_passed=True,
                 result_summary_extra={
                     "destroy_confirmed": True,
-                    "terraform_destroy_enabled": False,
-                    "state_snapshot_verified": True,
-                    "terraform_initialization_completed": True,
+                    "terraform_destroy_enabled": destroy_enabled,
+                    "terraform_destroy_executed": False,
                 },
             )
 
-        # All preflight checks passed, but actual destruction remains disabled.
+        # Terraform succeeded. Reconcile resulting state and inventory.
+        try:
+            reconciliation = _sync_state_after_execution(
+                db,
+                infrastructure_request.id,
+            )
+        except Exception:
+            db.rollback()
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "succeeded",
+                "STATE_RECONCILIATION_REQUIRED",
+                (
+                    "Terraform Destroy succeeded, but state and inventory "
+                    "reconciliation requires manual review."
+                ),
+                preflight_passed=True,
+                result_summary_extra={
+                    "destroy_confirmed": True,
+                    "terraform_destroy_enabled": True,
+                    "terraform_destroy_executed": True,
+                    "deployment_succeeded": True,
+                    "state_reconciled": False,
+                    "state_reconciliation_required": True,
+                },
+            )
+
         return _owned_operation_result(
             db,
             operation_id,
             execution_token,
-            "blocked",
-            "TERRAFORM_DESTROY_DISABLED",
-            "Destroy preflight completed successfully. Terraform destroy execution remains disabled.",
+            "succeeded",
+            "NONE",
+            (
+                "Terraform Destroy completed and infrastructure "
+                "inventory was synchronized."
+            ),
             preflight_passed=True,
             result_summary_extra={
                 "destroy_confirmed": True,
-                "terraform_destroy_enabled": False,
-                "state_snapshot_verified": True,
-                "terraform_initialization_completed": True,
+                "terraform_destroy_enabled": True,
+                "terraform_destroy_executed": True,
+                "deployment_succeeded": True,
+                **reconciliation,
             },
         )
 

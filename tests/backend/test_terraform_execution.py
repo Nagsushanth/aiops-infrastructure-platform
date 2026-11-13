@@ -31,6 +31,7 @@ from backend.app.services.terraform.execution import (
     execute_terraform_plan,
     reconstructed_terraform_configuration_workspace,
     reconstructed_terraform_workspace,
+    execute_terraform_saved_plan,
     initialize_terraform_apply_workspace,
     build_terraform_environment,
     execute_terraform_destroy_plan,
@@ -1439,3 +1440,116 @@ def test_destroy_plan_allows_data_source_reads(
         == "managed"
     )
 
+def test_execute_saved_plan_uses_controlled_process(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "tfplan").write_bytes(b"verified-plan")
+
+    env = {"TF_IN_AUTOMATION": "1"}
+    lease_callback = lambda: True
+    expected = completed_process(stdout="Apply complete!")
+
+    with patch.object(
+        execution_module,
+        "_run_controlled_process",
+        return_value=expected,
+    ) as mock_process:
+        result = execute_terraform_saved_plan(
+            workspace,
+            timeout_seconds=300,
+            env=env,
+            lease_renewal_callback=lease_callback,
+        )
+
+    assert result is expected
+
+    mock_process.assert_called_once()
+    args, kwargs = mock_process.call_args
+
+    assert args[0] == [
+        "terraform",
+        "apply",
+        "-input=false",
+        "-no-color",
+        "-lock-timeout=5m",
+        "tfplan",
+    ]
+    assert kwargs["cwd"] == workspace
+    assert kwargs["timeout_seconds"] == 300
+    assert kwargs["env"] == env
+    assert kwargs["lease_renewal_callback"] is lease_callback
+
+
+def test_execute_saved_plan_rejects_missing_plan(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    with patch.object(
+        execution_module,
+        "_run_controlled_process",
+    ) as mock_process:
+        with pytest.raises(
+            TerraformExecutionError,
+            match="SAVED_PLAN_ARTIFACT_MISSING",
+        ):
+            execute_terraform_saved_plan(
+                workspace,
+                timeout_seconds=300,
+                env={},
+                lease_renewal_callback=lambda: True,
+            )
+
+    mock_process.assert_not_called()
+
+
+def test_execute_saved_plan_rejects_symlink(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    actual_plan = tmp_path / "actual-tfplan"
+    actual_plan.write_bytes(b"verified-plan")
+    (workspace / "tfplan").symlink_to(actual_plan)
+
+    with patch.object(
+        execution_module,
+        "_run_controlled_process",
+    ) as mock_process:
+        with pytest.raises(
+            TerraformExecutionError,
+            match="SAVED_PLAN_ARTIFACT_MISSING",
+        ):
+            execute_terraform_saved_plan(
+                workspace,
+                timeout_seconds=300,
+                env={},
+                lease_renewal_callback=lambda: True,
+            )
+
+    mock_process.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "timeout_seconds",
+    [0, -1, 601, True, False],
+)
+def test_execute_saved_plan_rejects_invalid_timeout(
+    tmp_path,
+    timeout_seconds,
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "tfplan").write_bytes(b"verified-plan")
+
+    with patch.object(
+        execution_module,
+        "_run_controlled_process",
+    ) as mock_process:
+        with pytest.raises(ValueError):
+            execute_terraform_saved_plan(
+                workspace,
+                timeout_seconds=timeout_seconds,
+                env={},
+                lease_renewal_callback=lambda: True,
+            )
+
+    mock_process.assert_not_called()
