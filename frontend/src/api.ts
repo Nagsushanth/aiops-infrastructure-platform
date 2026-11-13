@@ -1,3 +1,72 @@
+export interface InfrastructureOperationResponse {
+  id: number;
+  infrastructure_request_id: number;
+  terraform_plan_record_id: number;
+  approval_request_id: number;
+  requester_id: number;
+  operation: string;
+  status: string;
+  celery_task_id: string | null;
+  error_code: string | null;
+  result_summary: Record<string, unknown>;
+  comments: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface InfrastructureOperationAuditEvent {
+  id: number;
+  source: string;
+  approval_request_id: number;
+  operation_id: number;
+  actor_id: number | null;
+  actor_type: string;
+  event_type: string;
+  previous_status: string | null;
+  new_status: string;
+  comments: string | null;
+  event_metadata: Record<string, unknown>;
+  created_at: string;
+}
+
+export async function getInfrastructureOperations():
+  Promise<InfrastructureOperationResponse[]> {
+  return apiRequest<InfrastructureOperationResponse[]>(
+    "/infrastructure-operations",
+  );
+}
+
+export async function getInfrastructureOperationAudit(
+  operationId: number,
+): Promise<InfrastructureOperationAuditEvent[]> {
+  return apiRequest<InfrastructureOperationAuditEvent[]>(
+    `/infrastructure-operations/${operationId}/audit`,
+  );
+}
+
+export interface InfrastructureResourceHealth {
+  instance_id: string;
+  lifecycle_state: string;
+  health_status: "healthy" | "impaired" | "not_running" | "initializing" | "unknown";
+  system_status: string | null;
+  instance_status: string | null;
+}
+
+export interface InfrastructureResourceHealthResponse {
+  infrastructure_request_id: number;
+  total_instances: number;
+  health: InfrastructureResourceHealth[];
+}
+
+export async function getInfrastructureResourceHealth(
+  infrastructureRequestId: number,
+): Promise<InfrastructureResourceHealthResponse> {
+  return apiRequest<InfrastructureResourceHealthResponse>(
+    `/infrastructure-operations/requests/${infrastructureRequestId}/health`,
+  );
+}
 
 const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";

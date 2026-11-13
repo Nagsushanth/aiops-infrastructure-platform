@@ -62,6 +62,14 @@ from backend.app.services.terraform.state_version_manager import (
 from backend.app.models.infrastructure_operation_event import (
     InfrastructureOperationEvent,
 )
+from backend.app.models.infrastructure_resource import (
+    InfrastructureResource,
+)
+from backend.app.services.terraform.resource_health import (
+    ResourceHealthError,
+    create_ec2_client,
+    get_ec2_resource_health,
+)
 
 router = APIRouter(
     prefix="/infrastructure-operations",
@@ -946,4 +954,82 @@ def synchronize_infrastructure_inventory(
     return {
         "infrastructure_request_id": infrastructure_request_id,
         **result,
+    }
+
+@router.get(
+    "/requests/{infrastructure_request_id}/health",
+)
+def get_infrastructure_resource_health(
+    infrastructure_request_id: int,
+    current_user: CurrentUser,
+    db: Session = Depends(get_db),
+):
+    """Retrieve live health information for inventoried EC2 instances."""
+
+    get_owned_infrastructure_request(
+        infrastructure_request_id,
+        current_user.id,
+        db,
+    )
+
+    state_record = db.scalar(
+        select(TerraformStateRecord).where(
+            TerraformStateRecord.infrastructure_request_id
+            == infrastructure_request_id
+        )
+    )
+
+    if state_record is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Terraform state record not found.",
+        )
+
+    if state_record.status == "archived":
+        raise HTTPException(
+            status_code=409,
+            detail="Archived Terraform state cannot be monitored.",
+        )
+
+    resources = db.scalars(
+        select(InfrastructureResource).where(
+            InfrastructureResource.infrastructure_request_id
+            == infrastructure_request_id,
+            InfrastructureResource.resource_type == "aws_instance",
+            InfrastructureResource.mode == "managed",
+            InfrastructureResource.is_present.is_(True),
+        )
+    ).all()
+
+    instance_ids = [
+        resource.resource_id
+        for resource in resources
+        if resource.resource_id
+    ]
+
+    if not instance_ids:
+        return {
+            "infrastructure_request_id": infrastructure_request_id,
+            "total_instances": 0,
+            "health": [],
+        }
+
+    try:
+        ec2_client = create_ec2_client(state_record.state_region)
+
+        health = get_ec2_resource_health(
+            ec2_client,
+            instance_ids,
+        )
+
+    except ResourceHealthError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="EC2 resource health retrieval failed.",
+        ) from exc
+
+    return {
+        "infrastructure_request_id": infrastructure_request_id,
+        "total_instances": len(health),
+        "health": health,
     }

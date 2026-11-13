@@ -19,7 +19,7 @@ import SmartToyIcon from "@mui/icons-material/SmartToy";
 import StorageIcon from "@mui/icons-material/Storage";
 import AccountTreeIcon from "@mui/icons-material/AccountTree";
 import CheckCircleIcon from "@mui/icons-material/CheckCircle";
-
+import InfrastructureOperationsPanel from "./InfrastructureOperationsPanel";
 import AuthPanel from "./AuthPanel";
 import ChatPanel, { type InfrastructureSpec } from "./ChatPanel";
 import TerraformPreview from "./TerraformPreview";
@@ -364,6 +364,11 @@ export default function App() {
 
           <Box sx={{ mt: 3 }}>
             <ApprovalReviewPanel />
+          </Box>
+
+          <Box sx={{ mt: 3 }}>
+            <InfrastructureOperationsPanel
+              infrastructureRequestId={infrastructureRequestId}/>
           </Box>
 
           <Typography

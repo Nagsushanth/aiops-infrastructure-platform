@@ -1620,3 +1620,201 @@ def test_deprovision_returns_409_for_database_uniqueness_conflict(
     assert response.json()["detail"] == (
         "A deprovision operation already exists for this approval."
     )
+
+def _create_health_test_records(request_id):
+    """Create Terraform state and one inventoried EC2 instance."""
+
+    db = TestingSessionLocal()
+    try:
+        db.add(
+            TerraformStateRecord(
+                infrastructure_request_id=request_id,
+                backend_type="s3",
+                state_bucket="test-state-bucket",
+                state_key=f"requests/{request_id}/terraform.tfstate",
+                state_region="ap-south-1",
+                status="active",
+            )
+        )
+
+        db.add(
+            InfrastructureResource(
+                infrastructure_request_id=request_id,
+                resource_address="aws_instance.web",
+                resource_type="aws_instance",
+                resource_name="web",
+                provider="registry.terraform.io/hashicorp/aws",
+                mode="managed",
+                module=None,
+                instance_key=None,
+                resource_id="i-1234567890abcdef0",
+                tags={},
+                dependencies=[],
+                instance_status="running",
+                state_serial=1,
+                is_present=True,
+            )
+        )
+
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_owner_can_retrieve_ec2_resource_health(
+    client, setup_data, monkeypatch
+):
+    request_id = setup_data["request_id"]
+    _create_health_test_records(request_id)
+
+    class FakeEC2Client:
+        def describe_instances(self, **kwargs):
+            assert kwargs["InstanceIds"] == ["i-1234567890abcdef0"]
+            return {
+                "Reservations": [
+                    {
+                        "Instances": [
+                            {
+                                "InstanceId": "i-1234567890abcdef0",
+                                "State": {"Name": "running"},
+                            }
+                        ]
+                    }
+                ]
+            }
+
+        def describe_instance_status(self, **kwargs):
+            assert kwargs["IncludeAllInstances"] is True
+            return {
+                "InstanceStatuses": [
+                    {
+                        "InstanceId": "i-1234567890abcdef0",
+                        "SystemStatus": {"Status": "ok"},
+                        "InstanceStatus": {"Status": "ok"},
+                    }
+                ]
+            }
+
+    regions = []
+
+    def fake_create_ec2_client(region_name):
+        regions.append(region_name)
+        return FakeEC2Client()
+
+    monkeypatch.setattr(
+        operations_api,
+        "create_ec2_client",
+        fake_create_ec2_client,
+    )
+
+    response = client.get(
+        f"/infrastructure-operations/requests/{request_id}/health",
+        headers=setup_data["requester_headers"],
+    )
+
+    assert response.status_code == 200, response.text
+
+    body = response.json()
+
+    assert body["infrastructure_request_id"] == request_id
+    assert body["total_instances"] == 1
+    assert body["health"][0]["instance_id"] == "i-1234567890abcdef0"
+    assert body["health"][0]["lifecycle_state"] == "running"
+    assert body["health"][0]["health_status"] == "healthy"
+    assert regions == ["ap-south-1"]
+
+    # Live monitoring must not overwrite Terraform inventory status.
+    db = TestingSessionLocal()
+    try:
+        resource = db.query(InfrastructureResource).filter_by(
+            infrastructure_request_id=request_id
+        ).one()
+
+        assert resource.instance_status == "running"
+    finally:
+        db.close()
+
+def test_another_user_cannot_retrieve_ec2_resource_health(
+    client, setup_data, monkeypatch
+):
+    request_id = setup_data["request_id"]
+
+    def must_not_run(*args, **kwargs):
+        pytest.fail("EC2 client must not be created for another user")
+
+    monkeypatch.setattr(
+        operations_api,
+        "create_ec2_client",
+        must_not_run,
+    )
+
+    response = client.get(
+        f"/infrastructure-operations/requests/{request_id}/health",
+        headers=setup_data["other_user_headers"],
+    )
+
+    assert response.status_code == 404
+
+def test_health_returns_empty_inventory_without_aws_call(
+    client, setup_data, monkeypatch
+):
+    request_id = setup_data["request_id"]
+
+    db = TestingSessionLocal()
+    try:
+        db.add(
+            TerraformStateRecord(
+                infrastructure_request_id=request_id,
+                backend_type="s3",
+                state_bucket="test-state-bucket",
+                state_key=f"requests/{request_id}/terraform.tfstate",
+                state_region="ap-south-1",
+                status="active",
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    def must_not_run(*args, **kwargs):
+        pytest.fail("EC2 must not be queried for empty inventory")
+
+    monkeypatch.setattr(
+        operations_api,
+        "create_ec2_client",
+        must_not_run,
+    )
+
+    response = client.get(
+        f"/infrastructure-operations/requests/{request_id}/health",
+        headers=setup_data["requester_headers"],
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "infrastructure_request_id": request_id,
+        "total_instances": 0,
+        "health": [],
+    }
+
+def test_health_returns_404_when_state_record_is_missing(
+    client, setup_data, monkeypatch
+):
+    request_id = setup_data["request_id"]
+
+    def must_not_run(*args, **kwargs):
+        pytest.fail("EC2 must not be queried without a state record")
+
+    monkeypatch.setattr(
+        operations_api,
+        "create_ec2_client",
+        must_not_run,
+    )
+
+    response = client.get(
+        f"/infrastructure-operations/requests/{request_id}/health",
+        headers=setup_data["requester_headers"],
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Terraform state record not found."

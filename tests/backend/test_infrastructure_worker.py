@@ -1025,6 +1025,110 @@ def test_worker_lease_callback_renews_current_operation(worker_db):
     finally:
         db.close()
 
+
+def test_progress_event_records_for_current_worker(worker_db):
+    db = worker_db()
+
+    try:
+        operation_id = create_recovery_test_operation(
+            db,
+            "progress-success@example.com",
+            "running",
+            datetime.now(timezone.utc) + timedelta(minutes=5),
+        )
+
+        recorded = tasks._record_operation_progress(
+            db,
+            operation_id,
+            "test-execution-token",
+            "validating_request",
+            "Validating infrastructure request.",
+        )
+
+        assert recorded is True
+
+        event = db.scalar(
+            select(InfrastructureOperationEvent).where(
+                InfrastructureOperationEvent.operation_id == operation_id
+            )
+        )
+
+        assert event is not None
+        assert event.event_type == "worker_progress"
+        assert event.previous_status == "running"
+        assert event.new_status == "running"
+        assert event.event_metadata["stage"] == "validating_request"
+
+    finally:
+        db.close()
+
+
+def test_progress_event_rejects_wrong_execution_token(worker_db):
+    db = worker_db()
+
+    try:
+        operation_id = create_recovery_test_operation(
+            db,
+            "progress-wrong-token@example.com",
+            "running",
+            datetime.now(timezone.utc) + timedelta(minutes=5),
+        )
+
+        recorded = tasks._record_operation_progress(
+            db,
+            operation_id,
+            "incorrect-token",
+            "validating_request",
+            "Validating infrastructure request.",
+        )
+
+        assert recorded is False
+
+        event = db.scalar(
+            select(InfrastructureOperationEvent).where(
+                InfrastructureOperationEvent.operation_id == operation_id
+            )
+        )
+
+        assert event is None
+
+    finally:
+        db.close()
+
+
+def test_progress_event_rejects_expired_lease(worker_db):
+    db = worker_db()
+
+    try:
+        operation_id = create_recovery_test_operation(
+            db,
+            "progress-expired@example.com",
+            "running",
+            datetime.now(timezone.utc) - timedelta(minutes=5),
+        )
+
+        recorded = tasks._record_operation_progress(
+            db,
+            operation_id,
+            "test-execution-token",
+            "validating_request",
+            "Validating infrastructure request.",
+        )
+
+        assert recorded is False
+
+        event = db.scalar(
+            select(InfrastructureOperationEvent).where(
+                InfrastructureOperationEvent.operation_id == operation_id
+            )
+        )
+
+        assert event is None
+
+    finally:
+        db.close()
+
+
 def test_worker_process_integration_renews_lease(worker_db):
     db = worker_db()
 

@@ -145,6 +145,56 @@ def _run_owned_operation_process(
     )
 
 
+def _record_operation_progress(
+    db,
+    operation_id: int,
+    execution_token: str,
+    stage: str,
+    message: str,
+) -> bool:
+    """Record progress only while this worker owns a valid operation lease."""
+
+    now = datetime.now(timezone.utc)
+
+    result = db.execute(
+        update(InfrastructureOperation)
+        .where(
+            InfrastructureOperation.id == operation_id,
+            InfrastructureOperation.status == "running",
+            InfrastructureOperation.execution_token == execution_token,
+            InfrastructureOperation.lease_expires_at > now,
+        )
+        .values(
+            lease_expires_at=now + timedelta(
+                minutes=WORKER_LEASE_MINUTES
+            )
+        )
+        .execution_options(synchronize_session=False)
+    )
+
+    if result.rowcount != 1:
+        db.rollback()
+        return False
+
+    db.add(
+        InfrastructureOperationEvent(
+            operation_id=operation_id,
+            actor_id=None,
+            actor_type="system",
+            event_type="worker_progress",
+            previous_status="running",
+            new_status="running",
+            comments=message,
+            event_metadata={
+                "source": "celery_worker",
+                "stage": stage,
+            },
+        )
+    )
+
+    db.commit()
+    return True
+
 def _finish_operation(
     db,
     operation_id: int,
@@ -563,6 +613,24 @@ def execute_provision_operation(operation_id: int) -> dict:
             )
 
         
+        if not _record_operation_progress(
+            db,
+            operation_id,
+            execution_token,
+            "terraform_initialization_started",
+            "Initializing the approved Terraform workspace.",
+        ):
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "WORKER_LEASE_LOST",
+                "Worker no longer owns this operation.",
+            )
+
+
+
         # Reconstruct the exact approved Terraform workspace.
         env, temp_root = build_terraform_environment()
 
@@ -599,6 +667,23 @@ def execute_provision_operation(operation_id: int) -> dict:
                 exc.code,
                 "Terraform initialization failed safely.",
                 preflight_passed=True,
+            )
+
+
+        if not _record_operation_progress(
+            db,
+            operation_id,
+            execution_token,
+            "preflight_completed",
+            "Terraform initialization and provision preflight completed successfully.",
+        ):
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "WORKER_LEASE_LOST",
+                "Worker no longer owns this operation.",
             )
 
 
@@ -971,6 +1056,26 @@ def execute_deprovision_operation(operation_id: int) -> dict:
                 },
             )
 
+        if not _record_operation_progress(
+            db,
+            operation_id,
+            execution_token,
+            "state_snapshot_verified",
+            "Current Terraform state matches the approved destroy plan snapshot.",
+        ):
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "WORKER_LEASE_LOST",
+                "Worker no longer owns this operation.",
+                result_summary_extra={
+                    "destroy_confirmed": True,
+                    "terraform_destroy_enabled": False,
+                },
+            )
+
         # Verify the Terraform binary plan artifact.
         if not plan.artifact_path or not plan.artifact_sha256:
             return _owned_operation_result(
@@ -1097,6 +1202,27 @@ def execute_deprovision_operation(operation_id: int) -> dict:
                 },
             )
 
+        if not _record_operation_progress(
+            db,
+            operation_id,
+            execution_token,
+            "terraform_initialization_started",
+            "Initializing the approved Terraform destroy workspace.",
+        ):
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "WORKER_LEASE_LOST",
+                "Worker no longer owns this operation.",
+                result_summary_extra={
+                    "destroy_confirmed": True,
+                    "terraform_destroy_enabled": False,
+                    "state_snapshot_verified": True,
+                },
+            )
+
         # Reconstruct the exact Terraform workspace used for the destroy plan.
         env, temp_root = build_terraform_environment()
 
@@ -1138,6 +1264,28 @@ def execute_deprovision_operation(operation_id: int) -> dict:
                     "terraform_destroy_enabled": False,
                     "state_snapshot_verified": True,
                     "terraform_initialization_completed": False,
+                },
+            )
+
+        if not _record_operation_progress(
+            db,
+            operation_id,
+            execution_token,
+            "preflight_completed",
+            "Terraform destroy preflight and initialization completed successfully.",
+        ):
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "WORKER_LEASE_LOST",
+                "Worker no longer owns this operation.",
+                result_summary_extra={
+                    "destroy_confirmed": True,
+                    "terraform_destroy_enabled": False,
+                    "state_snapshot_verified": True,
+                    "terraform_initialization_completed": True,
                 },
             )
 
