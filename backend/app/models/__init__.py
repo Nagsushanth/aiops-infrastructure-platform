@@ -9,6 +9,7 @@ from backend.app.models.infrastructure_operation_event import (
     InfrastructureOperationEvent,
 )
 from backend.app.models.infrastructure_resource import InfrastructureResource
+from backend.app.models.message_attachment import MessageAttachment
 
 
 __all__ = [
@@ -21,4 +22,5 @@ __all__ = [
     "TerraformStateVersion",
     "InfrastructureOperationEvent",
     "InfrastructureResource",
+    "MessageAttachment"
 ]

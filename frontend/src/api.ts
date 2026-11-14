@@ -217,6 +217,92 @@ export async function getMessages(
 }
 
 
+export interface ChatAttachment {
+  id: number;
+  conversation_id: number;
+  message_id: number;
+  original_filename: string;
+  content_type: string;
+  size_bytes: number;
+  sha256: string;
+  created_at: string;
+}
+
+export interface AttachmentUploadResponse {
+  attachment: ChatAttachment;
+  message_id: number;
+  message_content: string;
+}
+
+export async function uploadAttachment(
+  conversationId: number,
+  file: File,
+): Promise<AttachmentUploadResponse> {
+  const token = getAccessToken();
+
+  if (!token) {
+    throw new Error("Please sign in to upload attachments.");
+  }
+
+  const formData = new FormData();
+  formData.append("file", file);
+
+  const response = await fetch(
+    `${API_BASE_URL}/conversations/${conversationId}/attachments`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+      body: formData,
+    },
+  );
+
+  if (!response.ok) {
+    throw new Error(
+      `Upload failed (${response.status}): ${await response.text()}`,
+    );
+  }
+
+  return response.json() as Promise<AttachmentUploadResponse>;
+}
+
+export async function getConversationAttachments(
+  conversationId: number,
+): Promise<ChatAttachment[]> {
+  return apiRequest<ChatAttachment[]>(
+    `/conversations/${conversationId}/attachments`,
+  );
+}
+
+export async function downloadAttachment(
+  conversationId: number,
+  attachmentId: number,
+): Promise<Blob> {
+  const token = getAccessToken();
+
+  if (!token) {
+    throw new Error("Please sign in to download attachments.");
+  }
+
+  const response = await fetch(
+    `${API_BASE_URL}/conversations/${conversationId}/attachments/${attachmentId}`,
+    {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    },
+  );
+
+  if (!response.ok) {
+    throw new Error(
+      `Download failed (${response.status}): ${await response.text()}`,
+    );
+  }
+
+  return response.blob();
+}
+
 export interface TerraformPreviewResource {
   address: string;
   type: string;

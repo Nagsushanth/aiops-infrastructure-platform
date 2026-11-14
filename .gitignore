@@ -21,3 +21,6 @@ coverage/
 
 # Private Terraform plan artifacts
 .terraform-artifacts/
+
+# Private chat attachments
+private_uploads/

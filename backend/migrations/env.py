@@ -12,6 +12,7 @@ from backend.app.models.base import Base
 from backend.app.models.approval import ApprovalAuditEvent, ApprovalRequest
 from backend.app.models.conversation import Conversation
 from backend.app.models.messages import Message
+from backend.app.models.message_attachment import MessageAttachment
 from backend.app.models.infrastructure_request import InfrastructureRequest
 from backend.app.models.user import User
 from backend.app.models.infrastructure_operation import InfrastructureOperation

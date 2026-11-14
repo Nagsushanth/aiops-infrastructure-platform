@@ -1,5 +1,5 @@
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type ChangeEvent } from "react";
 import {
   Alert,
   Box,
@@ -11,15 +11,26 @@ import {
   Stack,
   TextField,
   Typography,
+  IconButton,
+  LinearProgress,
 } from "@mui/material";
 import SendIcon from "@mui/icons-material/Send";
+import AttachFileIcon from "@mui/icons-material/AttachFile";
+import DownloadIcon from "@mui/icons-material/Download";
+
 import {
   createConversation,
+  downloadAttachment,
   getAccessToken,
+  getConversationAttachments,
   getConversationBySession,
   getMessages,
+  uploadAttachment,
+  type ChatAttachment,
   type ChatMessage,
 } from "./api";
+
+import MessageRenderer from "./MessageRenderer";
 
 const SESSION_KEY = "aiops-conversation-session";
 const API_BASE_URL =
@@ -130,14 +141,20 @@ export default function ChatPanel({
   const [conversationId, setConversationId] = useState<number | null>(null);
   const [infrastructureRequestId, setInfrastructureRequestId] =
     useState<number | null>(null);
+
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [creatingConversation, setCreatingConversation] = useState(false);
   const [error, setError] = useState("");
+
+  const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
+  const [uploading, setUploading] = useState(false);
+
   const [connectionStatus, setConnectionStatus] =
     useState<ConnectionStatus>("connecting");
 
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
   const sessionIdRef = useRef<string | null>(null);
@@ -197,7 +214,6 @@ export default function ChatPanel({
               err instanceof Error &&
               (err.message.includes("404") || err.message.includes("409"))
             ) {
-              // The saved session is unavailable; create a new one.
               sessionId = null;
             } else {
               throw err;
@@ -207,6 +223,7 @@ export default function ChatPanel({
 
         if (!sessionId || !conversation) {
           sessionId = crypto.randomUUID();
+
           conversation = await createConversation(
             sessionId,
             "Infrastructure request",
@@ -219,11 +236,15 @@ export default function ChatPanel({
 
         sessionIdRef.current = sessionId;
 
-        const history = await getMessages(conversation.id);
+        const [history, attachmentHistory] = await Promise.all([
+          getMessages(conversation.id),
+          getConversationAttachments(conversation.id),
+        ]);
 
         if (cancelled) return;
 
         setMessages(history);
+        setAttachments(attachmentHistory);
         setConversationId(conversation.id);
         setInfrastructureRequestId(null);
         setConnectionStatus("connecting");
@@ -344,8 +365,6 @@ export default function ChatPanel({
 
         if (data.type === "message_saved") {
           addMessages([data.message]);
-
-          // The backend has accepted the message. Avoid resending it.
           pendingContentRef.current = null;
           return;
         }
@@ -375,7 +394,7 @@ export default function ChatPanel({
           if (typeof requestId === "number") {
             setInfrastructureRequestId(requestId);
             onInfrastructureRequestIdChange(requestId);
-          } 
+          }
 
           if (result?.status === "complete") {
             const requirements = result.requirements;
@@ -420,7 +439,6 @@ export default function ChatPanel({
 
         setConnectionStatus("disconnected");
 
-        // Do not retry authentication or conversation errors indefinitely.
         if ([4401, 4404, 4408].includes(event.code)) {
           setLoading(false);
 
@@ -467,7 +485,7 @@ export default function ChatPanel({
 
   // Start an independent conversation for a new infrastructure request.
   async function handleNewRequest() {
-    if (loading || creatingConversation) return;
+    if (loading || creatingConversation || uploading) return;
 
     if (!getAccessToken()) {
       setError("Please sign in to start a new request.");
@@ -485,16 +503,14 @@ export default function ChatPanel({
         "Infrastructure request",
       );
 
-      // Prevent an earlier unsent message from reaching the new conversation.
       pendingContentRef.current = null;
       retryCountRef.current = 0;
 
-      // Save the new session so a page refresh restores this conversation.
       sessionStorage.setItem(SESSION_KEY, newSessionId);
       sessionIdRef.current = newSessionId;
 
-      // Clear the previous conversation, request ID, and preview specification.
       setMessages([]);
+      setAttachments([]);
       setInfrastructureRequestId(null);
       onRequirementsComplete(null);
       onInfrastructureRequestIdChange(null);
@@ -503,7 +519,6 @@ export default function ChatPanel({
       setError("");
       setConnectionStatus("connecting");
 
-      // This changes the conversation ID and reconnects the WebSocket.
       setConversationId(newConversation.id);
     } catch (err) {
       setError(
@@ -536,6 +551,98 @@ export default function ChatPanel({
     setError("");
 
     sendPendingMessage();
+  }
+
+  // Upload attachments through REST only.
+  // This does not send a WebSocket message or trigger Terraform extraction.
+  async function handleFileSelected(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+
+    if (!file || !conversationId) return;
+
+    const allowedExtensions = [
+      ".pdf",
+      ".txt",
+      ".csv",
+      ".json",
+      ".png",
+      ".jpg",
+      ".jpeg",
+      ".docx",
+    ];
+
+    const dotIndex = file.name.lastIndexOf(".");
+    const extension =
+      dotIndex >= 0 ? file.name.slice(dotIndex).toLowerCase() : "";
+
+    if (!allowedExtensions.includes(extension)) {
+      setError(
+        "Unsupported file type. Allowed: PDF, TXT, CSV, JSON, PNG, JPG, JPEG, DOCX.",
+      );
+      event.target.value = "";
+      return;
+    }
+
+    if (file.size === 0 || file.size > 10 * 1024 * 1024) {
+      setError("File must be greater than 0 bytes and no larger than 10 MB.");
+      event.target.value = "";
+      return;
+    }
+
+    if (uploading || creatingConversation) {
+      event.target.value = "";
+      return;
+    }
+
+    setUploading(true);
+    setError("");
+
+    try {
+      await uploadAttachment(conversationId, file);
+
+      const [history, attachmentHistory] = await Promise.all([
+        getMessages(conversationId),
+        getConversationAttachments(conversationId),
+      ]);
+
+      setMessages(history);
+      setAttachments(attachmentHistory);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "File upload failed.");
+    } finally {
+      setUploading(false);
+      event.target.value = "";
+    }
+  }
+
+  async function handleDownloadAttachment(attachment: ChatAttachment) {
+    if (!conversationId) return;
+
+    try {
+      const blob = await downloadAttachment(conversationId, attachment.id);
+      const objectUrl = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+
+      link.href = objectUrl;
+      link.download = attachment.original_filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+
+      window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "File download failed.");
+    }
+  }
+
+  function formatFileSize(sizeBytes: number): string {
+    if (sizeBytes < 1024) return `${sizeBytes} B`;
+
+    if (sizeBytes < 1024 * 1024) {
+      return `${(sizeBytes / 1024).toFixed(1)} KB`;
+    }
+
+    return `${(sizeBytes / (1024 * 1024)).toFixed(1)} MB`;
   }
 
   return (
@@ -591,6 +698,7 @@ export default function ChatPanel({
               onClick={handleNewRequest}
               disabled={
                 creatingConversation ||
+                uploading ||
                 connectionStatus === "connecting"
               }
             >
@@ -659,9 +767,51 @@ export default function ChatPanel({
                     {message.role === "user" ? "You" : "Assistant"}
                   </Typography>
 
-                  <Typography sx={{ whiteSpace: "pre-wrap" }}>
-                    {message.content}
-                  </Typography>
+                  <MessageRenderer content={message.content} />
+
+                  {attachments
+                    .filter(
+                      (attachment) => attachment.message_id === message.id,
+                    )
+                    .map((attachment) => (
+                      <Stack
+                        key={attachment.id}
+                        direction="row"
+                        spacing={1}
+                        sx={{
+                          alignItems: "center",
+                          mt: 1,
+                          p: 1,
+                          border: "1px solid",
+                          borderColor: "divider",
+                          borderRadius: 1.5,
+                          bgcolor: "background.paper",
+                        }}
+                      >
+                        <AttachFileIcon fontSize="small" color="action" />
+
+                        <Box sx={{ minWidth: 0, flex: 1 }}>
+                          <Typography variant="body2" noWrap>
+                            {attachment.original_filename}
+                          </Typography>
+
+                          <Typography variant="caption" color="text.secondary">
+                            {formatFileSize(attachment.size_bytes)}
+                          </Typography>
+                        </Box>
+
+                        <IconButton
+                          size="small"
+                          aria-label={`Download ${attachment.original_filename}`}
+                          title="Download attachment"
+                          onClick={() =>
+                            void handleDownloadAttachment(attachment)
+                          }
+                        >
+                          <DownloadIcon fontSize="small" />
+                        </IconButton>
+                      </Stack>
+                    ))}
                 </Box>
               </Box>
             ))}
@@ -673,6 +823,7 @@ export default function ChatPanel({
                 sx={{ alignItems: "center" }}
               >
                 <CircularProgress size={16} />
+
                 <Typography variant="body2" color="text.secondary">
                   {creatingConversation
                     ? "Starting a new request..."
@@ -685,11 +836,43 @@ export default function ChatPanel({
           </Stack>
         </Box>
 
+        {uploading && (
+          <Box>
+            <LinearProgress />
+            <Typography variant="caption" color="text.secondary">
+              Uploading attachment...
+            </Typography>
+          </Box>
+        )}
+
+        <input
+          ref={fileInputRef}
+          type="file"
+          hidden
+          accept=".pdf,.txt,.csv,.json,.png,.jpg,.jpeg,.docx"
+          onChange={handleFileSelected}
+        />
+
         <Stack
           direction={{ xs: "column", sm: "row" }}
           spacing={1}
           sx={{ alignItems: "stretch" }}
         >
+          <Button
+            variant="outlined"
+            startIcon={<AttachFileIcon />}
+            onClick={() => fileInputRef.current?.click()}
+            disabled={
+              !conversationId ||
+              uploading ||
+              creatingConversation ||
+              connectionStatus !== "connected"
+            }
+            sx={{ minWidth: { xs: "100%", sm: 120 } }}
+          >
+            Attach
+          </Button>
+
           <TextField
             fullWidth
             multiline
