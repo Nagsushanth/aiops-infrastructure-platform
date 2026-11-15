@@ -158,10 +158,26 @@ export default function InfrastructureOperationsPanel({
   }
 
   return (
-    <Card sx={{ borderRadius: 3 }}>
+    <Card
+        sx={{
+          borderRadius: 3,
+          border: "1px solid",
+          borderColor: "divider",
+          boxShadow: "0 4px 18px rgba(15, 23, 42, 0.04)",
+        }}
+      >
       <CardContent sx={{ p: 3 }}>
         {infrastructureRequestId !== null && (
-          <Box sx={{ mb: 3 }}>
+          <Box
+            sx={{
+              mb: 3,
+              p: { xs: 1.5, md: 2 },
+              borderRadius: 2.5,
+              bgcolor: "background.default",
+              border: "1px solid",
+              borderColor: "divider",
+            }}
+          >
             <Stack
               direction="row"
               sx={{ justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 1 }}
@@ -207,6 +223,11 @@ export default function InfrastructureOperationsPanel({
                       borderColor: "divider",
                       borderRadius: 2,
                       p: 2,
+                      bgcolor: "background.paper",
+                      transition: "border-color 0.2s ease",
+                      "&:hover": {
+                        borderColor: "primary.light",
+                      },
                     }}
                   >
                     <Stack
@@ -226,7 +247,8 @@ export default function InfrastructureOperationsPanel({
 
                     <Stack
                       direction="row"
-                      sx={{ spacing: 1 , flexWrap: "wrap" , mt: 1}}
+                      spacing={1}
+                      sx={{ flexWrap: "wrap", mt: 1 }}
                     >
                       <Chip
                         label={`Lifecycle: ${instance.lifecycle_state}`}
@@ -263,7 +285,7 @@ export default function InfrastructureOperationsPanel({
           }}
         >
           <Box>
-            <Typography variant="h6" sx={{ fontWeight: 700 }}>
+            <Typography variant="h5" sx={{ fontWeight: 800 }}>
               Infrastructure Operations
             </Typography>
             <Typography variant="body2" color="text.secondary">
@@ -300,8 +322,14 @@ export default function InfrastructureOperationsPanel({
                 sx={{
                   border: "1px solid",
                   borderColor: "divider",
-                  borderRadius: 2,
-                  p: 2,
+                  borderRadius: 2.5,
+                  p: { xs: 2, md: 2.5 },
+                  bgcolor: "background.paper",
+                  transition: "box-shadow 0.2s ease, border-color 0.2s ease",
+                  "&:hover": {
+                    borderColor: "primary.light",
+                    boxShadow: "0 4px 16px rgba(15, 23, 42, 0.06)",
+                  },
                 }}
               >
                 <Stack
@@ -380,7 +408,13 @@ export default function InfrastructureOperationsPanel({
 
                 <Button
                   size="small"
-                  sx={{ mt: 1 }}
+                  variant="outlined"
+                  sx={{
+                    mt: 1.5,
+                    borderRadius: 2,
+                    textTransform: "none",
+                    fontWeight: 600,
+                  }}
                   onClick={() => void handleAudit(operation.id)}
                 >
                   {selectedOperationId === operation.id

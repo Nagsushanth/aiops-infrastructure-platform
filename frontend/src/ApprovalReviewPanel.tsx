@@ -612,7 +612,14 @@ export default function ApprovalReviewPanel() {
   }
 
   return (
-    <Card sx={{ borderRadius: 3 }}>
+    <Card
+sx={{
+    borderRadius: 3,
+    border: "1px solid",
+    borderColor: "divider",
+    boxShadow: "0 4px 18px rgba(15, 23, 42, 0.04)",
+  }}
+>
       <CardContent sx={{ p: { xs: 2, md: 3 } }}>
         <Box
           sx={{
@@ -635,12 +642,25 @@ export default function ApprovalReviewPanel() {
           </Box>
 
           <Button
-            startIcon={<RefreshIcon />}
-            onClick={() => void loadApprovals()}
-            disabled={loading}
-          >
-            Refresh
-          </Button>
+  variant="outlined"
+  startIcon={
+    loading ? (
+      <CircularProgress size={16} />
+    ) : (
+      <RefreshIcon />
+    )
+  }
+  onClick={() => void loadApprovals()}
+  disabled={loading}
+  sx={{
+    borderRadius: 2,
+    px: 2,
+    textTransform: "none",
+    fontWeight: 700,
+  }}
+>
+  {loading ? "Refreshing..." : "Refresh"}
+</Button>
         </Box>
 
         {user && (
@@ -691,10 +711,19 @@ export default function ApprovalReviewPanel() {
               const security = summary.security_analysis;
 
               return (
-                <Card
+                                <Card
                   key={approval.id}
                   variant="outlined"
-                  sx={{ borderRadius: 2 }}
+                  sx={{
+                    borderRadius: 2.5,
+                    borderColor: "divider",
+                    overflow: "hidden",
+                    transition: "box-shadow 0.2s ease, border-color 0.2s ease",
+                    "&:hover": {
+                      borderColor: "primary.light",
+                      boxShadow: "0 4px 16px rgba(15, 23, 42, 0.06)",
+                    },
+                  }}
                 >
                   <CardContent>
                     <Box

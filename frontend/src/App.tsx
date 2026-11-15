@@ -1,5 +1,4 @@
 
-import TerraformPlanReview from "./TerraformPlanReview";
 import { useEffect, useState } from "react";
 import {
   AppBar,
@@ -14,15 +13,18 @@ import {
   Toolbar,
   Typography,
 } from "@mui/material";
+
 import CloudQueueIcon from "@mui/icons-material/CloudQueue";
 import SmartToyIcon from "@mui/icons-material/SmartToy";
-import StorageIcon from "@mui/icons-material/Storage";
-import AccountTreeIcon from "@mui/icons-material/AccountTree";
 import CheckCircleIcon from "@mui/icons-material/CheckCircle";
+import LogoutIcon from "@mui/icons-material/Logout";
+import ApiIcon from "@mui/icons-material/Api";
+
 import InfrastructureOperationsPanel from "./InfrastructureOperationsPanel";
 import AuthPanel from "./AuthPanel";
 import ChatPanel, { type InfrastructureSpec } from "./ChatPanel";
 import TerraformPreview from "./TerraformPreview";
+import TerraformPlanReview from "./TerraformPlanReview";
 import ApprovalPanel from "./ApprovalPanel";
 import ApprovalReviewPanel from "./ApprovalReviewPanel";
 
@@ -39,36 +41,15 @@ type BackendStatus = {
   service: string;
 };
 
-const features = [
-  {
-    title: "AI Infrastructure Assistant",
-    description: "Describe infrastructure requirements in natural language.",
-    icon: <SmartToyIcon fontSize="large" />,
-  },
-  {
-    title: "Terraform Provisioning",
-    description: "Generate and validate infrastructure configurations.",
-    icon: <CloudQueueIcon fontSize="large" />,
-  },
-  {
-    title: "Resource Inventory",
-    description: "View infrastructure resources and their status.",
-    icon: <StorageIcon fontSize="large" />,
-  },
-  {
-    title: "Workflow & Approvals",
-    description: "Review proposed infrastructure changes before execution.",
-    icon: <AccountTreeIcon fontSize="large" />,
-  },
-];
-
 export default function App() {
   const [user, setUser] = useState<AuthUser | null>(null);
   const [authChecking, setAuthChecking] = useState(true);
+
   const [infrastructureSpec, setInfrastructureSpec] =
-  useState<InfrastructureSpec | null>(null);
+    useState<InfrastructureSpec | null>(null);
+
   const [infrastructureRequestId, setInfrastructureRequestId] =
-  useState<number | null>(null);
+    useState<number | null>(null);
 
   const [backend, setBackend] = useState<BackendStatus | null>(null);
   const [loading, setLoading] = useState(false);
@@ -134,7 +115,7 @@ export default function App() {
             display: "flex",
             alignItems: "center",
             justifyContent: "center",
-            bgcolor: "#f4f7fb",
+            bgcolor: "#f5f7fb",
           }}
         >
           <CircularProgress />
@@ -160,32 +141,91 @@ export default function App() {
     <>
       <CssBaseline />
 
-      <AppBar position="static" elevation={0}>
-        <Toolbar>
-          <CloudQueueIcon sx={{ mr: 1.5 }} />
+      <AppBar
+        position="sticky"
+        elevation={0}
+        sx={{
+          bgcolor: "#ffffff",
+          color: "#17243b",
+          borderBottom: "1px solid #e8edf4",
+        }}
+      >
+        <Toolbar
+          sx={{
+            maxWidth: 1440,
+            width: "100%",
+            mx: "auto",
+            px: { xs: 2, md: 4 },
+            minHeight: "72px !important",
+          }}
+        >
+          <Box
+            sx={{
+              width: 42,
+              height: 42,
+              borderRadius: 2.5,
+              bgcolor: "#eaf1ff",
+              color: "#2864dc",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              mr: 1.5,
+            }}
+          >
+            <CloudQueueIcon />
+          </Box>
 
-          <Typography sx={{ flexGrow: 1, fontWeight: 700 }}>
-            AIOps Infrastructure Support
-          </Typography>
+          <Box sx={{ flexGrow: 1 }}>
+            <Typography
+              sx={{
+                fontWeight: 800,
+                fontSize: "1rem",
+                letterSpacing: "-0.3px",
+              }}
+            >
+              AIOps Infrastructure
+            </Typography>
+
+            <Typography
+              variant="caption"
+              sx={{ color: "#758198", display: "block" }}
+            >
+              Infrastructure Support Platform
+            </Typography>
+          </Box>
+
+          <Chip
+            label="Development"
+            size="small"
+            sx={{
+              bgcolor: "#edf3ff",
+              color: "#285ac5",
+              fontWeight: 700,
+              mr: { xs: 1, sm: 2 },
+            }}
+          />
 
           <Typography
             sx={{
               mr: 2,
-              display: { xs: "none", sm: "block" },
+              color: "#64748b",
+              fontSize: "0.85rem",
+              display: { xs: "none", md: "block" },
             }}
           >
             {user.email}
           </Typography>
 
-          <Chip
-            label="Development"
+          <Button
+            color="inherit"
+            onClick={handleLogout}
+            startIcon={<LogoutIcon />}
             sx={{
-              color: "white",
-              bgcolor: "rgba(255,255,255,0.18)",
+              textTransform: "none",
+              fontWeight: 600,
+              color: "#475569",
             }}
-          />
-
-          <Button color="inherit" onClick={handleLogout} sx={{ ml: 1 }}>
+          >
             Logout
           </Button>
         </Toolbar>
@@ -194,190 +234,395 @@ export default function App() {
       <Box
         sx={{
           minHeight: "100vh",
-          bgcolor: "#f4f7fb",
-          p: { xs: 2, md: 4 },
+          bgcolor: "#f5f7fb",
+          px: { xs: 2, sm: 3, md: 4 },
+          py: { xs: 3, md: 4 },
         }}
       >
-        <Box sx={{ maxWidth: 1200, mx: "auto" }}>
-          <Typography variant="h4" sx={{ fontWeight: 800, mb: 1 }}>
-            Infrastructure Overview
-          </Typography>
+        <Box sx={{ maxWidth: 1440, mx: "auto" }}>
 
-          <Typography color="text.secondary" sx={{ mb: 4 }}>
-            Request, review, and manage infrastructure through an AI-powered
-            support platform.
-          </Typography>
-
+          {/* Dashboard heading */}
           <Box
             sx={{
-              display: "grid",
-              gridTemplateColumns: { xs: "1fr", md: "3fr 2fr" },
-              gap: 3,
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: { xs: "flex-start", md: "center" },
+              flexDirection: { xs: "column", md: "row" },
+              gap: 2,
               mb: 3,
             }}
           >
-            <Card sx={{ borderRadius: 3 }}>
-              <CardContent sx={{ p: 3 }}>
-                <Typography variant="h6" sx={{ fontWeight: 700 }}>
-                  Backend API Connection
-                </Typography>
+            <Box>
+              <Typography
+                variant="h4"
+                sx={{
+                  color: "#17243b",
+                  fontWeight: 800,
+                  fontSize: { xs: "1.7rem", md: "2rem" },
+                  letterSpacing: "-0.8px",
+                  mb: 0.7,
+                }}
+              >
+                Infrastructure Overview
+              </Typography>
 
-                <Stack
-                  direction="row"
-                  spacing={1}
-                  sx={{ my: 2, alignItems: "center" }}
-                >
-                  {loading ? (
-                    <CircularProgress size={20} />
-                  ) : backend ? (
-                    <CheckCircleIcon color="success" />
-                  ) : (
-                    <CloudQueueIcon color="action" />
-                  )}
+              <Typography sx={{ color: "#718096", fontSize: "0.95rem" }}>
+                Manage infrastructure requests, Terraform plans, approvals
+                and infrastructure operations from one place.
+              </Typography>
+            </Box>
 
-                  <Typography>
-                    {loading
-                      ? "Checking FastAPI..."
-                      : backend
-                        ? `Connected — ${backend.service}`
-                        : "Not connected"}
-                  </Typography>
-                </Stack>
-
-                {backend && (
-                  <Chip
-                    label={`API status: ${backend.status}`}
-                    color="success"
-                    size="small"
-                  />
-                )}
-
-                {error && (
-                  <Typography color="error" sx={{ mb: 2 }}>
-                    {error}
-                  </Typography>
-                )}
-
-                <Stack
-                  direction="row"
-                  spacing={1}
-                  sx={{ mt: 3, flexWrap: "wrap" }}
-                >
-                  <Button
-                    variant="contained"
-                    onClick={testConnection}
-                    disabled={loading}
-                  >
-                    Test Connection
-                  </Button>
-
-                  <Button
-                    onClick={() =>
-                      window.open("http://localhost:8000/docs", "_blank")
-                    }
-                  >
-                    API Documentation
-                  </Button>
-                </Stack>
-              </CardContent>
-            </Card>
-
-            <Card
+            <Button
+              variant="outlined"
+              startIcon={<ApiIcon />}
+              onClick={testConnection}
+              disabled={loading}
               sx={{
-                borderRadius: 3,
-                color: "white",
-                background: "linear-gradient(135deg, #173b70, #2877c7)",
+                borderRadius: 2,
+                textTransform: "none",
+                fontWeight: 700,
+                px: 2,
+                py: 1,
+                borderColor: "#d5deeb",
+                color: "#334b70",
+                bgcolor: "#ffffff",
               }}
             >
-              <CardContent sx={{ p: 3 }}>
-                <SmartToyIcon sx={{ fontSize: 42, mb: 1 }} />
-
-                <Typography variant="h5" sx={{ fontWeight: 700, mb: 1 }}>
-                  AI Operations Assistant
-                </Typography>
-
-                <Typography sx={{ mb: 2 }}>
-                  Turn infrastructure requests into reviewable, controlled
-                  workflows.
-                </Typography>
-
-                <Chip
-                  label="AI integration pending"
-                  variant="outlined"
-                  sx={{ color: "white", borderColor: "white" }}
-                />
-              </CardContent>
-            </Card>
+              Refresh Connection
+            </Button>
           </Box>
 
+          {/* Main status and assistant cards */}
           <Box
             sx={{
               display: "grid",
               gridTemplateColumns: {
                 xs: "1fr",
-                sm: "repeat(2, 1fr)",
-                lg: "repeat(4, 1fr)",
+                lg: "1.1fr 1.9fr",
               },
-              gap: 3,
+              gap: 2.5,
+              mb: 4,
             }}
           >
-            {features.map((feature) => (
-              <Card
-                key={feature.title}
-                sx={{ borderRadius: 3, height: "100%" }}
-              >
-                <CardContent sx={{ p: 2.5 }}>
-                  <Box sx={{ color: "primary.main", mb: 2 }}>
-                    {feature.icon}
+            <Card
+              elevation={0}
+              sx={{
+                border: "1px solid #e6ebf2",
+                borderRadius: 3,
+                bgcolor: "#ffffff",
+              }}
+            >
+              <CardContent sx={{ p: 3 }}>
+                <Stack
+                  direction="row"
+                  spacing={1.2}
+                  sx={{ mb: 2.5, alignItems: "center" }}
+                >
+                  <Box
+                    sx={{
+                      width: 38,
+                      height: 38,
+                      borderRadius: 2,
+                      bgcolor: "#edf3ff",
+                      color: "#2864dc",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                    }}
+                  >
+                    <ApiIcon />
                   </Box>
 
-                  <Typography variant="h6" sx={{ fontWeight: 700, mb: 1 }}>
-                    {feature.title}
+                  <Typography
+                    sx={{ fontWeight: 750, color: "#24334d" }}
+                  >
+                    Backend API
                   </Typography>
+                </Stack>
 
-                  <Typography variant="body2" color="text.secondary">
-                    {feature.description}
+                <Stack
+                  direction="row"
+                  spacing={1.2}
+                  sx={{ mb: 1.5, alignItems: "center" }}
+                >
+                  {loading ? (
+                    <CircularProgress size={19} />
+                  ) : backend ? (
+                    <CheckCircleIcon color="success" />
+                  ) : (
+                    <CloudQueueIcon sx={{ color: "#94a3b8" }} />
+                  )}
+
+                  <Typography
+                    sx={{
+                      fontWeight: 700,
+                      color: backend ? "#16804a" : "#64748b",
+                    }}
+                  >
+                    {loading
+                      ? "Checking connection..."
+                      : backend
+                        ? "Connected"
+                        : "Connection unavailable"}
                   </Typography>
+                </Stack>
 
-                  <Chip label="Coming next" size="small" sx={{ mt: 2 }} />
-                </CardContent>
-              </Card>
-            ))}
+                {backend && (
+                  <Stack
+                    direction="row"
+                    spacing={1}
+                    sx={{ alignItems: "center", flexWrap: "wrap" }}
+                  >
+                    <Chip
+                      label={backend.service}
+                      size="small"
+                      sx={{
+                        bgcolor: "#f0f5ff",
+                        color: "#315dba",
+                        fontWeight: 600,
+                      }}
+                    />
+
+                    <Chip
+                      label={`Status: ${backend.status}`}
+                      size="small"
+                      color="success"
+                      variant="outlined"
+                    />
+                  </Stack>
+                )}
+
+                <Typography
+                  component="a"
+                  href="http://localhost:8000/docs"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  sx={{
+                    display: "inline-flex",
+                    mt: 1.5,
+                    color: "#2864dc",
+                    fontWeight: 700,
+                    fontSize: "0.875rem",
+                    textDecoration: "none",
+                    "&:hover": {
+                      textDecoration: "underline",
+                    },
+                  }}
+                >
+                  Open API Documentation →
+                </Typography>
+
+                {error && (
+                  
+                  <Typography
+                    color="error"
+                    variant="body2"
+                    sx={{ mt: 1.5 }}
+                  >
+                    {error}
+                  </Typography>
+                )}
+              </CardContent>
+            </Card>
+
+            <Card
+              elevation={0}
+              sx={{
+                borderRadius: 3,
+                overflow: "hidden",
+                color: "#ffffff",
+                background:
+                  "linear-gradient(120deg, #173b70 0%, #245db2 60%, #367de0 100%)",
+                position: "relative",
+              }}
+            >
+              <CardContent
+                sx={{
+                  p: { xs: 3, md: 3.5 },
+                  position: "relative",
+                  zIndex: 1,
+                }}
+              >
+                <Stack
+                  direction="row"
+                  spacing={2}
+                  sx={{ mb: 2 ,alignItems:"center" }}
+                >
+                  <Box
+                    sx={{
+                      width: 48,
+                      height: 48,
+                      borderRadius: 2.5,
+                      bgcolor: "rgba(255,255,255,0.15)",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                    }}
+                  >
+                    <SmartToyIcon sx={{ fontSize: 29 }} />
+                  </Box>
+
+                  <Box>
+                    <Typography
+                      variant="h5"
+                      sx={{ fontWeight: 800, letterSpacing: "-0.4px" }}
+                    >
+                      AI Operations Assistant
+                    </Typography>
+
+                    <Typography
+                      sx={{
+                        color: "rgba(255,255,255,0.76)",
+                        fontSize: "0.83rem",
+                      }}
+                    >
+                      Intelligent infrastructure workflows
+                    </Typography>
+                  </Box>
+                </Stack>
+
+                <Typography
+                  sx={{
+                    maxWidth: 650,
+                    color: "rgba(255,255,255,0.9)",
+                    lineHeight: 1.7,
+                    fontSize: "0.94rem",
+                  }}
+                >
+                  Describe your infrastructure requirements in natural
+                  language. Generate Terraform plans, review cost and
+                  security information, and manage approval-controlled
+                  infrastructure operations.
+                </Typography>
+              </CardContent>
+            </Card>
           </Box>
 
-          <Box sx={{ mt: 3 }}>
-            <TerraformPreview specification={infrastructureSpec} />
+          {/* Infrastructure workflow */}
+          <Box sx={{ mb: 2 }}>
+            <Typography
+              variant="h5"
+              sx={{
+                color: "#24334d",
+                fontWeight: 800,
+                fontSize: "1.25rem",
+                mb: 0.6,
+              }}
+            >
+              Infrastructure Workspace
+            </Typography>
+
+            <Typography
+              sx={{ color: "#8190a5", fontSize: "0.88rem" }}
+            >
+              Your infrastructure request and management workflows.
+            </Typography>
           </Box>
 
-          <Box sx={{ mt: 3 }}>
-            <TerraformPlanReview />
-          </Box>
+          <Stack spacing={3}>
+            <Card
+              elevation={0}
+              sx={{
+                border: "1px solid #e6ebf2",
+                borderRadius: 3,
+                overflow: "visible",
+              }}
+            >
+              <CardContent sx={{ p: { xs: 2, md: 3 } }}>
+                <TerraformPreview specification={infrastructureSpec} />
+              </CardContent>
+            </Card>
 
-          <Box sx={{ mt: 3 }}>
-            <ChatPanel onRequirementsComplete={setInfrastructureSpec}
-            onInfrastructureRequestIdChange={setInfrastructureRequestId} />
-          </Box>
+            <Card
+              elevation={0}
+              sx={{
+                border: "1px solid #e6ebf2",
+                borderRadius: 3,
+                overflow: "visible",
+              }}
+            >
+              <CardContent sx={{ p: { xs: 2, md: 3 } }}>
+                <TerraformPlanReview />
+              </CardContent>
+            </Card>
 
-          <Box sx={{ mt: 3 }}>
-            <ApprovalPanel infrastructureRequestId={infrastructureRequestId} />
-          </Box>
+            <Card
+              elevation={0}
+              sx={{
+                border: "1px solid #e6ebf2",
+                borderRadius: 3,
+                overflow: "visible",
+              }}
+            >
+              <CardContent sx={{ p: { xs: 2, md: 3 } }}>
+                <ChatPanel
+                  onRequirementsComplete={setInfrastructureSpec}
+                  onInfrastructureRequestIdChange={
+                    setInfrastructureRequestId
+                  }
+                />
+              </CardContent>
+            </Card>
 
-          <Box sx={{ mt: 3 }}>
-            <ApprovalReviewPanel />
-          </Box>
+            <Card
+              elevation={0}
+              sx={{
+                border: "1px solid #e6ebf2",
+                borderRadius: 3,
+                overflow: "visible",
+              }}
+            >
+              <CardContent sx={{ p: { xs: 2, md: 3 } }}>
+                <ApprovalPanel
+                  infrastructureRequestId={infrastructureRequestId}
+                />
+              </CardContent>
+            </Card>
 
-          <Box sx={{ mt: 3 }}>
-            <InfrastructureOperationsPanel
-              infrastructureRequestId={infrastructureRequestId}/>
-          </Box>
+            <Card
+              elevation={0}
+              sx={{
+                border: "1px solid #e6ebf2",
+                borderRadius: 3,
+                overflow: "visible",
+              }}
+            >
+              <CardContent sx={{ p: { xs: 2, md: 3 } }}>
+                <ApprovalReviewPanel />
+              </CardContent>
+            </Card>
 
-          <Typography
-            variant="body2"
-            color="text.secondary"
-            sx={{ mt: 4, textAlign: "center" }}
+            <Card
+              elevation={0}
+              sx={{
+                border: "1px solid #e6ebf2",
+                borderRadius: 3,
+                overflow: "visible",
+              }}
+            >
+              <CardContent sx={{ p: { xs: 2, md: 3 } }}>
+                <InfrastructureOperationsPanel
+                  infrastructureRequestId={infrastructureRequestId}
+                />
+              </CardContent>
+            </Card>
+          </Stack>
+
+          <Box
+            sx={{
+              textAlign: "center",
+              py: 4,
+              mt: 3,
+              borderTop: "1px solid #e6ebf2",
+            }}
           >
-            AIOps Platform for Infrastructure Support · Development Preview
-          </Typography>
+            <Typography
+              variant="body2"
+              sx={{ color: "#94a3b8", fontSize: "0.82rem" }}
+            >
+              AIOps Platform for Infrastructure Support
+            </Typography>
+          </Box>
         </Box>
       </Box>
     </>

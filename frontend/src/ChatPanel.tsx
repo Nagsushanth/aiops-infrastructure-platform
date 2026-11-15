@@ -6,7 +6,6 @@ import {
   Button,
   Chip,
   CircularProgress,
-  Divider,
   Paper,
   Stack,
   TextField,
@@ -17,6 +16,7 @@ import {
 import SendIcon from "@mui/icons-material/Send";
 import AttachFileIcon from "@mui/icons-material/AttachFile";
 import DownloadIcon from "@mui/icons-material/Download";
+import SmartToyIcon from "@mui/icons-material/SmartToy";
 
 import {
   createConversation,
@@ -645,126 +645,242 @@ export default function ChatPanel({
     return `${(sizeBytes / (1024 * 1024)).toFixed(1)} MB`;
   }
 
+  
   return (
     <Paper
       elevation={0}
       sx={{
-        p: { xs: 2, md: 3 },
+        border: "1px solid #e3eaf3",
         borderRadius: 3,
-        border: "1px solid",
-        borderColor: "divider",
-        bgcolor: "background.paper",
+        overflow: "hidden",
+        bgcolor: "#ffffff",
       }}
     >
-      <Stack spacing={2}>
-        <Stack
-          direction={{ xs: "column", sm: "row" }}
-          spacing={1}
-          sx={{
-            alignItems: { xs: "stretch", sm: "center" },
-            justifyContent: "space-between",
-          }}
-        >
-          <Typography variant="h5" sx={{ fontWeight: 700 }}>
-            Infrastructure Assistant
-          </Typography>
-
-          <Stack
-            direction="row"
-            spacing={1}
-            sx={{ alignItems: "center", justifyContent: "flex-end" }}
+      {/* Chat header */}
+      <Box
+        sx={{
+          px: { xs: 2, md: 3 },
+          py: 2,
+          borderBottom: "1px solid #e8edf4",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          flexWrap: "wrap",
+          gap: 2,
+        }}
+      >
+        <Stack direction="row" spacing={1.5} sx={{ alignItems: "center" }}>
+          <Box
+            sx={{
+              width: 46,
+              height: 46,
+              borderRadius: 2.5,
+              bgcolor: "#edf3ff",
+              color: "#2864dc",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+            }}
           >
-            <Chip
-              size="small"
-              label={
-                connectionStatus === "connected"
-                  ? "Live"
-                  : connectionStatus === "connecting"
-                    ? "Connecting"
-                    : "Disconnected"
-              }
-              color={
-                connectionStatus === "connected"
-                  ? "success"
-                  : connectionStatus === "connecting"
-                    ? "info"
-                    : "default"
-              }
-            />
+            <SmartToyIcon sx={{ fontSize: 27 }} />
+          </Box>
 
-            <Button
-              variant="outlined"
-              size="small"
-              onClick={handleNewRequest}
-              disabled={
-                creatingConversation ||
-                uploading ||
-                connectionStatus === "connecting"
-              }
+          <Box>
+            <Typography
+              sx={{ fontWeight: 800, color: "#24334d", fontSize: "1.05rem" }}
             >
-              {creatingConversation ? "Starting..." : "New Request"}
-            </Button>
-          </Stack>
+              Infrastructure Assistant
+            </Typography>
+            <Typography variant="caption" sx={{ color: "#8491a5" }}>
+              Natural-language infrastructure management
+            </Typography>
+          </Box>
         </Stack>
 
-        <Typography color="text.secondary" sx={{ textAlign: "center" }}>
-          Describe the infrastructure you want to provision.
+        <Stack direction="row" spacing={1} sx={{ alignItems: "center" }}>
+          <Chip
+            size="small"
+            label={
+              connectionStatus === "connected"
+                ? "Live connection"
+                : connectionStatus === "connecting"
+                  ? "Connecting"
+                  : "Disconnected"
+            }
+            color={
+              connectionStatus === "connected"
+                ? "success"
+                : connectionStatus === "connecting"
+                  ? "info"
+                  : "default"
+            }
+            variant="outlined"
+          />
+
+          <Button
+            variant="outlined"
+            size="small"
+            onClick={handleNewRequest}
+            disabled={
+              creatingConversation ||
+              uploading ||
+              connectionStatus === "connecting"
+            }
+            sx={{
+              borderRadius: 2,
+              textTransform: "none",
+              fontWeight: 700,
+            }}
+          >
+            {creatingConversation ? "Starting..." : "New Request"}
+          </Button>
+        </Stack>
+      </Box>
+
+      {/* Chat description */}
+      <Box sx={{ px: { xs: 2, md: 3 }, pt: 2 }}>
+        <Typography variant="body2" sx={{ color: "#718096" }}>
+          Describe your infrastructure requirements. The assistant will help
+          gather the details needed to prepare your infrastructure request.
         </Typography>
+      </Box>
 
-        <Divider />
-
-        {error && (
+      {error && (
+        <Box sx={{ px: { xs: 2, md: 3 }, pt: 2 }}>
           <Alert severity="error" onClose={() => setError("")}>
             {error}
           </Alert>
+        </Box>
+      )}
+
+      {/* Conversation area */}
+      <Box
+        sx={{
+          mx: { xs: 1.5, md: 3 },
+          my: 2,
+          height: { xs: 380, md: 480 },
+          overflowY: "auto",
+          p: { xs: 1.5, md: 2.5 },
+          bgcolor: "#f7f9fc",
+          border: "1px solid #edf0f5",
+          borderRadius: 2.5,
+        }}
+      >
+        {messages.length === 0 && (
+          <Box
+            sx={{
+              minHeight: "100%",
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "center",
+              justifyContent: "center",
+              textAlign: "center",
+              px: 2,
+              py: 3,
+            }}
+          >
+            <Box
+              sx={{
+                width: 64,
+                height: 64,
+                borderRadius: 3,
+                bgcolor: "#eaf1ff",
+                color: "#2864dc",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                mb: 2,
+              }}
+            >
+              <SmartToyIcon sx={{ fontSize: 36 }} />
+            </Box>
+
+            <Typography
+              variant="h6"
+              sx={{ fontWeight: 800, color: "#24334d", mb: 1 }}
+            >
+              How can I help with your infrastructure?
+            </Typography>
+
+            <Typography
+              variant="body2"
+              sx={{ color: "#8190a5", maxWidth: 440, mb: 2.5 }}
+            >
+              Describe the cloud resources you need, and we'll work through
+              the infrastructure requirements together.
+            </Typography>
+
+            <Stack spacing={1} sx={{ width: "100%", maxWidth: 440 }}>
+              {[
+                "I need a development EC2 instance with 2 vCPUs and 2 GB RAM.",
+                "Help me create a secure AWS development environment.",
+                "I need a Linux virtual machine for testing.",
+              ].map((suggestion) => (
+                <Button
+                  key={suggestion}
+                  variant="outlined"
+                  onClick={() => setInput(suggestion)}
+                  disabled={connectionStatus !== "connected"}
+                  sx={{
+                    justifyContent: "flex-start",
+                    textAlign: "left",
+                    textTransform: "none",
+                    borderColor: "#dce5f1",
+                    color: "#405572",
+                    bgcolor: "#ffffff",
+                    borderRadius: 2,
+                    py: 1.1,
+                    "&:hover": {
+                      bgcolor: "#edf3ff",
+                      borderColor: "#9db9ed",
+                    },
+                  }}
+                >
+                  {suggestion}
+                </Button>
+              ))}
+            </Stack>
+          </Box>
         )}
 
-        <Box
-          sx={{
-            height: 280,
-            overflowY: "auto",
-            p: 2,
-            bgcolor: "grey.50",
-            borderRadius: 2,
-          }}
-        >
-          {messages.length === 0 && (
-            <Typography color="text.secondary" sx={{ textAlign: "center" }}>
-              Try: "I need a development EC2 instance."
-            </Typography>
-          )}
+        <Stack spacing={2}>
+          {messages.map((message) => {
+            const isUser = message.role === "user";
 
-          <Stack spacing={1.5}>
-            {messages.map((message) => (
+            return (
               <Box
                 key={message.id}
                 sx={{
                   display: "flex",
-                  justifyContent:
-                    message.role === "user" ? "flex-end" : "flex-start",
+                  justifyContent: isUser ? "flex-end" : "flex-start",
                 }}
               >
                 <Box
                   sx={{
-                    maxWidth: "85%",
-                    p: 1.5,
-                    borderRadius: 2,
-                    bgcolor:
-                      message.role === "user" ? "primary.100" : "white",
+                    width: "fit-content",
+                    maxWidth: { xs: "94%", md: "82%" },
+                    minWidth: 100,
+                    p: 2,
+                    borderRadius: isUser
+                      ? "16px 16px 4px 16px"
+                      : "16px 16px 16px 4px",
+                    bgcolor: isUser ? "#e9f1ff" : "#ffffff",
                     border: "1px solid",
-                    borderColor: "divider",
+                    borderColor: isUser ? "#d5e4ff" : "#e6ebf2",
+                    boxShadow: "0 2px 6px rgba(25,45,80,0.025)",
                     overflowWrap: "anywhere",
                   }}
                 >
                   <Typography
                     variant="caption"
-                    color="text.secondary"
                     sx={{
                       display: "block",
-                      textAlign: message.role === "user" ? "right" : "left",
+                      fontWeight: 800,
+                      color: isUser ? "#315eac" : "#2864dc",
+                      mb: 1,
                     }}
                   >
-                    {message.role === "user" ? "You" : "Assistant"}
+                    {isUser ? "You" : "Infrastructure Assistant"}
                   </Typography>
 
                   <MessageRenderer content={message.content} />
@@ -780,22 +896,27 @@ export default function ChatPanel({
                         spacing={1}
                         sx={{
                           alignItems: "center",
-                          mt: 1,
+                          mt: 1.5,
                           p: 1,
-                          border: "1px solid",
-                          borderColor: "divider",
-                          borderRadius: 1.5,
-                          bgcolor: "background.paper",
+                          border: "1px solid #e3eaf3",
+                          borderRadius: 2,
+                          bgcolor: "#f8fafc",
                         }}
                       >
-                        <AttachFileIcon fontSize="small" color="action" />
+                        <AttachFileIcon
+                          fontSize="small"
+                          sx={{ color: "#64748b" }}
+                        />
 
                         <Box sx={{ minWidth: 0, flex: 1 }}>
                           <Typography variant="body2" noWrap>
                             {attachment.original_filename}
                           </Typography>
 
-                          <Typography variant="caption" color="text.secondary">
+                          <Typography
+                            variant="caption"
+                            sx={{ color: "#8491a5" }}
+                          >
                             {formatFileSize(attachment.size_bytes)}
                           </Typography>
                         </Box>
@@ -814,48 +935,60 @@ export default function ChatPanel({
                     ))}
                 </Box>
               </Box>
-            ))}
+            );
+          })}
 
-            {(loading || creatingConversation) && (
-              <Stack
-                direction="row"
-                spacing={1}
-                sx={{ alignItems: "center" }}
-              >
-                <CircularProgress size={16} />
+          {(loading || creatingConversation) && (
+            <Stack
+              direction="row"
+              spacing={1.2}
+              sx={{ alignItems: "center", py: 1 }}
+            >
+              <CircularProgress size={17} />
+              <Typography variant="body2" sx={{ color: "#718096" }}>
+                {creatingConversation
+                  ? "Starting a new request..."
+                  : "Gathering infrastructure requirements..."}
+              </Typography>
+            </Stack>
+          )}
 
-                <Typography variant="body2" color="text.secondary">
-                  {creatingConversation
-                    ? "Starting a new request..."
-                    : "Gathering requirements..."}
-                </Typography>
-              </Stack>
-            )}
+          <div ref={bottomRef} />
+        </Stack>
+      </Box>
 
-            <div ref={bottomRef} />
-          </Stack>
+      {/* Attachment upload progress */}
+      {uploading && (
+        <Box sx={{ px: { xs: 2, md: 3 }, pb: 1 }}>
+          <LinearProgress
+            sx={{ borderRadius: 2, height: 5, mb: 0.8 }}
+          />
+          <Typography variant="caption" sx={{ color: "#718096" }}>
+            Uploading attachment...
+          </Typography>
         </Box>
+      )}
 
-        {uploading && (
-          <Box>
-            <LinearProgress />
-            <Typography variant="caption" color="text.secondary">
-              Uploading attachment...
-            </Typography>
-          </Box>
-        )}
+      <input
+        ref={fileInputRef}
+        type="file"
+        hidden
+        accept=".pdf,.txt,.csv,.json,.png,.jpg,.jpeg,.docx"
+        onChange={handleFileSelected}
+      />
 
-        <input
-          ref={fileInputRef}
-          type="file"
-          hidden
-          accept=".pdf,.txt,.csv,.json,.png,.jpg,.jpeg,.docx"
-          onChange={handleFileSelected}
-        />
-
+      {/* Message composer */}
+      <Box
+        sx={{
+          px: { xs: 2, md: 3 },
+          pb: 2.5,
+          pt: 1,
+          borderTop: "1px solid #edf0f5",
+        }}
+      >
         <Stack
           direction={{ xs: "column", sm: "row" }}
-          spacing={1}
+          spacing={1.2}
           sx={{ alignItems: "stretch" }}
         >
           <Button
@@ -868,7 +1001,13 @@ export default function ChatPanel({
               creatingConversation ||
               connectionStatus !== "connected"
             }
-            sx={{ minWidth: { xs: "100%", sm: 120 } }}
+            sx={{
+              minWidth: { xs: "100%", sm: 115 },
+              borderRadius: 2,
+              textTransform: "none",
+              fontWeight: 700,
+              borderColor: "#dce5f1",
+            }}
           >
             Attach
           </Button>
@@ -895,6 +1034,12 @@ export default function ChatPanel({
                 handleSend();
               }
             }}
+            sx={{
+              "& .MuiOutlinedInput-root": {
+                borderRadius: 2,
+                bgcolor: "#ffffff",
+              },
+            }}
           />
 
           <Button
@@ -907,7 +1052,18 @@ export default function ChatPanel({
               !input.trim() ||
               connectionStatus !== "connected"
             }
-            sx={{ minWidth: 100 }}
+            sx={{
+              minWidth: { xs: "100%", sm: 105 },
+              borderRadius: 2,
+              textTransform: "none",
+              fontWeight: 800,
+              boxShadow: "none",
+              bgcolor: "#2864dc",
+              "&:hover": {
+                bgcolor: "#1e50b5",
+                boxShadow: "none",
+              },
+            }}
           >
             Send
           </Button>
@@ -915,20 +1071,32 @@ export default function ChatPanel({
 
         <Typography
           variant="caption"
-          color="text.secondary"
-          sx={{ textAlign: "center" }}
+          sx={{
+            display: "block",
+            textAlign: "center",
+            color: "#94a0b2",
+            mt: 1.5,
+          }}
         >
           Messages and requirement progress are saved to PostgreSQL.
           AI-assisted requirement extraction is enabled, with rule-based
           fallback when the AI service is unavailable.
         </Typography>
-      </Stack>
 
-      {infrastructureRequestId !== null && (
-        <Typography variant="caption" color="text.secondary">
-          Infrastructure Request ID: {infrastructureRequestId}
-        </Typography>
-      )}
+        {infrastructureRequestId !== null && (
+          <Typography
+            variant="caption"
+            sx={{
+              display: "block",
+              textAlign: "center",
+              color: "#64748b",
+              mt: 1,
+            }}
+          >
+            Infrastructure Request ID: {infrastructureRequestId}
+          </Typography>
+        )}
+      </Box>
     </Paper>
   );
 }

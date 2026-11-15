@@ -64,12 +64,13 @@ function CodeBlock({
     <Paper
       variant="outlined"
       sx={{
-        my: 1.5,
+        my: 2,
         overflow: "hidden",
         bgcolor: "#0d1117",
         color: "#e6edf3",
         borderColor: "#30363d",
-        borderRadius: 2,
+        borderRadius: 2.5,
+        boxShadow: "0 3px 12px rgba(0,0,0,0.12)",
       }}
     >
       <Box
@@ -77,8 +78,8 @@ function CodeBlock({
           display: "flex",
           alignItems: "center",
           justifyContent: "space-between",
-          px: 1.5,
-          py: 0.5,
+          px: 2,
+          py: 1,
           borderBottom: "1px solid #30363d",
           bgcolor: "#161b22",
         }}
@@ -112,10 +113,10 @@ function CodeBlock({
           m: 0,
           p: 2,
           overflowX: "auto",
-          fontSize: "0.82rem",
-          lineHeight: 1.65,
+          fontSize: "0.84rem",
+          lineHeight: 1.75,
           "& code": {
-            fontFamily: "monospace",
+            fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
             whiteSpace: "pre",
           },
         }}
@@ -205,11 +206,13 @@ function MermaidDiagram({ source }: { source: string }) {
     <Paper
       variant="outlined"
       sx={{
-        my: 1.5,
-        p: 2,
+        my: 2,
+        p: { xs: 1.5, md: 2.5 },
         overflowX: "auto",
-        borderRadius: 2,
+        borderRadius: 2.5,
         bgcolor: "#ffffff",
+        borderColor: "divider",
+        boxShadow: "0 3px 12px rgba(15,23,42,0.05)",
       }}
     >
       <Box
@@ -246,10 +249,25 @@ const markdownComponents: Components = {
     }
 
     return (
-      <code className={className} {...props}>
-        {children}
-      </code>
-    );
+  <Box
+    component="code"
+    className={className}
+    {...props}
+    sx={{
+      px: 0.7,
+      py: 0.25,
+      mx: 0.2,
+      borderRadius: 1,
+      bgcolor: "action.hover",
+      color: "primary.dark",
+      fontSize: "0.86em",
+      fontFamily: "monospace",
+      overflowWrap: "anywhere",
+    }}
+  >
+    {children}
+  </Box>
+);
   },
 
   pre({ children }) {
@@ -257,28 +275,55 @@ const markdownComponents: Components = {
   },
 
   p({ children }) {
-    return (
-      <Typography
-        component="p"
-        variant="body1"
-        sx={{ my: 1, lineHeight: 1.7, overflowWrap: "anywhere" }}
-      >
-        {children}
-      </Typography>
-    );
-  },
+  return (
+    <Typography
+      component="p"
+      variant="body1"
+      sx={{
+        my: 1.25,
+        lineHeight: 1.8,
+        fontSize: "0.94rem",
+        color: "text.primary",
+        overflowWrap: "anywhere",
+      }}
+    >
+      {children}
+    </Typography>
+  );
+},
 
   h1({ children }) {
-    return <Typography variant="h5" sx={{ mt: 2, mb: 1 }}>{children}</Typography>;
-  },
+  return (
+    <Typography
+      variant="h5"
+      sx={{ mt: 2.5, mb: 1.5, fontWeight: 800, color: "text.primary" }}
+    >
+      {children}
+    </Typography>
+  );
+},
 
-  h2({ children }) {
-    return <Typography variant="h6" sx={{ mt: 2, mb: 1 }}>{children}</Typography>;
-  },
+h2({ children }) {
+  return (
+    <Typography
+      variant="h6"
+      sx={{ mt: 2.5, mb: 1.25, fontWeight: 750, color: "text.primary" }}
+    >
+      {children}
+    </Typography>
+  );
+},
 
-  h3({ children }) {
-    return <Typography variant="subtitle1" sx={{ mt: 1.5, mb: 0.5, fontWeight: 700 }}>{children}</Typography>;
-  },
+h3({ children }) {
+  return (
+    <Typography
+      variant="subtitle1"
+      sx={{ mt: 2, mb: 1, fontWeight: 750, color: "text.primary" }}
+    >
+      {children}
+    </Typography>
+  );
+},
 
   ul({ children }) {
     return <Box component="ul" sx={{ pl: 3, my: 1 }}>{children}</Box>;
@@ -315,11 +360,22 @@ const markdownComponents: Components = {
 
   table({ children }) {
     return (
-      <Box sx={{ width: "100%", overflowX: "auto", my: 1.5 }}>
-        <Table size="small">{children}</Table>
+      <Box
+        sx={{
+          width: "100%",
+          overflowX: "auto",
+          my: 2,
+          border: "1px solid",
+          borderColor: "divider",
+          borderRadius: 2,
+        }}
+      >
+        <Table size="small" sx={{ minWidth: 400 }}>
+          {children}
+        </Table>
       </Box>
-    );
-  },
+          );
+        },
 
   thead({ children }) {
     return <TableHead>{children}</TableHead>;
@@ -346,12 +402,25 @@ const markdownComponents: Components = {
   },
 
   a({ href, children }) {
-    return (
-      <a href={href} target="_blank" rel="noopener noreferrer">
-        {children}
-      </a>
-    );
-  },
+  return (
+    <Box
+      component="a"
+      href={href}
+      target="_blank"
+      rel="noopener noreferrer"
+      sx={{
+        color: "primary.main",
+        fontWeight: 600,
+        textDecoration: "none",
+        "&:hover": {
+          textDecoration: "underline",
+        },
+      }}
+    >
+      {children}
+    </Box>
+  );
+},
 
   hr() {
     return <Box component="hr" sx={{ my: 2, border: 0, borderTop: 1, borderColor: "divider" }} />;

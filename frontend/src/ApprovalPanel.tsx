@@ -4,6 +4,7 @@ import {
   Box,
   Button,
   Card,
+  Chip,
   CardContent,
   CircularProgress,
   Stack,
@@ -120,100 +121,228 @@ export default function ApprovalPanel({
     }
   }
 
+  
   return (
-    <Card sx={{ borderRadius: 3 }}>
+    <Card
+      sx={{
+        borderRadius: 3,
+        border: "1px solid",
+        borderColor: "divider",
+        boxShadow: "0 4px 18px rgba(15, 23, 42, 0.04)",
+      }}
+    >
       <CardContent sx={{ p: { xs: 2, md: 3 } }}>
-        <Stack direction="row" spacing={1.5} sx={{ alignItems: "center", mb: 1 }}>
-          <AccountTreeIcon color="primary" fontSize="large" />
-          <Typography variant="h5" sx={{ fontWeight: 700 }}>
-            Workflow & Approvals
-          </Typography>
+        <Stack
+          direction="row"
+          spacing={1.5}
+          sx={{ mb: 1, alignItems:"center"}}
+        >
+          <Box
+            sx={{
+              width: 44,
+              height: 44,
+              borderRadius: 2,
+              bgcolor: "primary.light",
+              color: "primary.dark",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+            }}
+          >
+            <AccountTreeIcon fontSize="medium" />
+          </Box>
+
+          <Box>
+            <Typography variant="h5" sx={{ fontWeight:750 }}>
+              Workflow & Approvals
+            </Typography>
+            <Typography variant="body2" color="text.secondary">
+              Trusted plan generation and approval management
+            </Typography>
+          </Box>
         </Stack>
 
-        <Typography color="text.secondary" sx={{ mb: 3 }}>
+        <Typography color="text.secondary" sx={{ mb: 3, mt: 2 }}>
           Generate a trusted Terraform plan for a completed infrastructure
           request, review its summary, and submit it for approval.
           Submitting does not provision resources.
         </Typography>
 
-        {error && <Alert severity="error" sx={{ mb: 2 }}>{error}</Alert>}
-        {notice && <Alert severity="success" sx={{ mb: 2 }}>{notice}</Alert>}
+        {error && (
+          <Alert severity="error" sx={{ mb: 2, borderRadius: 2 }}>
+            {error}
+          </Alert>
+        )}
 
-        <Stack spacing={2}>
-          <Box>
-            <Typography variant="subtitle2" sx={{ mb: 1 }}>
-              Infrastructure Request ID
-            </Typography>
-            <input
-              type="number"
-              min="1"
-              step="1"
-              value={requestId}
-              onChange={(event) => {
-                setRequestId(event.target.value);
-                setPlan(null);
-                setApproval(null);
-                setError("");
-                setNotice("");
-              }}
-              placeholder="Enter an existing request ID"
-              style={{
-                boxSizing: "border-box",
-                width: "100%",
-                padding: "14px",
-                borderRadius: "8px",
-                border: "1px solid #999",
-                fontSize: "16px",
-              }}
-            />
-          </Box>
+        {notice && (
+          <Alert severity="success" sx={{ mb: 2, borderRadius: 2 }}>
+            {notice}
+          </Alert>
+        )}
 
-          <Box>
-            <Button
-              variant="contained"
-              onClick={() => void handleGeneratePlan()}
-              disabled={loadingPlan || loadingApproval || !requestId.trim()}
-            >
-              {loadingPlan ? (
-                <>
-                  <CircularProgress size={18} color="inherit" sx={{ mr: 1 }} />
-                  Generating plan...
-                </>
-              ) : (
-                "Generate Trusted Terraform Plan"
-              )}
-            </Button>
-          </Box>
-        </Stack>
+        <Box
+          sx={{
+            p: { xs: 2, md: 2.5 },
+            border: "1px solid",
+            borderColor: "divider",
+            borderRadius: 2.5,
+            bgcolor: "background.default",
+          }}
+        >
+          <Typography  sx={{ mb: 0.5, fontWeight:700 }}>
+            Infrastructure request
+          </Typography>
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+            Enter the ID of an existing infrastructure request.
+          </Typography>
+
+          <Typography variant="subtitle2" sx={{ mb: 1 }}>
+            Infrastructure Request ID
+          </Typography>
+
+          <Box
+            component="input"
+            type="number"
+            min="1"
+            step="1"
+            value={requestId}
+            onChange={(event) => {
+              setRequestId(event.target.value);
+              setPlan(null);
+              setApproval(null);
+              setError("");
+              setNotice("");
+            }}
+            placeholder="Enter an existing request ID"
+            sx={{
+              boxSizing: "border-box",
+              width: "100%",
+              p: 1.75,
+              borderRadius: 2,
+              border: "1px solid",
+              borderColor: "divider",
+              bgcolor: "background.paper",
+              color: "text.primary",
+              fontSize: 15,
+              outline: "none",
+              "&:focus": {
+                borderColor: "primary.main",
+                boxShadow: "0 0 0 2px rgba(25, 118, 210, 0.12)",
+              },
+            }}
+          />
+
+          <Button
+            variant="contained"
+            onClick={() => void handleGeneratePlan()}
+            disabled={loadingPlan || loadingApproval || !requestId.trim()}
+            sx={{
+              mt: 2,
+              borderRadius: 2,
+              px: 2.5,
+              py: 1.2,
+              textTransform: "none",
+              fontWeight: 700,
+            }}
+          >
+            {loadingPlan ? (
+              <>
+                <CircularProgress size={18} color="inherit" sx={{ mr: 1 }} />
+                Generating plan...
+              </>
+            ) : (
+              "Generate Trusted Terraform Plan"
+            )}
+          </Button>
+        </Box>
 
         {plan && (
-          <Card variant="outlined" sx={{ mt: 3, borderRadius: 2 }}>
-            <CardContent>
-              <Typography variant="h6" sx={{ fontWeight: 700, mb: 1 }}>
-                Terraform Plan Review
-              </Typography>
+          <Card
+            variant="outlined"
+            sx={{ mt: 3, borderRadius: 2.5, overflow: "hidden" }}
+          >
+            <CardContent sx={{ p: { xs: 2, md: 2.5 } }}>
+              <Stack
+                direction={{ xs: "column", sm: "row" }}
+                spacing={1}
+                sx={{ mb: 2, justifyContent:"space-between", alignItems:{ xs: "flex-start", sm: "center" } }}
+              >
+                <Box>
+                  <Typography variant="h6" sx={{fontWeight:750}}>
+                    Terraform Plan Review
+                  </Typography>
+                  <Typography variant="body2" color="text.secondary">
+                    Review the generated plan before requesting approval.
+                  </Typography>
+                </Box>
 
-              <Typography>Plan Record ID: {plan.id}</Typography>
-              <Typography>Request ID: {plan.infrastructure_request_id}</Typography>
-              <Typography>Status: {plan.status}</Typography>
-              <Typography>
-                Deployment enabled: {plan.deployment_enabled ? "Yes" : "No"}
-              </Typography>
+                <Chip
+                  label={plan.status}
+                  color={plan.status === "succeeded" ? "success" : "error"}
+                  size="small"
+                  sx={{ fontWeight: 700, textTransform: "capitalize" }}
+                />
+              </Stack>
 
-              <Typography sx={{ fontWeight: 600, mt: 2, mb: 1 }}>
+              <Box
+                sx={{
+                  display: "grid",
+                  gridTemplateColumns: {
+                    xs: "1fr",
+                    sm: "repeat(2, minmax(0, 1fr))",
+                  },
+                  gap: 1.5,
+                  mb: 2.5,
+                }}
+              >
+                {[
+                  { label: "Plan Record ID", value: plan.id },
+                  {
+                    label: "Infrastructure Request",
+                    value: plan.infrastructure_request_id,
+                  },
+                  {
+                    label: "Deployment Enabled",
+                    value: plan.deployment_enabled ? "Yes" : "No",
+                  },
+                  { label: "Plan Status", value: plan.status },
+                ].map((item) => (
+                  <Box
+                    key={item.label}
+                    sx={{
+                      p: 1.75,
+                      borderRadius: 2,
+                      bgcolor: "action.hover",
+                    }}
+                  >
+                    <Typography variant="caption" color="text.secondary">
+                      {item.label}
+                    </Typography>
+                    <Typography  sx={{ mt: 0.5, fontWeight:700 }}>
+                      {item.value}
+                    </Typography>
+                  </Box>
+                ))}
+              </Box>
+
+              <Typography  sx={{ mb: 1, fontWeight:700 }}>
                 Stored plan summary
               </Typography>
 
               <Box
                 component="pre"
                 sx={{
-                  p: 1.5,
-                  borderRadius: 1,
-                  bgcolor: "action.hover",
+                  p: 2,
+                  m: 0,
+                  borderRadius: 2,
+                  bgcolor: "#101827",
+                  color: "#d8e5f5",
                   overflowX: "auto",
                   whiteSpace: "pre-wrap",
                   overflowWrap: "anywhere",
                   fontSize: 12,
+                  lineHeight: 1.7,
+                  fontFamily: "monospace",
                 }}
               >
                 {JSON.stringify(plan.plan_summary, null, 2)}
@@ -224,11 +353,22 @@ export default function ApprovalPanel({
                   variant="contained"
                   onClick={() => void handleSubmitApproval()}
                   disabled={loadingApproval || loadingPlan}
-                  sx={{ mt: 2 }}
+                  sx={{
+                    mt: 2.5,
+                    borderRadius: 2,
+                    px: 2.5,
+                    py: 1.2,
+                    textTransform: "none",
+                    fontWeight: 700,
+                  }}
                 >
                   {loadingApproval ? (
                     <>
-                      <CircularProgress size={18} color="inherit" sx={{ mr: 1 }} />
+                      <CircularProgress
+                        size={18}
+                        color="inherit"
+                        sx={{ mr: 1 }}
+                      />
                       Submitting...
                     </>
                   ) : (
@@ -237,27 +377,76 @@ export default function ApprovalPanel({
                 </Button>
               )}
 
-              <Alert severity="info" sx={{ mt: 2 }}>
-                A generated plan is not an approval. Terraform deployment remains disabled.
+              <Alert severity="info" sx={{ mt: 2, borderRadius: 2 }}>
+                A generated plan is not an approval. Terraform deployment
+                remains disabled.
               </Alert>
             </CardContent>
           </Card>
         )}
 
         {approval && (
-          <Card variant="outlined" sx={{ mt: 3, borderRadius: 2 }}>
-            <CardContent>
-              <Typography variant="h6" sx={{ fontWeight: 700, mb: 2 }}>
-                Approval Request Created
-              </Typography>
-              <Typography>Approval ID: {approval.id}</Typography>
-              <Typography>
-                Infrastructure Request ID: {approval.infrastructure_request_id}
-              </Typography>
-              <Typography>Plan Record ID: {approval.terraform_plan_record_id}</Typography>
-              <Typography>Status: {approval.status}</Typography>
-              <Alert severity="info" sx={{ mt: 2 }}>
-                The request is awaiting the configured approval workflow. No deployment was triggered.
+          <Card
+            variant="outlined"
+            sx={{
+              mt: 3,
+              borderRadius: 2.5,
+              borderColor: "success.light",
+            }}
+          >
+            <CardContent sx={{ p: { xs: 2, md: 2.5 } }}>
+              <Stack direction="row" spacing={1}  sx={{ mb: 2, alignItems:"center" }}>
+                <AccountTreeIcon color="success" />
+                <Typography variant="h6" sx={{fontWeight:750}}>
+                  Approval Request Created
+                </Typography>
+              </Stack>
+
+              <Chip
+                label={approval.status}
+                color="success"
+                size="small"
+                sx={{ mb: 2, fontWeight: 700, textTransform: "capitalize" }}
+              />
+
+              <Stack spacing={1.5}>
+                {[
+                  { label: "Approval ID", value: approval.id },
+                  {
+                    label: "Infrastructure Request ID",
+                    value: approval.infrastructure_request_id,
+                  },
+                  {
+                    label: "Plan Record ID",
+                    value: approval.terraform_plan_record_id,
+                  },
+                  { label: "Status", value: approval.status },
+                ].map((item) => (
+                  <Stack
+                    key={item.label}
+                    direction={{ xs: "column", sm: "row" }}
+                    
+                    spacing={0.5}
+                    sx={{
+                      py: 1,
+                      borderBottom: "1px solid",
+                      borderColor: "divider",
+                      justifyContent:"space-between"
+                    }}
+                  >
+                    <Typography variant="body2" color="text.secondary">
+                      {item.label}
+                    </Typography>
+                    <Typography variant="body2" sx={{fontWeight:700}}>
+                      {item.value}
+                    </Typography>
+                  </Stack>
+                ))}
+              </Stack>
+
+              <Alert severity="info" sx={{ mt: 2, borderRadius: 2 }}>
+                The request is awaiting the configured approval workflow.
+                No deployment was triggered.
               </Alert>
             </CardContent>
           </Card>

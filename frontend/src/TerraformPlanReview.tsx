@@ -99,98 +99,217 @@ export default function TerraformPlanReview() {
     }
   }
 
+  
   return (
-    <Card sx={{ borderRadius: 3, mb: 3 }}>
+    <Card
+      elevation={0}
+      sx={{
+        border: "1px solid #e3eaf3",
+        borderRadius: 3,
+        overflow: "hidden",
+        bgcolor: "#ffffff",
+      }}
+    >
       <CardContent sx={{ p: { xs: 2, md: 3 } }}>
-        <Stack direction="row" spacing={1.5} sx={{ alignItems: "center", mb: 1 }}>
-          <FactCheckIcon color="primary" fontSize="large" />
+        {/* Header */}
+        <Stack
+          direction="row"
+          spacing={1.5}
+          sx={{ alignItems: "center", mb: 2 }}
+        >
+          <Box
+            sx={{
+              width: 46,
+              height: 46,
+              borderRadius: 2.5,
+              bgcolor: "#edf3ff",
+              color: "#2864dc",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+            }}
+          >
+            <FactCheckIcon fontSize="large" />
+          </Box>
+
           <Box>
-            <Typography component="h2" variant="h5" sx={{ fontWeight: 800 }}>
+            <Typography
+              component="h2"
+              variant="h5"
+              sx={{ fontWeight: 800, color: "#24334d" }}
+            >
               Terraform Plan Review
             </Typography>
             <Typography variant="body2" color="text.secondary">
-              Inspect resource changes from Terraform plan JSON.
+              Inspect infrastructure changes from Terraform plan JSON.
             </Typography>
           </Box>
         </Stack>
 
-        <Alert severity="warning" sx={{ my: 2 }}>
+        <Alert severity="warning" sx={{ mb: 2.5, borderRadius: 2 }}>
           Review only. This endpoint parses supplied JSON; it does not run
           Terraform, verify the plan against live AWS state, approve changes,
           or deploy resources. Avoid pasting credentials or other secrets.
         </Alert>
 
-        <TextField
-          label="Terraform plan JSON"
-          placeholder="Paste the complete output of terraform show -json"
-          value={planJson}
-          onChange={(event) => setPlanJson(event.target.value)}
-          multiline
-          minRows={8}
-          maxRows={18}
-          fullWidth
+        {/* JSON input */}
+        <Box
           sx={{
-            mb: 2,
-            "& textarea": {
-              fontFamily: "monospace",
-              fontSize: 13,
-            },
+            p: { xs: 1.5, md: 2 },
+            bgcolor: "#f8fafd",
+            border: "1px solid #e8edf4",
+            borderRadius: 2.5,
           }}
-        />
-
-        <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: "wrap"}}>
-          <Button
-            variant="contained"
-            onClick={reviewPlan}
-            disabled={loading || !planJson.trim()}
-            startIcon={
-              loading ? (
-                <CircularProgress size={18} color="inherit" />
-              ) : (
-                <FactCheckIcon />
-              )
-            }
+        >
+          <Typography
+            variant="subtitle1"
+            sx={{ fontWeight: 800, color: "#24334d", mb: 1.5 }}
           >
-            {loading ? "Reviewing plan..." : "Review Terraform Plan"}
-          </Button>
+            Terraform Plan JSON
+          </Typography>
 
-          <Button
-            variant="outlined"
-            onClick={() => {
-              setPlanJson(EMPTY_PLAN_EXAMPLE);
-              setReview(null);
-              setError("");
+          <TextField
+            label="Paste Terraform plan JSON"
+            placeholder="Paste the complete output of terraform show -json"
+            value={planJson}
+            onChange={(event) => setPlanJson(event.target.value)}
+            multiline
+            minRows={10}
+            maxRows={18}
+            fullWidth
+            sx={{
+              mb: 2,
+              "& .MuiOutlinedInput-root": {
+                bgcolor: "#ffffff",
+                borderRadius: 2,
+                alignItems: "flex-start",
+              },
+              "& textarea": {
+                fontFamily: "monospace",
+                fontSize: 13,
+                lineHeight: 1.6,
+              },
             }}
-            disabled={loading}
-          >
-            Load Example
-          </Button>
+          />
 
-          <Button
-            onClick={() => {
-              setPlanJson("");
-              setReview(null);
-              setError("");
-            }}
-            disabled={loading}
+          <Stack
+            direction={{ xs: "column", sm: "row" }}
+            spacing={1.2}
+            useFlexGap
+            sx={{ flexWrap: "wrap" }}
           >
-            Clear
-          </Button>
-        </Stack>
+            <Button
+              variant="contained"
+              onClick={reviewPlan}
+              disabled={loading || !planJson.trim()}
+              startIcon={
+                loading ? (
+                  <CircularProgress size={18} color="inherit" />
+                ) : (
+                  <FactCheckIcon />
+                )
+              }
+              sx={{
+                borderRadius: 2,
+                textTransform: "none",
+                fontWeight: 800,
+                boxShadow: "none",
+                bgcolor: "#2864dc",
+                "&:hover": { bgcolor: "#1e50b5", boxShadow: "none" },
+              }}
+            >
+              {loading ? "Reviewing plan..." : "Review Terraform Plan"}
+            </Button>
+
+            <Button
+              variant="outlined"
+              onClick={() => {
+                setPlanJson(EMPTY_PLAN_EXAMPLE);
+                setReview(null);
+                setError("");
+              }}
+              disabled={loading}
+              sx={{ borderRadius: 2, textTransform: "none", fontWeight: 700 }}
+            >
+              Load Example
+            </Button>
+
+            <Button
+              onClick={() => {
+                setPlanJson("");
+                setReview(null);
+                setError("");
+              }}
+              disabled={loading}
+              sx={{ borderRadius: 2, textTransform: "none" }}
+            >
+              Clear
+            </Button>
+          </Stack>
+        </Box>
 
         {error && (
-          <Alert severity="error" sx={{ mt: 2 }}>
+          <Alert severity="error" sx={{ mt: 2, borderRadius: 2 }}>
             {error}
           </Alert>
         )}
 
+        {/* Review results */}
         {review && (
           <Box sx={{ mt: 3 }}>
-            <Divider sx={{ mb: 2 }} />
+            <Divider sx={{ mb: 2.5 }} />
 
-            <Typography component="h3" variant="h6" sx={{ fontWeight: 700, mb: 1.5 }}>
+            <Typography
+              component="h3"
+              variant="h6"
+              sx={{ fontWeight: 800, color: "#24334d", mb: 2 }}
+            >
               Plan Summary
             </Typography>
+
+            <Box
+              sx={{
+                display: "grid",
+                gridTemplateColumns: {
+                  xs: "repeat(2, minmax(0, 1fr))",
+                  sm: "repeat(3, minmax(0, 1fr))",
+                  lg: "repeat(4, minmax(0, 1fr))",
+                },
+                gap: 1.5,
+                mb: 2,
+              }}
+            >
+              {[
+                { label: "Create", value: review.resource_summary.create, color: "#16804a" },
+                { label: "Update", value: review.resource_summary.update, color: "#2864dc" },
+                { label: "Delete", value: review.resource_summary.delete, color: "#d14343" },
+                { label: "Replace", value: review.resource_summary.replace, color: "#b7791f" },
+                { label: "Read", value: review.resource_summary.read, color: "#64748b" },
+                { label: "No-op", value: review.resource_summary.no_op, color: "#64748b" },
+                { label: "Other", value: review.resource_summary.other, color: "#64748b" },
+                { label: "Total changes", value: review.resource_summary.total_resource_changes, color: "#24334d" },
+              ].map((item) => (
+                <Box
+                  key={item.label}
+                  sx={{
+                    p: 2,
+                    bgcolor: "#f8fafd",
+                    border: "1px solid #e8edf4",
+                    borderRadius: 2,
+                  }}
+                >
+                  <Typography variant="caption" color="text.secondary">
+                    {item.label}
+                  </Typography>
+                  <Typography
+                    variant="h5"
+                    sx={{ fontWeight: 800, color: item.color, mt: 0.5 }}
+                  >
+                    {item.value}
+                  </Typography>
+                </Box>
+              ))}
+            </Box>
 
             <Stack
               direction="row"
@@ -199,52 +318,51 @@ export default function TerraformPlanReview() {
               sx={{ flexWrap: "wrap", mb: 2 }}
             >
               <Chip
-                label={`Create: ${review.resource_summary.create}`}
-                color="success"
+                label={`Terraform: ${review.terraform_version ?? "Unknown"}`}
+                variant="outlined"
               />
               <Chip
-                label={`Update: ${review.resource_summary.update}`}
-                color="info"
-              />
-              <Chip
-                label={`Delete: ${review.resource_summary.delete}`}
-                color="error"
-              />
-              <Chip
-                label={`Replace: ${review.resource_summary.replace}`}
-                color="warning"
-              />
-              <Chip label={`Read: ${review.resource_summary.read}`} />
-              <Chip label={`No-op: ${review.resource_summary.no_op}`} />
-              <Chip label={`Other: ${review.resource_summary.other}`} />
-              <Chip
-                label={`Total changes: ${review.resource_summary.total_resource_changes}`}
+                label={`Format: ${review.format_version ?? "Unknown"}`}
+                variant="outlined"
               />
             </Stack>
 
-            <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-              Terraform version: {review.terraform_version ?? "Unknown"} ·
-              Plan format: {review.format_version ?? "Unknown"}
-            </Typography>
-
-            <Alert severity="success" sx={{ mb: 2 }}>
+            <Alert severity="success" sx={{ mb: 2, borderRadius: 2 }}>
               JSON parsed successfully. Deployment remains disabled.
             </Alert>
 
+            <Typography
+              component="h3"
+              variant="h6"
+              sx={{ fontWeight: 800, color: "#24334d", mb: 1.5 }}
+            >
+              Resource Changes
+            </Typography>
+
             {review.resources.length === 0 ? (
-              <Alert severity="info">
+              <Alert severity="info" sx={{ borderRadius: 2 }}>
                 No resource changes were found in this plan JSON.
               </Alert>
             ) : (
-              <Stack spacing={1.5}>
+              <Stack spacing={2}>
                 {review.resources.map((resource, index) => (
                   <Card
                     key={`${resource.address ?? "resource"}-${index}`}
                     variant="outlined"
-                    sx={{ borderRadius: 2 }}
+                    sx={{
+                      borderRadius: 2.5,
+                      borderColor: "#e3eaf3",
+                      overflow: "hidden",
+                    }}
                   >
-                    <CardContent>
-                      <Typography sx={{ fontWeight: 700, overflowWrap: "anywhere" }}>
+                    <CardContent sx={{ p: 2.5 }}>
+                      <Typography
+                        sx={{
+                          fontWeight: 800,
+                          color: "#24334d",
+                          overflowWrap: "anywhere",
+                        }}
+                      >
                         {resource.address ?? "Unknown resource address"}
                       </Typography>
 
@@ -252,64 +370,96 @@ export default function TerraformPlanReview() {
                         direction="row"
                         spacing={1}
                         useFlexGap
-                       sx={{ flexWrap: "wrap", my: 1 }}
+                        sx={{ flexWrap: "wrap", my: 1.5 }}
                       >
                         <Chip
                           size="small"
                           label={`Type: ${resource.type ?? "Unknown"}`}
+                          variant="outlined"
                         />
                         <Chip
                           size="small"
                           label={`Action: ${resource.actions.join(", ") || "Unknown"}`}
+                          color="primary"
                         />
                         <Chip
                           size="small"
                           label={`Mode: ${resource.mode}`}
+                          variant="outlined"
                         />
                       </Stack>
 
                       {resource.action_reason && (
-                        <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+                        <Alert severity="info" sx={{ mb: 2, borderRadius: 2 }}>
                           Reason: {resource.action_reason}
-                        </Typography>
+                        </Alert>
                       )}
 
-                      <Typography variant="subtitle2" sx={{ mt: 2, mb: 0.5 }}>
-                        Before
-                      </Typography>
                       <Box
-                        component="pre"
                         sx={{
-                          p: 1.5,
-                          bgcolor: "action.hover",
-                          borderRadius: 1,
-                          whiteSpace: "pre-wrap",
-                          overflowWrap: "anywhere",
-                          fontSize: 12,
-                          maxHeight: 220,
-                          overflow: "auto",
+                          display: "grid",
+                          gridTemplateColumns: {
+                            xs: "1fr",
+                            md: "repeat(2, minmax(0, 1fr))",
+                          },
+                          gap: 2,
                         }}
                       >
-                        {formatValue(resource.before)}
-                      </Box>
+                        <Box sx={{ minWidth: 0 }}>
+                          <Typography
+                            variant="subtitle2"
+                            sx={{ fontWeight: 800, mb: 1, color: "#475569" }}
+                          >
+                            Before
+                          </Typography>
+                          <Box
+                            component="pre"
+                            sx={{
+                              m: 0,
+                              p: 1.5,
+                              bgcolor: "#f8fafd",
+                              border: "1px solid #e8edf4",
+                              borderRadius: 2,
+                              whiteSpace: "pre-wrap",
+                              overflowWrap: "anywhere",
+                              fontSize: 12,
+                              lineHeight: 1.6,
+                              maxHeight: 240,
+                              overflow: "auto",
+                              color: "#475569",
+                            }}
+                          >
+                            {formatValue(resource.before)}
+                          </Box>
+                        </Box>
 
-                      <Typography variant="subtitle2" sx={{ mt: 2, mb: 0.5 }}>
-                        After
-                      </Typography>
-                      <Box
-                        component="pre"
-                        sx={{
-                          p: 1.5,
-                          bgcolor: "action.hover",
-                          borderRadius: 1,
-                          whiteSpace: "pre-wrap",
-                          overflowWrap: "anywhere",
-                          fontSize: 12,
-                          maxHeight: 220,
-                          overflow: "auto",
-                        }}
-                      >
-                        {formatValue(resource.after)}
+                        <Box sx={{ minWidth: 0 }}>
+                          <Typography
+                            variant="subtitle2"
+                            sx={{ fontWeight: 800, mb: 1, color: "#475569" }}
+                          >
+                            After
+                          </Typography>
+                          <Box
+                            component="pre"
+                            sx={{
+                              m: 0,
+                              p: 1.5,
+                              bgcolor: "#f0f6ff",
+                              border: "1px solid #dce8fb",
+                              borderRadius: 2,
+                              whiteSpace: "pre-wrap",
+                              overflowWrap: "anywhere",
+                              fontSize: 12,
+                              lineHeight: 1.6,
+                              maxHeight: 240,
+                              overflow: "auto",
+                              color: "#31527e",
+                            }}
+                          >
+                            {formatValue(resource.after)}
+                          </Box>
+                        </Box>
                       </Box>
                     </CardContent>
                   </Card>
@@ -317,7 +467,7 @@ export default function TerraformPlanReview() {
               </Stack>
             )}
 
-            <Alert severity="warning" sx={{ mt: 2 }}>
+            <Alert severity="warning" sx={{ mt: 2, borderRadius: 2 }}>
               This report reflects the JSON submitted for parsing. Confirm its
               source and review the plan before any future approval or execution.
             </Alert>
