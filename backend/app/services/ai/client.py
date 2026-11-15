@@ -168,3 +168,72 @@ async def extract_requirements_with_ai(
 
     finally:
         await client.close()
+
+
+async def generate_clarification_question_with_ai(
+    missing_field: str,
+    requirements: dict[str, Any],
+    user_message: str,
+) -> str:
+    """Generate one contextual question for a missing requirement.
+
+    The AI only generates question wording. Python remains responsible
+    for identifying missing fields and validating requirements.
+    """
+    allowed_fields = set(InfrastructureRequirements.model_fields)
+
+    if missing_field not in allowed_fields:
+        raise ValueError("Unknown infrastructure requirement field.")
+
+    client, model = create_ai_client()
+
+    try:
+        response = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You generate clarification questions for an "
+                        "infrastructure requirements gathering assistant. "
+                        "Return exactly one short, clear question in plain "
+                        "text. Ask only about the specified missing field. "
+                        "Use the existing requirements and user's latest "
+                        "message to make the question contextual. "
+                        "Do not invent, assume, or modify any requirement. "
+                        "Do not ask about fields that are already provided. "
+                        "Do not generate Terraform code, approve changes, "
+                        "or claim that infrastructure has been provisioned. "
+                        "Return only the question, ending with a question mark."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Missing field: {missing_field}\n"
+                        f"Collected requirements: {json.dumps(requirements)}\n"
+                        f"Latest user message: {user_message}"
+                    ),
+                },
+            ],
+        )
+
+        content = response.choices[0].message.content
+
+        if not isinstance(content, str):
+            raise ValueError("The AI returned no clarification question.")
+
+        question = content.strip().strip('"').strip("'")
+
+        if (
+            not question
+            or len(question) > 500
+            or "\n" in question
+            or "?" not in question
+        ):
+            raise ValueError("The AI returned an invalid clarification question.")
+
+        return question
+
+    finally:
+        await client.close()

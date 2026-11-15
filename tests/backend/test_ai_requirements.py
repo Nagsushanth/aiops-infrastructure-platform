@@ -9,6 +9,14 @@ from backend.app.services.ai.client import AIConfigurationError
 from backend.app.services.ai.requirements import gather_requirements_with_ai
 from backend.app.services.requirements.gathering import gather_requirements
 
+@pytest.fixture(autouse=True)
+def mock_ai_clarification_generation():
+    with patch(
+        "backend.app.services.ai.requirements.generate_clarification_question_with_ai",
+        new_callable=AsyncMock,
+        return_value="Could you provide the missing infrastructure detail?",
+    ):
+        yield
 
 def test_ai_failure_falls_back_to_deterministic_parser():
     with patch(
@@ -162,3 +170,80 @@ def test_invalid_ai_output_falls_back_to_deterministic_parser():
     assert result == expected
     assert result["requirements"]["cloud_provider"] == "aws"
     assert result["requirements"]["public_access"] is False
+
+def test_ai_generated_clarification_question_is_used():
+    extracted = {"cloud_provider": "aws"}
+
+    with patch(
+        "backend.app.services.ai.requirements.extract_requirements_with_ai",
+        new_callable=AsyncMock,
+        return_value=extracted,
+    ), patch(
+        "backend.app.services.ai.requirements.generate_clarification_question_with_ai",
+        new_callable=AsyncMock,
+        return_value="What type of EC2 instance do you need?",
+    ) as mock_question:
+        result = asyncio.run(
+            gather_requirements_with_ai("I need an AWS instance")
+        )
+
+    assert result["status"] == "needs_clarification"
+    assert result["question"] == "What type of EC2 instance do you need?"
+    assert result["missing_field"] == "resource_type"
+    mock_question.assert_awaited_once()
+
+    call_kwargs = mock_question.await_args.kwargs
+
+    assert call_kwargs["missing_field"] == "resource_type"
+    assert call_kwargs["user_message"] == "I need an AWS instance"
+    assert call_kwargs["requirements"]["cloud_provider"] == "aws"
+
+def test_question_generation_failure_uses_fixed_fallback():
+    extracted = {"cloud_provider": "aws"}
+
+    with patch(
+        "backend.app.services.ai.requirements.extract_requirements_with_ai",
+        new_callable=AsyncMock,
+        return_value=extracted,
+    ), patch(
+        "backend.app.services.ai.requirements.generate_clarification_question_with_ai",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("Simulated question generation failure"),
+    ):
+        result = asyncio.run(
+            gather_requirements_with_ai("I need an AWS instance")
+        )
+
+    assert result["status"] == "needs_clarification"
+    assert result["missing_field"] == "resource_type"
+    assert result["question"] == (
+        "What type of resource do you need, such as an EC2 instance?"
+    )
+
+def test_complete_requirements_do_not_generate_clarification():
+    extracted = {
+        "cloud_provider": "aws",
+        "resource_type": "EC2",
+        "environment": "development",
+        "region": "ap-south-1",
+        "vcpus": 2,
+        "memory_gb": 4,
+        "public_access": False,
+        "operating_system": "Linux",
+    }
+
+    with patch(
+        "backend.app.services.ai.requirements.extract_requirements_with_ai",
+        new_callable=AsyncMock,
+        return_value=extracted,
+    ), patch(
+        "backend.app.services.ai.requirements.generate_clarification_question_with_ai",
+        new_callable=AsyncMock,
+    ) as mock_question:
+        result = asyncio.run(
+            gather_requirements_with_ai("Create a development instance")
+        )
+
+    assert result["status"] == "complete"
+    assert result["question"] is None
+    mock_question.assert_not_awaited()
