@@ -247,3 +247,70 @@ def test_complete_requirements_do_not_generate_clarification():
     assert result["status"] == "complete"
     assert result["question"] is None
     mock_question.assert_not_awaited()
+
+
+def test_workload_sizing_recommendation_is_included():
+    extracted = {"cloud_provider": "aws"}
+
+    with patch(
+        "backend.app.services.ai.requirements.extract_requirements_with_ai",
+        new_callable=AsyncMock,
+        return_value=extracted,
+    ):
+        result = asyncio.run(
+            gather_requirements_with_ai(
+                "I need a small development web application"
+            )
+        )
+
+    recommendation = result["sizing_recommendation"]
+
+    assert recommendation["vcpus"] == 2
+    assert recommendation["memory_gb"] == 4
+    assert "Sizing recommendation" in result["question"]
+
+
+def test_explicit_cpu_and_memory_prevent_sizing_recommendation():
+    extracted = {
+        "cloud_provider": "aws",
+        "resource_type": "EC2",
+        "environment": "development",
+        "region": "ap-south-1",
+        "vcpus": 4,
+        "memory_gb": 8,
+        "public_access": False,
+        "operating_system": "Linux",
+    }
+
+    with patch(
+        "backend.app.services.ai.requirements.extract_requirements_with_ai",
+        new_callable=AsyncMock,
+        return_value=extracted,
+    ):
+        result = asyncio.run(
+            gather_requirements_with_ai(
+                "I need a small development web application "
+                "with 4 vCPUs and 8 GB RAM"
+            )
+        )
+
+    assert result["requirements"]["vcpus"] == 4
+    assert result["requirements"]["memory_gb"] == 8
+    assert "sizing_recommendation" not in result
+
+
+def test_unknown_workload_does_not_receive_sizing_recommendation():
+    extracted = {"cloud_provider": "aws"}
+
+    with patch(
+        "backend.app.services.ai.requirements.extract_requirements_with_ai",
+        new_callable=AsyncMock,
+        return_value=extracted,
+    ):
+        result = asyncio.run(
+            gather_requirements_with_ai(
+                "I need an infrastructure resource"
+            )
+        )
+
+    assert "sizing_recommendation" not in result

@@ -17,10 +17,46 @@ from backend.app.services.requirements.gathering import (
     _first_missing_field,
     gather_requirements,
 )
+from backend.app.services.ai.resource_sizing import (
+    recommend_resource_sizing,
+)
 
 
 logger = logging.getLogger(__name__)
 
+def _include_sizing_recommendation(
+    result: dict[str, Any],
+    user_message: str,
+) -> dict[str, Any]:
+    """Attach an indicative sizing recommendation without changing requirements."""
+
+    requirements = result.get("requirements", {})
+
+    # Do not recommend over values already supplied by the user.
+    if (
+        requirements.get("vcpus") is not None
+        or requirements.get("memory_gb") is not None
+    ):
+        return result
+
+    recommendation = recommend_resource_sizing(user_message)
+
+    if recommendation is None:
+        return result
+
+    result["sizing_recommendation"] = recommendation
+
+    if result.get("status") == "needs_clarification":
+        question = result.get("question") or ""
+
+        result["question"] = (
+            f"{question}\n\n"
+            f"Sizing recommendation: {recommendation['vcpus']} vCPUs "
+            f"and {recommendation['memory_gb']} GB RAM. "
+            "You can provide these values when asked about CPU and memory."
+        )
+
+    return result
 
 async def gather_requirements_with_ai(
     message: str,
@@ -46,17 +82,20 @@ async def gather_requirements_with_ai(
 
         merged_model = InfrastructureRequirements.model_validate(merged)
 
-        return await gather_requirements_from_collected_requirements(
+        result = await gather_requirements_from_collected_requirements(
             merged_model,
             message,
         )
+
+        return _include_sizing_recommendation(result, message)
 
     except Exception:
         logger.warning(
             "AI requirement extraction failed; using deterministic fallback.",
             exc_info=True,
         )
-        return gather_requirements(message, current)
+        result = gather_requirements(message, current)
+        return _include_sizing_recommendation(result, message)
 
 
 async def gather_requirements_from_collected_requirements(
