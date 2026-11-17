@@ -33,6 +33,7 @@ from backend.app.models.approval import (
     ApprovalAuditEvent,
 )
 from backend.app.models.conversation import Conversation
+from backend.app.models.messages import Message
 from backend.app.models.infrastructure_operation import (
     InfrastructureOperation,
 )
@@ -205,6 +206,9 @@ def test_worker_validates_plan_artifact_fingerprint(
     artifact_path, artifact_checksum = save_plan_artifact(
         b"valid-test-terraform-plan"
     )
+    print("TEST ARTIFACT PATH:", artifact_path)
+    print("TEST ARTIFACT EXISTS:", Path(artifact_path).is_file())
+    print("ARTIFACT DIRECTORY:", os.getenv("AIOPS_TERRAFORM_ARTIFACT_DIR"))
 
     provider_lock_path, provider_lock_checksum = (
         save_provider_lock_artifact(
@@ -356,6 +360,8 @@ def test_worker_validates_plan_artifact_fingerprint(
         "initialize_terraform_apply_workspace",
         fake_initialize_workspace,
     )
+
+    monkeypatch.setenv("AIOPS_TERRAFORM_APPLY_ENABLED", "false")
 
     try:
         # First execution: worker claims the queued operation.
@@ -2752,6 +2758,14 @@ def test_cleanup_scan_excludes_resource_with_active_operation(worker_db):
     ),
     [
         (None, False, "succeeded", None, True),
+                (None, False, "succeeded", None, True),
+        (
+            None,
+            True,
+            "failed",
+            None,
+            False,
+        ),
         (
             "PROCESS_FAILED_TEST",
             False,
@@ -3023,8 +3037,17 @@ def test_provision_worker_executes_saved_plan_when_feature_flag_enabled(
 
         if apply_error_code is None:
             assert result["deployment_succeeded"] is True
-            assert result["state_reconciled"] is True
+            assert result["state_reconciled"] is expected_reconciled
             assert calls["reconciled_request_id"] == request_id
+
+            if reconciliation_fails:
+                assert result["status"] == "failed"
+                assert (
+                    result["error_code"]
+                    == "STATE_RECONCILIATION_REQUIRED"
+                )
+                assert result["terraform_apply_executed"] is True
+                assert result["state_reconciliation_required"] is True
         else:
             assert result["error_code"] == apply_error_code
             assert result["terraform_apply_attempted"] is True
@@ -3060,7 +3083,22 @@ def test_provision_worker_executes_saved_plan_when_feature_flag_enabled(
             if apply_error_code is None:
                 assert saved_operation.result_summary[
                     "state_reconciled"
+                ] is expected_reconciled
+
+                assert saved_operation.result_summary[
+                    "deployment_succeeded"
                 ] is True
+
+                if reconciliation_fails:
+                    assert saved_operation.error_code == (
+                        "STATE_RECONCILIATION_REQUIRED"
+                    )
+                    assert saved_operation.result_summary[
+                        "terraform_apply_executed"
+                    ] is True
+                    assert saved_operation.result_summary[
+                        "state_reconciliation_required"
+                    ] is True
             else:
                 assert saved_operation.result_summary[
                     "recovery_required"
@@ -3086,6 +3124,156 @@ def test_provision_worker_executes_saved_plan_when_feature_flag_enabled(
         delete_provider_lock_artifact(provider_lock_path)
         delete_configuration_artifact(configuration_path)
 
+def test_provision_worker_blocks_when_previous_operation_requires_recovery_review(
+    worker_db,
+    monkeypatch,
+):
+    requirements = {
+        "cloud_provider": "aws",
+        "resource_type": "EC2",
+        "environment": "development",
+        "region": "ap-south-1",
+        "vcpus": 2,
+        "memory_gb": 4,
+        "public_access": False,
+    }
+
+    db = worker_db()
+
+    try:
+        user = User(
+            email="recovery-guard-worker@example.com",
+            password_hash="test-hash",
+            role="user",
+            is_active=True,
+        )
+        db.add(user)
+        db.flush()
+
+        conversation = Conversation(
+            user_id=user.id,
+            session_id="recovery-guard-worker-session",
+            title="Recovery guard worker test",
+        )
+        db.add(conversation)
+        db.flush()
+
+        request = InfrastructureRequest(
+            conversation_id=conversation.id,
+            status="complete",
+            requirements=requirements,
+        )
+        db.add(request)
+        db.flush()
+
+        # Previous failed operation with unresolved recovery.
+        previous_plan = TerraformPlanRecord(
+            infrastructure_request_id=request.id,
+            requester_id=user.id,
+            status="succeeded",
+            plan_fingerprint="a" * 64,
+            specification_fingerprint="b" * 64,
+            plan_summary={},
+        )
+        db.add(previous_plan)
+        db.flush()
+
+        previous_approval = ApprovalRequest(
+            infrastructure_request_id=request.id,
+            terraform_plan_record_id=previous_plan.id,
+            requester_id=user.id,
+            status="approved",
+            plan_summary={},
+            plan_fingerprint="a" * 64,
+        )
+        db.add(previous_approval)
+        db.flush()
+
+        previous_operation = InfrastructureOperation(
+            infrastructure_request_id=request.id,
+            terraform_plan_record_id=previous_plan.id,
+            approval_request_id=previous_approval.id,
+            requester_id=user.id,
+            operation="provision",
+            status="failed",
+            error_code="PROCESS_FAILED_PERMISSION",
+            result_summary={
+                "recovery_required": True,
+                "recovery_status": "MANUAL_REVIEW_REQUIRED",
+            },
+        )
+        db.add(previous_operation)
+
+        # New operation with a different approval.
+        new_plan = TerraformPlanRecord(
+            infrastructure_request_id=request.id,
+            requester_id=user.id,
+            status="succeeded",
+            plan_fingerprint="c" * 64,
+            specification_fingerprint="d" * 64,
+            plan_summary={},
+        )
+        db.add(new_plan)
+        db.flush()
+
+        new_approval = ApprovalRequest(
+            infrastructure_request_id=request.id,
+            terraform_plan_record_id=new_plan.id,
+            requester_id=user.id,
+            status="approved",
+            plan_summary={},
+            plan_fingerprint="c" * 64,
+        )
+        db.add(new_approval)
+        db.flush()
+
+        operation = InfrastructureOperation(
+            infrastructure_request_id=request.id,
+            terraform_plan_record_id=new_plan.id,
+            approval_request_id=new_approval.id,
+            requester_id=user.id,
+            operation="provision",
+            status="queued",
+        )
+        db.add(operation)
+        db.commit()
+
+        operation_id = operation.id
+
+    finally:
+        db.close()
+
+    def must_not_initialize(*args, **kwargs):
+        pytest.fail(
+            "Terraform must not initialize while recovery review is required."
+        )
+
+    monkeypatch.setattr(
+        tasks,
+        "initialize_terraform_apply_workspace",
+        must_not_initialize,
+    )
+
+    result = tasks.execute_provision_operation.run(operation_id)
+
+    assert result["status"] == "blocked"
+    assert result["error_code"] == "RECOVERY_REVIEW_REQUIRED"
+    assert result["recovery_required"] is True
+    assert result["terraform_apply_attempted"] is False
+    assert result["terraform_apply_executed"] is False
+
+    verification_db = worker_db()
+    try:
+        saved_operation = verification_db.get(
+            InfrastructureOperation,
+            operation_id,
+        )
+
+        assert saved_operation.status == "blocked"
+        assert saved_operation.error_code == "RECOVERY_REVIEW_REQUIRED"
+    finally:
+        verification_db.close()
+
 @pytest.mark.parametrize(
     (
         "destroy_error_code",
@@ -3096,6 +3284,13 @@ def test_provision_worker_executes_saved_plan_when_feature_flag_enabled(
     ),
     [
         (None, False, "succeeded", None, True),
+        (
+            None,
+            True,
+            "failed",
+            None,
+            False,
+        ),
         (
             "PROCESS_FAILED_TEST",
             False,
@@ -3305,7 +3500,16 @@ def test_deprovision_worker_executes_saved_destroy_plan_when_feature_flag_enable
 
         if destroy_error_code is None:
             assert result["terraform_destroy_executed"] is True
-            assert result["state_reconciled"] is True
+            assert result["state_reconciled"] is expected_reconciled
+
+            if reconciliation_fails:
+                assert result["status"] == "failed"
+                assert (
+                    result["error_code"]
+                    == "STATE_RECONCILIATION_REQUIRED"
+                )
+                assert result["deployment_succeeded"] is True
+                assert result["state_reconciliation_required"] is True
         else:
             assert result["terraform_destroy_executed"] is False
             assert result["terraform_destroy_attempted"] is True

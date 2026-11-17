@@ -78,8 +78,22 @@ export default function InfrastructureOperationsPanel({
   const [auditError, setAuditError] = useState("");
   const [healthError, setHealthError] = useState("");
 
-  const loadOperations = useCallback(async () => {
-    setLoading(true);
+  // Prefer the current chat request. After a page refresh, fall back
+  // to the latest successful provisioning request from operation history.
+  const healthRequestId =
+    infrastructureRequestId ??
+    operations.find(
+      (operation) =>
+        operation.operation.toLowerCase() === "provision" &&
+        operation.status.toLowerCase() === "succeeded",
+    )?.infrastructure_request_id ??
+    null;
+
+  const loadOperations = useCallback(async (showLoading = true) => {
+    if (showLoading) {
+      setLoading(true);
+    }
+
     setError("");
 
     try {
@@ -88,7 +102,9 @@ export default function InfrastructureOperationsPanel({
     } catch {
       setError("Unable to load infrastructure operations.");
     } finally {
-      setLoading(false);
+      if (showLoading) {
+        setLoading(false);
+      }
     }
   }, []);
 
@@ -109,7 +125,7 @@ export default function InfrastructureOperationsPanel({
   }, []);
 
   const loadResourceHealth = useCallback(async () => {
-    if (infrastructureRequestId === null) {
+    if (healthRequestId === null) {
       setResourceHealth(null);
       setHealthError("");
       return;
@@ -120,7 +136,7 @@ export default function InfrastructureOperationsPanel({
 
     try {
       const result = await getInfrastructureResourceHealth(
-        infrastructureRequestId,
+        healthRequestId,
       );
       setResourceHealth(result);
     } catch {
@@ -129,15 +145,27 @@ export default function InfrastructureOperationsPanel({
     } finally {
       setHealthLoading(false);
     }
-  }, [infrastructureRequestId]);
+  }, [healthRequestId]);
 
+  // Initial operations load.
   useEffect(() => {
     void loadOperations();
   }, [loadOperations]);
 
+  // Load health whenever the selected or fallback request changes.
   useEffect(() => {
     void loadResourceHealth();
   }, [loadResourceHealth]);
+
+  // Automatically refresh operations and EC2 health every 30 seconds.
+  useEffect(() => {
+    const intervalId = window.setInterval(() => {
+      void loadOperations(false);
+      void loadResourceHealth();
+    }, 30000);
+
+    return () => window.clearInterval(intervalId);
+  }, [loadOperations, loadResourceHealth]);
 
   async function handleAudit(operationId: number) {
     if (selectedOperationId === operationId) {
@@ -159,15 +187,15 @@ export default function InfrastructureOperationsPanel({
 
   return (
     <Card
-        sx={{
-          borderRadius: 3,
-          border: "1px solid",
-          borderColor: "divider",
-          boxShadow: "0 4px 18px rgba(15, 23, 42, 0.04)",
-        }}
-      >
+      sx={{
+        borderRadius: 3,
+        border: "1px solid",
+        borderColor: "divider",
+        boxShadow: "0 4px 18px rgba(15, 23, 42, 0.04)",
+      }}
+    >
       <CardContent sx={{ p: 3 }}>
-        {infrastructureRequestId !== null && (
+        {healthRequestId !== null && (
           <Box
             sx={{
               mb: 3,
@@ -180,7 +208,12 @@ export default function InfrastructureOperationsPanel({
           >
             <Stack
               direction="row"
-              sx={{ justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 1 }}
+              sx={{
+                justifyContent: "space-between",
+                alignItems: "center",
+                flexWrap: "wrap",
+                gap: 1,
+              }}
             >
               <Box>
                 <Typography variant="h6" sx={{ fontWeight: 700 }}>
@@ -232,7 +265,12 @@ export default function InfrastructureOperationsPanel({
                   >
                     <Stack
                       direction="row"
-                      sx={{ justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 1 }}
+                      sx={{
+                        justifyContent: "space-between",
+                        alignItems: "center",
+                        flexWrap: "wrap",
+                        gap: 1,
+                      }}
                     >
                       <Typography sx={{ fontWeight: 700 }}>
                         {instance.instance_id}

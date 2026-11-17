@@ -581,6 +581,359 @@ def test_provision_rejects_deprovision_plan(
     finally:
         db.close()
 
+
+def test_provision_blocks_when_previous_operation_requires_recovery_review(
+    client,
+    setup_data,
+    monkeypatch,
+):
+    request_id = setup_data["request_id"]
+    requester_id = setup_data["requester_id"]
+
+    requirements = {
+        "cloud_provider": "aws",
+        "resource_type": "ec2",
+        "environment": "development",
+        "region": "ap-south-1",
+        "vcpus": 2,
+        "memory_gb": 4,
+        "public_access": False,
+        "operating_system": "Amazon Linux 2023",
+    }
+
+    specification = (
+        operations_api.ValidatedInfrastructureSpecification
+        .model_validate(requirements)
+    )
+
+    checksum = "a" * 64
+    specification_fingerprint = (
+        operations_api.fingerprint_specification(specification)
+    )
+
+    db = TestingSessionLocal()
+
+    try:
+        infrastructure_request = db.get(
+            InfrastructureRequest,
+            request_id,
+        )
+        infrastructure_request.requirements = requirements
+
+        # Create an earlier plan and approval.
+        previous_plan = TerraformPlanRecord(
+            infrastructure_request_id=request_id,
+            requester_id=requester_id,
+            operation="provision",
+            status="succeeded",
+            plan_fingerprint=checksum,
+            specification_fingerprint=specification_fingerprint,
+            plan_summary={},
+        )
+        db.add(previous_plan)
+        db.flush()
+
+        previous_approval = ApprovalRequest(
+            infrastructure_request_id=request_id,
+            terraform_plan_record_id=previous_plan.id,
+            requester_id=requester_id,
+            status="approved",
+            plan_summary={},
+            plan_fingerprint=checksum,
+        )
+        db.add(previous_approval)
+        db.flush()
+
+        previous_operation = InfrastructureOperation(
+            infrastructure_request_id=request_id,
+            terraform_plan_record_id=previous_plan.id,
+            approval_request_id=previous_approval.id,
+            requester_id=requester_id,
+            operation="provision",
+            status="failed",
+            error_code="PROCESS_FAILED_PERMISSION",
+            result_summary={
+                "recovery_required": True,
+                "recovery_status": "MANUAL_REVIEW_REQUIRED",
+            },
+        )
+        db.add(previous_operation)
+
+        # Create a different, newly approved plan.
+        new_plan = TerraformPlanRecord(
+            infrastructure_request_id=request_id,
+            requester_id=requester_id,
+            operation="provision",
+            status="succeeded",
+            plan_fingerprint=checksum,
+            specification_fingerprint=specification_fingerprint,
+            artifact_path="test-plan.tfplan",
+            artifact_sha256=checksum,
+            plan_summary={},
+        )
+        db.add(new_plan)
+        db.flush()
+
+        new_approval = ApprovalRequest(
+            infrastructure_request_id=request_id,
+            terraform_plan_record_id=new_plan.id,
+            requester_id=requester_id,
+            status="approved",
+            plan_summary={},
+            plan_fingerprint=checksum,
+        )
+        db.add(new_approval)
+        db.flush()
+
+        for stage in ("technical", "cost", "security"):
+            db.add(
+                ApprovalStageReview(
+                    approval_request_id=new_approval.id,
+                    stage=stage,
+                    status="approved",
+                )
+            )
+
+        new_approval_id = new_approval.id
+        db.commit()
+
+    finally:
+        db.close()
+
+    monkeypatch.setattr(
+        operations_api,
+        "load_plan_artifact",
+        lambda *args, **kwargs: b"test-plan",
+    )
+
+    response = client.post(
+        "/infrastructure-operations/provision",
+        headers=setup_data["requester_headers"],
+        json={"approval_request_id": new_approval_id},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "Provisioning is blocked because an earlier infrastructure "
+        "operation requires manual recovery review."
+    )
+
+    # Confirm the new approval did not create another operation.
+    db = TestingSessionLocal()
+    try:
+        new_operation = db.query(InfrastructureOperation).filter_by(
+            approval_request_id=new_approval_id,
+            operation="provision",
+        ).first()
+
+        assert new_operation is None
+    finally:
+        db.close()
+
+
+def test_admin_can_resolve_recovery_with_audited_evidence(
+    client,
+    setup_data,
+):
+    request_id = setup_data["request_id"]
+    requester_id = setup_data["requester_id"]
+
+    db = TestingSessionLocal()
+
+    try:
+        plan = TerraformPlanRecord(
+            infrastructure_request_id=request_id,
+            requester_id=requester_id,
+            status="succeeded",
+            plan_fingerprint="a" * 64,
+            specification_fingerprint="b" * 64,
+            plan_summary={},
+        )
+        db.add(plan)
+        db.flush()
+
+        approval = ApprovalRequest(
+            infrastructure_request_id=request_id,
+            terraform_plan_record_id=plan.id,
+            requester_id=requester_id,
+            status="approved",
+            plan_summary={},
+            plan_fingerprint="a" * 64,
+        )
+        db.add(approval)
+        db.flush()
+
+        operation = InfrastructureOperation(
+            infrastructure_request_id=request_id,
+            terraform_plan_record_id=plan.id,
+            approval_request_id=approval.id,
+            requester_id=requester_id,
+            operation="provision",
+            status="failed",
+            error_code="WORKER_STALE_OPERATION",
+            result_summary={
+                "manual_review_required": True,
+                "recovery_required": False,
+            },
+        )
+        db.add(operation)
+        db.commit()
+
+        operation_id = operation.id
+
+    finally:
+        db.close()
+
+    payload = {
+        "decision": "resolved",
+        "verification_scope": "no_changes_confirmed",
+        "evidence": (
+            "CloudTrail and AWS resource inspection confirmed "
+            "that this operation did not create infrastructure."
+        ),
+        "comments": (
+            "Reviewed execution history and confirmed no changes."
+        ),
+    }
+
+    # Requester cannot resolve their own operation.
+    requester_response = client.post(
+        f"/infrastructure-operations/{operation_id}/resolve-recovery",
+        headers=setup_data["requester_headers"],
+        json=payload,
+    )
+
+    assert requester_response.status_code == 403
+
+    # Admin reviewer can resolve with documented evidence.
+    admin_response = client.post(
+        f"/infrastructure-operations/{operation_id}/resolve-recovery",
+        headers=setup_data["other_user_headers"],
+        json=payload,
+    )
+
+    assert admin_response.status_code == 200
+    assert admin_response.json()["recovery_review_status"] == "resolved"
+
+    db = TestingSessionLocal()
+
+    try:
+        saved_operation = db.get(
+            InfrastructureOperation,
+            operation_id,
+        )
+
+        assert saved_operation.status == "failed"
+        assert saved_operation.result_summary[
+            "manual_review_required"
+        ] is True
+
+        assert (
+            operations_api.has_unresolved_recovery_operation(
+                db,
+                request_id,
+            )
+            is False
+        )
+
+        event = db.query(InfrastructureOperationEvent).filter_by(
+            operation_id=operation_id,
+            event_type="recovery_review_resolved",
+        ).one()
+
+        assert event.actor_type == "user"
+        assert event.actor_id is not None
+        assert event.new_status == "resolved"
+        assert event.event_metadata["verification_scope"] == (
+            "no_changes_confirmed"
+        )
+
+    finally:
+        db.close()
+
+
+def test_recovery_resolution_rejects_no_changes_scope_when_recovery_required(
+    client,
+    setup_data,
+):
+    db = TestingSessionLocal()
+
+    try:
+        request_id = setup_data["request_id"]
+        requester_id = setup_data["requester_id"]
+
+        plan = TerraformPlanRecord(
+            infrastructure_request_id=request_id,
+            requester_id=requester_id,
+            status="succeeded",
+            plan_fingerprint="a" * 64,
+            specification_fingerprint="b" * 64,
+            plan_summary={},
+        )
+        db.add(plan)
+        db.flush()
+
+        approval = ApprovalRequest(
+            infrastructure_request_id=request_id,
+            terraform_plan_record_id=plan.id,
+            requester_id=requester_id,
+            status="approved",
+            plan_summary={},
+            plan_fingerprint="a" * 64,
+        )
+        db.add(approval)
+        db.flush()
+
+        operation = InfrastructureOperation(
+            infrastructure_request_id=request_id,
+            terraform_plan_record_id=plan.id,
+            approval_request_id=approval.id,
+            requester_id=requester_id,
+            operation="provision",
+            status="failed",
+            error_code="PROCESS_FAILED_PERMISSION",
+            result_summary={
+                "recovery_required": True,
+                "recovery_status": "MANUAL_REVIEW_REQUIRED",
+            },
+        )
+        db.add(operation)
+        db.commit()
+        operation_id = operation.id
+
+    finally:
+        db.close()
+
+    response = client.post(
+        f"/infrastructure-operations/{operation_id}/resolve-recovery",
+        headers=setup_data["other_user_headers"],
+        json={
+            "decision": "resolved",
+            "verification_scope": "no_changes_confirmed",
+            "evidence": (
+                "Reviewed CloudTrail and inspected AWS resources "
+                "for the failed operation."
+            ),
+            "comments": "Attempted recovery resolution with wrong scope.",
+        },
+    )
+
+    assert response.status_code == 422
+
+    db = TestingSessionLocal()
+    try:
+        event = db.query(InfrastructureOperationEvent).filter_by(
+            operation_id=operation_id,
+            event_type="recovery_review_resolved",
+        ).first()
+
+        assert event is None
+
+        operation = db.get(InfrastructureOperation, operation_id)
+        assert operation.result_summary["recovery_required"] is True
+    finally:
+        db.close()
+
 def test_provision_returns_409_for_database_uniqueness_conflict(
     client, setup_data, monkeypatch
 ):

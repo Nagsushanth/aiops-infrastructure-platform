@@ -314,3 +314,30 @@ def test_unknown_workload_does_not_receive_sizing_recommendation():
         )
 
     assert "sizing_recommendation" not in result
+
+def test_ai_mumbai_region_is_normalized_for_aws():
+    extracted = {
+        "cloud_provider": "aws",
+        "resource_type": "EC2",
+        "environment": "development",
+        "region": "mumbai",
+        "vcpus": 2,
+        "memory_gb": 4,
+        "public_access": False,
+        "operating_system": "Linux",
+    }
+
+    with patch(
+        "backend.app.services.ai.requirements.extract_requirements_with_ai",
+        new_callable=AsyncMock,
+        return_value=extracted,
+    ):
+        result = asyncio.run(
+            gather_requirements_with_ai(
+                "Create a private development instance"
+            )
+        )
+
+    assert result["status"] == "complete"
+    assert result["requirements"]["cloud_provider"] == "aws"
+    assert result["requirements"]["region"] == "ap-south-1"

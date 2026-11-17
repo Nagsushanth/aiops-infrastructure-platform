@@ -644,6 +644,28 @@ def test_controlled_process_captures_output():
     assert result.returncode == 0
     assert "controlled-success" in result.stdout
 
+def test_controlled_process_classifies_permission_failure():
+    with pytest.raises(TerraformExecutionError) as exc:
+        execution_module._run_controlled_process(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import sys; "
+                    "print('An error occurred (UnauthorizedOperation) "
+                    "when calling the RunInstances operation: "
+                    "not authorized', file=sys.stderr); "
+                    "sys.exit(1)"
+                ),
+            ],
+            cwd=Path.cwd(),
+            timeout_seconds=5,
+            env=dict(os.environ),
+            lease_renewal_callback=lambda: True,
+            lease_renewal_interval_seconds=1,
+        )
+
+    assert exc.value.code == "PROCESS_FAILED_PERMISSION"
 
 def test_controlled_process_terminates_on_timeout():
     with pytest.raises(TerraformExecutionError) as exc:
@@ -1715,3 +1737,47 @@ def test_compensating_plan_rejects_missing_lease_callback():
             env=os.environ.copy(),
             lease_renewal_callback=None,
         )
+
+def test_safe_aws_failure_details_extracts_allowlisted_details():
+    diagnostic = (
+        "An error occurred (UnauthorizedOperation) "
+        "when calling the RunInstances operation: "
+        "not authorized"
+    )
+
+    result = execution_module._safe_aws_failure_details(
+        diagnostic
+    )
+
+    assert result == (
+        "aws_error_code=UnauthorizedOperation; "
+        "aws_operation=RunInstances"
+    )
+
+
+def test_safe_aws_failure_details_rejects_unknown_operation():
+    diagnostic = (
+        "An error occurred (UnauthorizedOperation) "
+        "when calling the DeleteSomething operation: "
+        "not authorized"
+    )
+
+    result = execution_module._safe_aws_failure_details(
+        diagnostic
+    )
+
+    assert result == "aws_details=unavailable"
+
+
+def test_safe_aws_failure_details_does_not_expose_raw_diagnostic():
+    diagnostic = (
+        "An error occurred (UnauthorizedOperation) "
+        "when calling the RunInstances operation: "
+        "secret-sensitive-information"
+    )
+
+    result = execution_module._safe_aws_failure_details(
+        diagnostic
+    )
+
+    assert "secret-sensitive-information" not in result

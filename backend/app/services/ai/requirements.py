@@ -80,6 +80,15 @@ async def gather_requirements_with_ai(
             if value is not None and merged.get(field) is None:
                 merged[field] = value
 
+        # Normalize the AWS Mumbai display name after AI and
+        # deterministic requirements have been merged.
+        if (
+            merged.get("cloud_provider") == "aws"
+            and isinstance(merged.get("region"), str)
+            and merged["region"].strip().lower() == "mumbai"
+        ):
+            merged["region"] = "ap-south-1"
+
         merged_model = InfrastructureRequirements.model_validate(merged)
 
         result = await gather_requirements_from_collected_requirements(

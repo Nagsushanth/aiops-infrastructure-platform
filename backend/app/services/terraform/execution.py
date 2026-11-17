@@ -11,7 +11,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
-
+import re
 from dotenv import load_dotenv
 
 from backend.app.services.terraform.artifacts import (
@@ -226,6 +226,57 @@ def _safe_diagnostic_marker(diagnostic: str) -> str:
 
     return ", ".join(matched) if matched else "none matched"
 
+def _safe_aws_failure_details(diagnostic: str) -> str:
+    """Extract allowlisted AWS error details without exposing raw output."""
+
+    match = re.search(
+        r"\berror occurred \(([A-Za-z][A-Za-z0-9]*)\)"
+        r"\s+when calling the ([A-Za-z][A-Za-z0-9]*) operation\b",
+        diagnostic,
+        re.IGNORECASE,
+    )
+
+    if not match:
+        return "aws_details=unavailable"
+
+    error_code = match.group(1)
+    operation = match.group(2)
+
+    allowed_error_codes = {
+        "UnauthorizedOperation",
+        "AccessDenied",
+        "AccessDeniedException",
+        "AuthFailure",
+        "InvalidClientTokenId",
+        "ExpiredToken",
+        "SignatureDoesNotMatch",
+        "RequestExpired",
+        "OptInRequired",
+        "OperationNotPermitted",
+    }
+
+    allowed_operations = {
+        "RunInstances",
+        "CreateSecurityGroup",
+        "AuthorizeSecurityGroupIngress",
+        "CreateTags",
+        "DescribeInstances",
+        "DescribeVpcs",
+        "DescribeSubnets",
+        "DescribeImages",
+        "CreateVolume",
+    }
+
+    if (
+        error_code not in allowed_error_codes
+        or operation not in allowed_operations
+    ):
+        return "aws_details=unavailable"
+
+    return (
+        f"aws_error_code={error_code}; "
+        f"aws_operation={operation}"
+    )
 
 def _run(
     command: list[str],
@@ -451,10 +502,13 @@ def _run_controlled_process(
         diagnostic = f"{result.stdout}\n{result.stderr}"
         category = _failure_category(diagnostic)
         marker = _safe_diagnostic_marker(diagnostic)
+        aws_details = _safe_aws_failure_details(diagnostic)
 
         print(
             "Controlled process failed: "
-            f"category={category}; diagnostic_marker={marker}"
+            f"category={category}; "
+            f"diagnostic_marker={marker}; "
+            f"{aws_details}"
         )
 
         raise TerraformExecutionError(

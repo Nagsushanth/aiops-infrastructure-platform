@@ -24,3 +24,6 @@ coverage/
 
 # Private chat attachments
 private_uploads/
+
+# Celery runtime schedule files
+celerybeat-schedule*

@@ -73,6 +73,10 @@ from backend.app.services.terraform.s3_state_storage import (
 from backend.app.models.infrastructure_resource import (
     InfrastructureResource,
 )
+from backend.app.models.user import User
+from backend.app.services.terraform.operation_safety import (
+    has_unresolved_recovery_operation,
+)
 
 WORKER_LEASE_MINUTES = 15
 
@@ -953,6 +957,29 @@ def execute_provision_operation(operation_id: int) -> dict:
                 "The operation ownership or record relationships are invalid.",
             )
 
+        if has_unresolved_recovery_operation(
+            db,
+            infrastructure_request.id,
+            exclude_operation_id=operation.id,
+        ):
+            return _owned_operation_result(
+                db,
+                operation_id,
+                execution_token,
+                "blocked",
+                "RECOVERY_REVIEW_REQUIRED",
+                (
+                    "Provisioning blocked because an earlier operation "
+                    "requires manual recovery review."
+                ),
+                result_summary_extra={
+                    "recovery_required": True,
+                    "recovery_status": "MANUAL_REVIEW_REQUIRED",
+                    "terraform_apply_attempted": False,
+                    "terraform_apply_executed": False,
+                },
+            )
+
         conversation = db.get(
             Conversation,
             infrastructure_request.conversation_id,
@@ -1416,7 +1443,7 @@ def execute_provision_operation(operation_id: int) -> dict:
                 db,
                 operation_id,
                 execution_token,
-                "succeeded",
+                "failed",
                 "STATE_RECONCILIATION_REQUIRED",
                 (
                     "Terraform Apply succeeded, but state and inventory "
@@ -2297,7 +2324,7 @@ def execute_deprovision_operation(operation_id: int) -> dict:
                 db,
                 operation_id,
                 execution_token,
-                "succeeded",
+                "failed",
                 "STATE_RECONCILIATION_REQUIRED",
                 (
                     "Terraform Destroy succeeded, but state and inventory "

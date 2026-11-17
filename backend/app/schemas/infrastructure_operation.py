@@ -74,3 +74,16 @@ class InfrastructureDeprovisionCreate(BaseModel):
     approval_request_id: int = Field(gt=0)
     confirm_destroy: Literal[True]
     comments: str | None = Field(default=None, max_length=5000)
+
+class InfrastructureRecoveryResolution(BaseModel):
+    """Admin decision to resolve a manual infrastructure recovery review."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    decision: Literal["resolved"]
+    verification_scope: Literal[
+        "no_changes_confirmed",
+        "state_and_cloud_reconciled",
+    ]
+    evidence: str = Field(min_length=20, max_length=4000)
+    comments: str = Field(min_length=10, max_length=2000)

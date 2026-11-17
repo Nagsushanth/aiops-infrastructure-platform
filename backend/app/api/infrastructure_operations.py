@@ -9,7 +9,10 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from backend.app.core.auth_dependencies import CurrentUser
+from backend.app.core.auth_dependencies import (
+    AdminUser,
+    CurrentUser,
+)
 from backend.app.core.dependencies import get_db
 
 from backend.app.models.approval import (
@@ -37,7 +40,8 @@ from backend.app.schemas.infrastructure_operation import (
     InfrastructureOperationResponse,
     TerraformStateVersionResponse,
     TerraformStateVersionSyncResponse,
-    InfrastructureDeprovisionCreate
+    InfrastructureDeprovisionCreate,
+    InfrastructureRecoveryResolution,
 )
 
 from backend.app.services.terraform.artifacts import (
@@ -69,6 +73,9 @@ from backend.app.services.terraform.resource_health import (
     ResourceHealthError,
     create_ec2_client,
     get_ec2_resource_health,
+)
+from backend.app.services.terraform.operation_safety import (
+    has_unresolved_recovery_operation,
 )
 
 router = APIRouter(
@@ -356,6 +363,17 @@ def create_provision_operation(
         current_user.id,
         db,
     )
+    if has_unresolved_recovery_operation(
+        db,
+        infrastructure_request.id,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Provisioning is blocked because an earlier infrastructure "
+                "operation requires manual recovery review."
+            ),
+        )
 
     # Prevent reusing the same approval for multiple provision operations.
     existing_operation = db.scalar(
@@ -796,6 +814,125 @@ def get_operation_audit(
     events.sort(key=audit_sort_key)
 
     return events
+
+
+@router.post("/{operation_id}/resolve-recovery")
+def resolve_operation_recovery(
+    operation_id: int,
+    payload: InfrastructureRecoveryResolution,
+    reviewer: AdminUser,
+    db: Session = Depends(get_db),
+):
+    """Record an admin decision resolving a manual recovery review."""
+
+    statement = (
+        select(InfrastructureOperation)
+        .where(InfrastructureOperation.id == operation_id)
+        .with_for_update()
+    )
+    operation = db.scalar(statement)
+
+    if operation is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Infrastructure operation not found.",
+        )
+
+    if operation.requester_id == reviewer.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You cannot review your own infrastructure operation.",
+        )
+
+    summary = operation.result_summary or {}
+
+    if not isinstance(summary, dict):
+        summary = {}
+
+    requires_review = (
+        summary.get("recovery_required") is True
+        or summary.get("manual_review_required") is True
+        or summary.get("recovery_status") == "MANUAL_REVIEW_REQUIRED"
+    )
+
+    if not requires_review:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This operation does not require manual recovery review.",
+        )
+
+    if operation.status not in {"failed", "blocked"}:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Only failed or blocked operations can be reviewed.",
+        )
+
+    existing_resolution = db.scalar(
+        select(InfrastructureOperationEvent.id).where(
+            InfrastructureOperationEvent.operation_id == operation.id,
+            InfrastructureOperationEvent.event_type
+            == "recovery_review_resolved",
+        )
+    )
+
+    if existing_resolution is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Recovery review has already been resolved.",
+        )
+
+    if (
+        summary.get("recovery_required") is True
+        and payload.verification_scope != "state_and_cloud_reconciled"
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "Operations requiring Terraform recovery must have "
+                "their cloud resources and state reconciled."
+            ),
+        )
+
+    evidence = payload.evidence.strip()
+    comments = payload.comments.strip()
+
+    if len(evidence) < 20 or len(comments) < 10:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Detailed evidence and review comments are required.",
+        )
+
+    resolved_at = datetime.now(timezone.utc)
+
+    db.add(
+        InfrastructureOperationEvent(
+            operation_id=operation.id,
+            actor_id=reviewer.id,
+            actor_type="user",
+            event_type="recovery_review_resolved",
+            previous_status=operation.status,
+            new_status="resolved",
+            comments=comments,
+            event_metadata={
+                "source": "recovery_review_api",
+                "decision": payload.decision,
+                "verification_scope": payload.verification_scope,
+                "evidence": evidence,
+                "reviewer_id": reviewer.id,
+                "resolved_at": resolved_at.isoformat(),
+            },
+        )
+    )
+
+    db.commit()
+
+    return {
+        "operation_id": operation.id,
+        "status": operation.status,
+        "recovery_review_status": "resolved",
+        "reviewer_id": reviewer.id,
+        "resolved_at": resolved_at,
+    }
 
 @router.post(
     "/requests/{infrastructure_request_id}/state-versions/sync",
