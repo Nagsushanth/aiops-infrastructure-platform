@@ -171,6 +171,13 @@ export async function loginUser(
 export async function getCurrentUser(): Promise<AuthUser> {
   return apiRequest<AuthUser>("/auth/me");
 }
+export async function getLatestInfrastructureRequest(): Promise<{
+  infrastructure_request_id: number | null;
+}> {
+  return apiRequest<{
+    infrastructure_request_id: number | null;
+  }>("/infrastructure-operations/latest-request");
+}
 
 export async function createConversation(
   sessionId: string,
@@ -533,6 +540,33 @@ export async function generateTrustedTerraformPlan(
   );
 }
 
+
+export async function generateTrustedTerraformDestroyPlan(
+  infrastructureRequestId: number,
+): Promise<TrustedTerraformPlanResponse> {
+  return apiRequest<TrustedTerraformPlanResponse>(
+    `/terraform/requests/${infrastructureRequestId}/destroy-plan`,
+    { method: "POST" },
+  );
+}
+
+export async function createDeprovisionOperation(
+  approvalRequestId: number,
+  comments?: string,
+): Promise<InfrastructureOperationResponse> {
+  return apiRequest<InfrastructureOperationResponse>(
+    "/infrastructure-operations/deprovision",
+    {
+      method: "POST",
+      body: JSON.stringify({
+        approval_request_id: approvalRequestId,
+        confirm_destroy: true,
+        comments: comments ?? "User confirmed infrastructure destruction.",
+      }),
+    },
+  );
+}
+
 export async function createApproval(
   infrastructureRequestId: number,
   terraformPlanRecordId: number,
@@ -564,6 +598,41 @@ export async function decideApprovalStage(
     {
       method: "POST",
       body: JSON.stringify(payload),
+    },
+  );
+}
+
+
+export interface ApprovalDecision {
+  decision: "approved" | "rejected";
+  comments: string | null;
+}
+
+export async function decideApproval(
+  approvalId: number,
+  payload: ApprovalDecision,
+): Promise<ApprovalResponse> {
+  return apiRequest<ApprovalResponse>(
+    `/approvals/${approvalId}/decision`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
+export async function createProvisionOperation(
+  approvalRequestId: number,
+  comments?: string,
+): Promise<InfrastructureOperationResponse> {
+  return apiRequest<InfrastructureOperationResponse>(
+    "/infrastructure-operations/provision",
+    {
+      method: "POST",
+      body: JSON.stringify({
+        approval_request_id: approvalRequestId,
+        comments: comments ?? null,
+      }),
     },
   );
 }

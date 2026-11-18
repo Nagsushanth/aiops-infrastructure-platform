@@ -1430,6 +1430,8 @@ def test_deprovision_worker_completes_preflight_without_destroy(
     monkeypatch,
     tmp_path,
 ):
+    monkeypatch.setenv("AIOPS_TERRAFORM_DESTROY_ENABLED", "false")
+
     db = worker_db()
 
     try:
@@ -2303,6 +2305,7 @@ def test_deprovision_worker_fails_when_terraform_initialization_fails(
     monkeypatch,
     tmp_path,
 ):
+    monkeypatch.setenv("AIOPS_TERRAFORM_DESTROY_ENABLED", "false")
     with worker_db() as db:
         (
             operation_id,

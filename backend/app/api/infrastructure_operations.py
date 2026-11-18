@@ -117,6 +117,32 @@ def get_owned_infrastructure_request(
 
     return infrastructure_request
 
+@router.get("/latest-request")
+def get_latest_infrastructure_request(
+    current_user: CurrentUser,
+    db: Session = Depends(get_db),
+) -> dict[str, int | None]:
+    """Return the latest infrastructure request owned by the current user."""
+
+    request_record = db.scalar(
+        select(InfrastructureRequest)
+        .join(
+            Conversation,
+            InfrastructureRequest.conversation_id == Conversation.id,
+        )
+        .where(Conversation.user_id == current_user.id)
+        .order_by(
+            InfrastructureRequest.updated_at.desc(),
+            InfrastructureRequest.id.desc(),
+        )
+        .limit(1)
+    )
+
+    return {
+        "infrastructure_request_id": (
+            request_record.id if request_record else None
+        )
+    }
 
 def fingerprint_specification(
     specification: ValidatedInfrastructureSpecification,

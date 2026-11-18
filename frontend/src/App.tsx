@@ -33,6 +33,7 @@ import {
   clearAccessToken,
   getAccessToken,
   getCurrentUser,
+  getLatestInfrastructureRequest,
   type AuthUser,
 } from "./api";
 
@@ -67,6 +68,10 @@ export default function App() {
     try {
       const currentUser = await getCurrentUser();
       setUser(currentUser);
+      const latestRequest = await getLatestInfrastructureRequest();
+      setInfrastructureRequestId(
+        latestRequest.infrastructure_request_id,
+      );
     } catch {
       clearAccessToken();
       setUser(null);

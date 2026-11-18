@@ -27,6 +27,12 @@ import {
   getCurrentUser,
   getApprovalStages,
   decideApprovalStage,
+  createProvisionOperation,
+  generateTrustedTerraformDestroyPlan,
+  createApproval,
+  createDeprovisionOperation,
+  getInfrastructureOperations,
+  type InfrastructureOperationResponse,
   type ApprovalResponse,
   type ApprovalStage,
   type ApprovalStageReviewResponse,
@@ -95,6 +101,18 @@ function StatusChip({ status }: { status: string }) {
       sx={{ textTransform: "capitalize", fontWeight: 600 }}
     />
   );
+}
+
+function isDestroyPlanApproval(approval: ApprovalResponse): boolean {
+  const counts = approval.plan_summary.resource_summary ?? {};
+  const deletes = Number(counts.delete ?? 0);
+  const creates = Number(counts.create ?? 0);
+  const updates = Number(counts.update ?? 0);
+  const replaces = Number(counts.replace ?? 0);
+
+  // A trusted destroy plan contains deletions only. Do not classify a normal
+  // change plan that happens to replace or delete one resource as a destroy.
+  return deletes > 0 && creates === 0 && updates === 0 && replaces === 0;
 }
 
 function SectionTitle({
@@ -447,19 +465,54 @@ export default function ApprovalReviewPanel() {
   const [workingId, setWorkingId] = useState<number | null>(null);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [applyingId, setApplyingId] = useState<number | null>(null);
+  const [destroyPlanRequestId, setDestroyPlanRequestId] = useState<number | null>(null);
+  const [destroyingApprovalId, setDestroyingApprovalId] = useState<number | null>(null);
+  const [destroyConfirmations, setDestroyConfirmations] = useState<Record<number, boolean>>({});
+  const [allOperations, setAllOperations] = useState<InfrastructureOperationResponse[]>([]);
+  const [operations, setOperations] = useState<
+    Record<number, { id: number; status: string; operation: string }>
+  >({});
 
   const loadApprovals = useCallback(async () => {
     setLoading(true);
     setError("");
 
     try {
-      const [currentUser, result] = await Promise.all([
+      const [currentUser, result, existingOperations] = await Promise.all([
         getCurrentUser(),
         apiRequest<ApprovalResponse[]>("/approvals"),
+        getInfrastructureOperations(),
       ]);
 
       setUser(currentUser);
       setApprovals(result);
+      setAllOperations(existingOperations);
+
+      // Index the latest known operation by approval ID so already-applied
+      // requests never display another Apply button after refresh/login.
+      const operationEntries = new Map<
+        number,
+        InfrastructureOperationResponse
+      >();
+      for (const operation of existingOperations) {
+        const previous = operationEntries.get(operation.approval_request_id);
+        if (
+          !previous ||
+          new Date(operation.created_at).getTime() >
+            new Date(previous.created_at).getTime()
+        ) {
+          operationEntries.set(operation.approval_request_id, operation);
+        }
+      }
+      setOperations(
+        Object.fromEntries(
+          Array.from(operationEntries.entries()).map(([approvalId, operation]) => [
+            approvalId,
+            { id: operation.id, status: operation.status, operation:operation.operation},
+          ]),
+        ),
+      );
 
       const stageEntries = await Promise.all(
         result.map(async (approval) => {
@@ -608,6 +661,106 @@ export default function ApprovalReviewPanel() {
       );
     } finally {
       setWorkingId(null);
+    }
+  }
+
+  async function applyInfrastructure(approvalId: number) {
+    if (applyingId !== null || operations[approvalId]) {
+      return;
+    }
+
+    setApplyingId(approvalId);
+    setError("");
+    setNotice("");
+
+    try {
+      const operation = await createProvisionOperation(approvalId);
+      setAllOperations((previous) => [...previous, operation]);
+
+      setOperations((previous) => ({
+  ...previous,
+  [approvalId]: {
+    id: operation.id,
+    status: operation.status,
+    operation: operation.operation,
+  },
+}));
+
+      setNotice(
+        `Deployment operation #${operation.id} was created. Current status: ${operation.status}.`,
+      );
+      await loadApprovals();
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Unable to start infrastructure deployment.",
+      );
+    } finally {
+      setApplyingId(null);
+    }
+  }
+
+  async function generateDestroyApproval(requestId: number) {
+    if (destroyPlanRequestId !== null) return;
+
+    setDestroyPlanRequestId(requestId);
+    setError("");
+    setNotice("");
+
+    try {
+      const plan = await generateTrustedTerraformDestroyPlan(requestId);
+      await createApproval(requestId, plan.id);
+      setNotice(
+        `Destroy plan #${plan.id} was generated and submitted as a separate approval request.`,
+      );
+      await loadApprovals();
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Unable to generate the trusted Terraform destroy plan.",
+      );
+    } finally {
+      setDestroyPlanRequestId(null);
+    }
+  }
+
+  async function destroyInfrastructure(approvalId: number) {
+    if (
+      destroyingApprovalId !== null ||
+      destroyConfirmations[approvalId] !== true
+    ) {
+      return;
+    }
+
+    setDestroyingApprovalId(approvalId);
+    setError("");
+    setNotice("");
+
+    try {
+      const operation = await createDeprovisionOperation(approvalId);
+      setAllOperations((previous) => [...previous, operation]);
+      setOperations((previous) => ({
+        ...previous,
+        [approvalId]: {
+          id: operation.id,
+          status: operation.status,
+          operation: operation.operation,
+        },
+      }));
+      setNotice(
+        `Destroy operation #${operation.id} was created. Current status: ${operation.status}.`,
+      );
+      await loadApprovals();
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Unable to start the controlled infrastructure destroy.",
+      );
+    } finally {
+      setDestroyingApprovalId(null);
     }
   }
 
@@ -1298,6 +1451,220 @@ sx={{
                                 </Box>
                               </>
                             )}
+
+                            {isRequester &&
+                              approval.status === "approved" &&
+                              allStagesApproved &&
+                              (() => {
+                                const destroyApproval = isDestroyPlanApproval(approval);
+                                const requestOperations = allOperations.filter(
+                                  (item) =>
+                                    item.infrastructure_request_id ===
+                                    approval.infrastructure_request_id,
+                                );
+                                const provisionOperation = requestOperations
+                                  .filter((item) => item.operation === "provision")
+                                  .sort(
+                                    (a, b) =>
+                                      new Date(b.created_at).getTime() -
+                                      new Date(a.created_at).getTime(),
+                                  )[0];
+                                const destroyOperation = requestOperations
+                                  .filter((item) => item.operation === "deprovision")
+                                  .sort(
+                                    (a, b) =>
+                                      new Date(b.created_at).getTime() -
+                                      new Date(a.created_at).getTime(),
+                                  )[0];
+                                const destroyApprovalsForRequest = approvals.filter(
+                                  (item) =>
+                                    item.infrastructure_request_id ===
+                                      approval.infrastructure_request_id &&
+                                    isDestroyPlanApproval(item),
+                                );
+                                const hasDestroyApproval =
+                                  destroyApprovalsForRequest.length > 0;
+                                const destroySucceeded =
+                                  destroyOperation?.status.toLowerCase() ===
+                                  "succeeded";
+
+                                return (
+                                  <Box
+                                    sx={{
+                                      mt: 3,
+                                      p: 2.5,
+                                      border: 1,
+                                      borderColor: destroyApproval
+                                        ? "warning.main"
+                                        : "success.main",
+                                      borderRadius: 2,
+                                    }}
+                                  >
+                                    <Typography
+                                      variant="h6"
+                                      sx={{ fontWeight: 800 }}
+                                    >
+                                      {destroyApproval
+                                        ? "Infrastructure Destruction"
+                                        : "Infrastructure Deployment"}
+                                    </Typography>
+
+                                    {destroyApproval ? (
+                                      destroyOperation ? (
+                                        <Alert
+                                          severity={
+                                            destroySucceeded
+                                              ? "success"
+                                              : destroyOperation.status.toLowerCase() === "failed"
+                                                ? "error"
+                                                : "info"
+                                          }
+                                          sx={{ my: 2 }}
+                                        >
+                                          <strong>Destroy Infrastructure</strong>
+                                          {" — "}
+                                          {destroySucceeded
+                                            ? "Done"
+                                            : destroyOperation.status.toLowerCase() === "failed"
+                                              ? "Failed"
+                                              : "In Progress"}
+                                          {" (Operation #"}
+                                          {destroyOperation.id}
+                                          {")."}
+                                        </Alert>
+                                      ) : (
+                                        <>
+                                          <Alert severity="warning" sx={{ my: 2 }}>
+                                            All three review stages and final approval
+                                            are complete. Confirm explicitly before
+                                            starting Terraform destroy.
+                                          </Alert>
+                                          <FormControlLabel
+                                            control={
+                                              <Checkbox
+                                                checked={
+                                                  destroyConfirmations[approval.id] === true
+                                                }
+                                                onChange={(event) =>
+                                                  setDestroyConfirmations((previous) => ({
+                                                    ...previous,
+                                                    [approval.id]: event.target.checked,
+                                                  }))
+                                                }
+                                              />
+                                            }
+                                            label="I understand this permanently deletes the approved infrastructure resources."
+                                          />
+                                          <Button
+                                            variant="contained"
+                                            color="error"
+                                            fullWidth
+                                            sx={{ mt: 1 }}
+                                            disabled={
+                                              destroyingApprovalId !== null ||
+                                              destroyConfirmations[approval.id] !== true
+                                            }
+                                            onClick={() =>
+                                              void destroyInfrastructure(approval.id)
+                                            }
+                                          >
+                                            {destroyingApprovalId === approval.id
+                                              ? "Starting destroy..."
+                                              : "Destroy Infrastructure"}
+                                          </Button>
+                                        </>
+                                      )
+                                    ) : (
+                                      <>
+                                        {provisionOperation ? (
+                                          <Alert
+                                            severity={
+                                              provisionOperation.status.toLowerCase() === "succeeded"
+                                                ? "success"
+                                                : provisionOperation.status.toLowerCase() === "failed"
+                                                  ? "error"
+                                                  : "info"
+                                            }
+                                            sx={{ my: 2 }}
+                                          >
+                                            <strong>Apply Infrastructure</strong>
+                                            {" — "}
+                                            {provisionOperation.status.toLowerCase() === "succeeded"
+                                              ? "Done"
+                                              : provisionOperation.status.toLowerCase() === "failed"
+                                                ? "Failed"
+                                                : "In Progress"}
+                                            {" (Operation #"}
+                                            {provisionOperation.id}
+                                            {")."}
+                                          </Alert>
+                                        ) : (
+                                          <Alert severity="info" sx={{ my: 2 }}>
+                                            All three review stages and final approval
+                                            are complete. Infrastructure is ready to deploy.
+                                          </Alert>
+                                        )}
+
+                                        {!provisionOperation && (
+                                          <Button
+                                            variant="contained"
+                                            color="success"
+                                            fullWidth
+                                            disabled={applyingId !== null}
+                                            onClick={() =>
+                                              void applyInfrastructure(approval.id)
+                                            }
+                                          >
+                                            {applyingId === approval.id
+                                              ? "Starting deployment..."
+                                              : "Apply Infrastructure"}
+                                          </Button>
+                                        )}
+
+                                        {destroySucceeded ? (
+                                          <Alert severity="success" sx={{ mt: 2 }}>
+                                            <strong>Destroy Infrastructure — Done</strong>
+                                            {" (Operation #"}
+                                            {destroyOperation?.id}
+                                            {")."}
+                                            No further destroy action is available.
+                                          </Alert>
+                                        ) : provisionOperation?.status.toLowerCase() === "succeeded" &&
+                                          !hasDestroyApproval ? (
+                                          <Button
+                                            variant="outlined"
+                                            color="error"
+                                            fullWidth
+                                            sx={{ mt: 2 }}
+                                            disabled={destroyPlanRequestId !== null}
+                                            onClick={() =>
+                                              void generateDestroyApproval(
+                                                approval.infrastructure_request_id,
+                                              )
+                                            }
+                                          >
+                                            {destroyPlanRequestId ===
+                                            approval.infrastructure_request_id
+                                              ? "Generating destroy plan..."
+                                              : "Generate Destroy Plan"}
+                                          </Button>
+                                        ) : hasDestroyApproval ? (
+                                          <Alert severity="info" sx={{ mt: 2 }}>
+                                            A separate destroy approval already exists.
+                                            Review and complete that approval before
+                                            destruction can proceed.
+                                          </Alert>
+                                        ) : provisionOperation?.status.toLowerCase() !== "succeeded" ? (
+                                          <Alert severity="warning" sx={{ mt: 2 }}>
+                                            Destroy planning is available only after a
+                                            successful provisioning operation.
+                                          </Alert>
+                                        ) : null}
+                                      </>
+                                    )}
+                                  </Box>
+                                );
+                              })()}
                           </Box>
                         </>
                       );
@@ -1388,8 +1755,10 @@ sx={{
         )}
 
         <Alert severity="info" sx={{ mt: 3 }}>
-          Approval decisions are recorded in the audit trail. This interface
-          does not execute Terraform or provision infrastructure. Security
+          Approval decisions are recorded in the audit trail. Requesters can
+          start a controlled Terraform apply after all approval stages and the
+          final decision are approved. Destroy requires a separate trusted plan,
+          separate three-stage approval and explicit confirmation. Security
           findings reflect the configured initial policy checks.
         </Alert>
       </CardContent>
